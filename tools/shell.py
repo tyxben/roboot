@@ -23,7 +23,7 @@ DANGEROUS_PATTERNS = [
     when_to_use="当用户让你在电脑上做任何事情：查文件、开应用、跑命令、查系统信息、操作 git 等",
     what_to_expect="命令的 stdout/stderr 输出，最多 4000 字符",
     failure_meaning="命令执行失败或超时，检查命令是否正确",
-    side_effect="write",
+    side_effect="read",
     requires_confirmation=False,
 )
 async def shell(command: str) -> str:

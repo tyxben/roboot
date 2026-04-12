@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Roboot Console</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface2: #1c2333;
+  --border: rgba(255,255,255,0.06);
+  --accent: #e94560;
+  --green: #3fb950;
+  --yellow: #d29922;
+  --red: #f85149;
+  --text: #e6edf3;
+  --text-dim: #7d8590;
+  --radius: 10px;
+  --sidebar-w: 280px;
+}
+
+body {
+  font-family: -apple-system, "PingFang SC", "SF Pro", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  overflow: hidden;
+}
+
+/* === SIDEBAR === */
+.sidebar {
+  width: var(--sidebar-w);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; flex-shrink: 0;
+}
+
+.sidebar-header { padding: 16px; border-bottom: 1px solid var(--border); }
+
+.sidebar-header h1 {
+  font-size: 15px; font-weight: 600;
+  display: flex; align-items: center; gap: 8px;
+}
+
+.sidebar-header h1 .logo {
+  width: 24px; height: 24px; border-radius: 6px;
+  background: linear-gradient(135deg, var(--accent), #533483);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700;
+}
+
+.sidebar-header .count { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+
+.session-list {
+  flex: 1; overflow-y: auto; padding: 8px;
+  -webkit-overflow-scrolling: touch;
+}
+.session-list::-webkit-scrollbar { width: 4px; }
+.session-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
+
+.session-item {
+  padding: 10px 12px; border-radius: 8px;
+  cursor: pointer; margin-bottom: 2px;
+  transition: background 0.12s;
+  display: flex; align-items: center; gap: 8px;
+}
+.session-item:hover { background: rgba(255,255,255,0.04); }
+.session-item.active { background: rgba(233,69,96,0.12); }
+
+.session-item .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--green); flex-shrink: 0;
+}
+.session-item .dot.waiting { background: var(--yellow); animation: pulse 1.5s ease infinite; }
+@keyframes pulse { 0%,100%{ opacity:1; } 50%{ opacity:0.4; } }
+
+.session-item .label { font-size: 13px; font-weight: 500; flex: 1; }
+
+.sidebar-footer { padding: 8px; border-top: 1px solid var(--border); }
+
+.chat-tab {
+  padding: 10px 12px; border-radius: 8px;
+  cursor: pointer; font-size: 13px; font-weight: 500;
+  display: flex; align-items: center; gap: 8px;
+}
+.chat-tab:hover { background: rgba(255,255,255,0.04); }
+.chat-tab.active { background: rgba(233,69,96,0.12); color: var(--accent); }
+
+.chat-tab .icon {
+  width: 20px; height: 20px; border-radius: 5px;
+  background: var(--accent);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: white;
+}
+
+/* === MAIN === */
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+.panel { display: none; flex: 1; flex-direction: column; overflow: hidden; }
+.panel.visible { display: flex; }
+
+.panel-header {
+  padding: 12px 20px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 12px;
+  background: var(--surface); flex-shrink: 0;
+}
+.panel-header .title { flex: 1; }
+.panel-header .title h2 { font-size: 14px; font-weight: 600; }
+.panel-header .title .meta { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+.panel-header button {
+  padding: 5px 12px; border: none; border-radius: 6px;
+  font-size: 12px; cursor: pointer; font-family: inherit;
+  background: var(--surface2); color: var(--text);
+}
+.panel-header button:hover { background: rgba(255,255,255,0.1); }
+.panel-header button.on { background: var(--accent); color: white; }
+
+/* Terminal */
+.terminal {
+  flex: 1; overflow-y: auto; padding: 14px 18px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 12.5px; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-all;
+  color: #adbac7; background: var(--bg);
+  -webkit-overflow-scrolling: touch;
+}
+.terminal::-webkit-scrollbar { width: 5px; }
+.terminal::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
+
+/* Confirm bar — shown when Claude Code is waiting for approval */
+.confirm-bar {
+  display: none; padding: 10px 18px;
+  background: rgba(210,153,34,0.1);
+  border-top: 1px solid rgba(210,153,34,0.3);
+  flex-shrink: 0;
+  align-items: center; gap: 10px;
+}
+.confirm-bar.visible { display: flex; }
+
+.confirm-bar .prompt {
+  flex: 1; font-size: 13px; color: var(--yellow);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.confirm-bar button {
+  padding: 6px 16px; border: none; border-radius: 6px;
+  font-size: 13px; font-weight: 500; cursor: pointer; font-family: inherit;
+}
+
+.btn-allow { background: var(--green); color: #000; }
+.btn-deny { background: var(--red); color: white; }
+.btn-allow:hover { opacity: 0.9; }
+.btn-deny:hover { opacity: 0.9; }
+
+/* Input bar */
+.input-bar {
+  padding: 10px 14px; border-top: 1px solid var(--border);
+  display: flex; gap: 8px; align-items: flex-end;
+  background: var(--surface); flex-shrink: 0;
+}
+
+.input-bar textarea {
+  flex: 1; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px; color: var(--text); font-size: 13px;
+  resize: none; outline: none; max-height: 100px; line-height: 1.4;
+}
+.input-bar textarea:focus { border-color: var(--accent); }
+.input-bar textarea::placeholder { color: var(--text-dim); }
+.input-bar .mono { font-family: "SF Mono", "Menlo", monospace; }
+
+.input-bar button {
+  width: 34px; height: 34px; border: none; border-radius: 8px;
+  background: var(--accent); color: white; font-size: 15px;
+  cursor: pointer; flex-shrink: 0;
+}
+.input-bar button:disabled { opacity: 0.3; cursor: default; }
+
+/* Chat */
+.chat-messages {
+  flex: 1; overflow-y: auto; padding: 16px 20px;
+  display: flex; flex-direction: column; gap: 10px;
+  -webkit-overflow-scrolling: touch;
+}
+.chat-messages::-webkit-scrollbar { width: 4px; }
+.chat-messages::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
+
+.chat-msg {
+  max-width: 80%; padding: 9px 13px;
+  border-radius: var(--radius); font-size: 13.5px;
+  line-height: 1.55; word-break: break-word;
+  animation: fadeUp 0.15s ease;
+}
+@keyframes fadeUp { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+
+.chat-msg.user { align-self: flex-end; background: #1f3a5f; border-bottom-right-radius: 4px; }
+.chat-msg.bot { align-self: flex-start; background: var(--surface2); border-bottom-left-radius: 4px; }
+
+.chat-msg.thinking {
+  align-self: flex-start; color: var(--text-dim);
+  background: transparent; font-size: 12px; padding: 6px 0;
+}
+.chat-msg.thinking::after { content:""; animation: dots 1.2s steps(4) infinite; }
+@keyframes dots { 0%{content:""} 25%{content:"."} 50%{content:".."} 75%{content:"..."} }
+
+.chat-msg pre {
+  background: rgba(0,0,0,0.3); padding: 6px 8px; border-radius: 6px;
+  margin-top: 5px; overflow-x: auto; font-size: 12px;
+  font-family: "SF Mono", "Menlo", monospace;
+}
+.chat-msg code {
+  background: rgba(0,0,0,0.2); padding: 1px 4px; border-radius: 3px;
+  font-size: 12px; font-family: "SF Mono", "Menlo", monospace;
+}
+
+.tools-badge {
+  font-size: 10px; color: var(--accent);
+  background: rgba(233,69,96,0.1);
+  padding: 2px 7px; border-radius: 8px;
+  margin-top: 5px; display: inline-block;
+}
+
+.empty-msg {
+  flex: 1; display: flex; align-items: center;
+  justify-content: center; color: var(--text-dim); font-size: 14px;
+}
+
+.toast {
+  position: fixed; top: 16px; right: 16px;
+  background: var(--green); color: white;
+  padding: 8px 16px; border-radius: 8px;
+  font-size: 12px; opacity: 0; transition: opacity 0.25s; z-index: 50;
+}
+.toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-header">
+    <h1><span class="logo">R</span> Roboot</h1>
+    <div class="count" id="session-count">加载中...</div>
+  </div>
+  <div class="session-list" id="session-list"></div>
+  <div class="sidebar-footer">
+    <div class="chat-tab" id="chat-tab" onclick="showChat()">
+      <span class="icon">AI</span> Roboot 聊天
+    </div>
+  </div>
+</div>
+
+<div class="main">
+  <div class="panel visible" id="panel-empty">
+    <div class="empty-msg">选择一个会话，或点击 Roboot 聊天</div>
+  </div>
+
+  <div class="panel" id="panel-session">
+    <div class="panel-header">
+      <div class="title">
+        <h2 id="sv-title"></h2>
+        <div class="meta" id="sv-meta"></div>
+      </div>
+      <button onclick="refreshSession()">刷新</button>
+      <button id="auto-btn" onclick="toggleAuto()">自动刷新</button>
+    </div>
+    <div class="terminal" id="terminal"></div>
+    <div class="confirm-bar" id="confirm-bar">
+      <span class="prompt" id="confirm-prompt">等待确认...</span>
+      <button class="btn-allow" onclick="quickSend('y')">允许</button>
+      <button class="btn-deny" onclick="quickSend('n')">拒绝</button>
+    </div>
+    <div class="input-bar">
+      <textarea id="txt-session" class="mono" rows="1" placeholder="发送消息到这个 Claude Code..."></textarea>
+      <button onclick="sendToSession()">↑</button>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-chat">
+    <div class="panel-header">
+      <div class="title">
+        <h2>Roboot AI 助手</h2>
+        <div class="meta">自然语言控制你的所有会话</div>
+      </div>
+    </div>
+    <div class="chat-messages" id="chat-messages"></div>
+    <div class="input-bar">
+      <textarea id="txt-chat" rows="1" placeholder="跟 Roboot 说点什么..."></textarea>
+      <button id="chat-send-btn" onclick="chatSend()">↑</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+var sessions = [];
+var currentId = null;
+var autoTimer = null;
+var ws = null;
+var thinkingEl = null;
+
+var CONFIRM_PATTERNS = [
+  /Do you want to proceed/i, /\[Y\/n\]/, /\[y\/N\]/, /\(y\/n\)/i,
+  /Allow|Deny/, /allow this/i, /approve this/i,
+  /Press Enter to continue/i, /Do you want to/i, /Shall I/i,
+  /要继续吗/, /是否允许/, /确认/,
+];
+
+function showPanel(name) {
+  document.querySelectorAll('.panel').forEach(function(p) { p.classList.remove('visible'); });
+  document.getElementById('panel-' + name).classList.add('visible');
+}
+
+function loadSessions() {
+  fetch('/api/sessions').then(function(r) { return r.json(); }).then(function(data) {
+    sessions = data.sessions;
+    document.getElementById('session-count').textContent = sessions.length + ' 个会话';
+    renderSessionList();
+  }).catch(function() {
+    document.getElementById('session-count').textContent = '加载失败';
+  });
+}
+
+function renderSessionList() {
+  var el = document.getElementById('session-list');
+  el.innerHTML = sessions.map(function(s) {
+    var active = currentId === s.id;
+    var label = s.project || s.name || s.id.substring(0,8);
+    return '<div class="session-item' + (active ? ' active' : '') + '" onclick="selectSession(\'' + s.id + '\')">'
+      + '<span class="dot" id="dot-' + s.id.replace(/[^a-zA-Z0-9]/g,'') + '"></span>'
+      + '<span class="label">' + label + '</span></div>';
+  }).join('');
+}
+
+function selectSession(id) {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  currentId = id;
+  var s = sessions.find(function(x) { return x.id === id; });
+  renderSessionList();
+  document.getElementById('chat-tab').classList.remove('active');
+  showPanel('session');
+  document.getElementById('sv-title').textContent = s ? (s.project || s.name) : id;
+  document.getElementById('sv-meta').textContent = s ? s.name : '';
+  document.getElementById('terminal').textContent = '读取中...';
+  document.getElementById('confirm-bar').classList.remove('visible');
+  refreshSession();
+  autoTimer = setInterval(refreshSession, 3000);
+  document.getElementById('auto-btn').classList.add('on');
+  document.getElementById('auto-btn').textContent = '自动 ✓';
+}
+
+function refreshSession() {
+  if (!currentId) return;
+  fetch('/api/sessions/' + encodeURIComponent(currentId) + '/read')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var term = document.getElementById('terminal');
+      var content = data.content || '(空)';
+      term.textContent = content;
+      term.scrollTop = term.scrollHeight;
+      checkForConfirmation(content);
+    }).catch(function() {
+      document.getElementById('terminal').textContent = '读取失败';
+    });
+}
+
+function checkForConfirmation(content) {
+  var lines = content.split('\n');
+  var tail = lines.slice(-10).join('\n');
+  var bar = document.getElementById('confirm-bar');
+  var promptEl = document.getElementById('confirm-prompt');
+  var found = false;
+  for (var i = 0; i < CONFIRM_PATTERNS.length; i++) {
+    if (CONFIRM_PATTERNS[i].test(tail)) {
+      found = true;
+      for (var j = lines.length - 1; j >= Math.max(0, lines.length - 10); j--) {
+        if (CONFIRM_PATTERNS[i].test(lines[j])) { promptEl.textContent = lines[j].trim(); break; }
+      }
+      break;
+    }
+  }
+  bar.classList.toggle('visible', found);
+  var dotId = currentId ? currentId.replace(/[^a-zA-Z0-9]/g,'') : '';
+  var dot = document.getElementById('dot-' + dotId);
+  if (dot) dot.classList.toggle('waiting', found);
+}
+
+function quickSend(text) {
+  if (!currentId) return;
+  fetch('/api/sessions/' + encodeURIComponent(currentId) + '/send', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: text }),
+  }).then(function() {
+    showToast(text === 'y' ? '已允许' : '已拒绝');
+    document.getElementById('confirm-bar').classList.remove('visible');
+    setTimeout(refreshSession, 1500);
+  });
+}
+
+function toggleAuto() {
+  var btn = document.getElementById('auto-btn');
+  if (autoTimer) {
+    clearInterval(autoTimer); autoTimer = null;
+    btn.classList.remove('on'); btn.textContent = '自动刷新';
+  } else {
+    autoTimer = setInterval(refreshSession, 3000);
+    btn.classList.add('on'); btn.textContent = '自动 ✓';
+    refreshSession();
+  }
+}
+
+function sendToSession() {
+  var inp = document.getElementById('txt-session');
+  var text = inp.value.trim();
+  if (!text || !currentId) return;
+  inp.value = ''; inp.style.height = 'auto';
+  fetch('/api/sessions/' + encodeURIComponent(currentId) + '/send', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: text }),
+  }).then(function() {
+    showToast('已发送');
+    setTimeout(refreshSession, 1500);
+  }).catch(function() { showToast('发送失败'); });
+}
+
+function showChat() {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  currentId = null;
+  renderSessionList();
+  document.getElementById('chat-tab').classList.add('active');
+  showPanel('chat');
+  if (!ws) connectWS();
+  document.getElementById('txt-chat').focus();
+}
+
+function connectWS() {
+  var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws');
+  ws.onmessage = function(e) {
+    var data = JSON.parse(e.data);
+    removeThinking();
+    if (data.type === 'response') {
+      addChatMsg('bot', data.content, data.tools_used);
+      // Show session action buttons if sessions data is included
+      if (data.sessions && data.sessions.length > 0) {
+        addSessionButtons(data.sessions);
+      }
+      document.getElementById('chat-send-btn').disabled = false;
+    } else if (data.type === 'thinking') {
+      addThinking();
+    } else if (data.type === 'error') {
+      addChatMsg('bot', '错误: ' + data.content);
+      document.getElementById('chat-send-btn').disabled = false;
+    }
+  };
+  ws.onclose = function() { ws = null; };
+}
+
+function addChatMsg(role, text, tools) {
+  var el = document.createElement('div');
+  el.className = 'chat-msg ' + role;
+  el.innerHTML = renderMD(text || '');
+  if (tools && tools > 0) {
+    var b = document.createElement('div');
+    b.className = 'tools-badge';
+    b.textContent = tools + ' tool call' + (tools > 1 ? 's' : '');
+    el.appendChild(b);
+  }
+  var box = document.getElementById('chat-messages');
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+}
+
+function addThinking() {
+  if (thinkingEl) return;
+  thinkingEl = document.createElement('div');
+  thinkingEl.className = 'chat-msg thinking';
+  thinkingEl.textContent = '思考中';
+  var box = document.getElementById('chat-messages');
+  box.appendChild(thinkingEl);
+  box.scrollTop = box.scrollHeight;
+}
+
+function removeThinking() {
+  if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
+}
+
+function addSessionButtons(sessionsList) {
+  var el = document.createElement('div');
+  el.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;animation:fadeUp 0.15s ease;';
+  sessionsList.forEach(function(s) {
+    var btn = document.createElement('button');
+    btn.textContent = s.project || s.name || s.id.substring(0,8);
+    btn.title = '打开 ' + (s.project || s.name);
+    btn.style.cssText = 'padding:5px 12px;border:1px solid rgba(233,69,96,0.3);border-radius:6px;background:rgba(233,69,96,0.08);color:#e94560;font-size:12px;cursor:pointer;font-family:inherit;';
+    btn.onmouseenter = function() { btn.style.background = 'rgba(233,69,96,0.2)'; };
+    btn.onmouseleave = function() { btn.style.background = 'rgba(233,69,96,0.08)'; };
+    btn.onclick = function() {
+      // Update sessions data and switch to session view
+      sessions = sessionsList.map(function(x) { return {id: x.id, project: x.project, name: x.name}; });
+      renderSessionList();
+      selectSession(s.id);
+    };
+    el.appendChild(btn);
+  });
+  var box = document.getElementById('chat-messages');
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+}
+
+function renderMD(t) {
+  t = t.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+  t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/\n/g, '<br>');
+  return t;
+}
+
+function chatSend() {
+  var inp = document.getElementById('txt-chat');
+  var text = inp.value.trim();
+  if (!text || !ws || ws.readyState !== 1) return;
+  addChatMsg('user', text);
+  ws.send(JSON.stringify({ content: text }));
+  inp.value = ''; inp.style.height = 'auto';
+  document.getElementById('chat-send-btn').disabled = true;
+}
+
+// ===== Shared =====
+function showToast(msg) {
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(function() { t.classList.remove('show'); }, 2000);
+}
+
+function setupTextarea(id, onSubmit) {
+  var el = document.getElementById(id);
+  el.addEventListener('input', function() {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 100) + 'px';
+  });
+  el.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      onSubmit();
+    }
+  });
+}
+
+setupTextarea('txt-session', sendToSession);
+setupTextarea('txt-chat', chatSend);
+
+// Load sessions once on startup — no auto-refresh
+loadSessions();
+</script>
+</body>
+</html>

@@ -6,6 +6,8 @@ requires-python = ">=3.11"
 dependencies = [
     "arcana-agent[all-providers]>=0.4.0",
     "pyyaml>=6.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
 ]
 
 [project.optional-dependencies]
@@ -19,8 +21,11 @@ vision = [
 telegram = [
     "python-telegram-bot>=21.0",
 ]
+desktop = [
+    "pywebview>=5.0",
+]
 all = [
-    "roboot[voice,vision,telegram]",
+    "roboot[voice,vision,telegram,desktop]",
 ]
 
 [project.scripts]

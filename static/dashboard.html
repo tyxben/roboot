@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Roboot — 控制面板</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #1a1a2e;
+  --surface: #16213e;
+  --surface2: #0f3460;
+  --accent: #e94560;
+  --accent2: #533483;
+  --green: #4caf50;
+  --yellow: #ff9800;
+  --text: #eee;
+  --text-dim: #888;
+  --radius: 12px;
+}
+
+body {
+  font-family: -apple-system, "PingFang SC", "SF Pro", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  padding: 24px;
+}
+
+h1 {
+  font-size: 22px;
+  margin-bottom: 6px;
+}
+
+.subtitle {
+  color: var(--text-dim);
+  font-size: 13px;
+  margin-bottom: 24px;
+}
+
+.stats {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.stat-card {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  flex: 1;
+}
+
+.stat-card .number {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.stat-card .label {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.sessions {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 14px;
+}
+
+.session-card {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 18px;
+  border-left: 3px solid var(--green);
+  transition: transform 0.15s, box-shadow 0.15s;
+  cursor: default;
+}
+
+.session-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+}
+
+.session-card .project-name {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-card .project-name .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+}
+
+.session-card .meta {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+  line-height: 1.6;
+}
+
+.session-card .meta span {
+  display: inline-block;
+  background: rgba(255,255,255,0.05);
+  padding: 2px 8px;
+  border-radius: 6px;
+  margin-right: 6px;
+  margin-bottom: 4px;
+}
+
+.session-card .preview {
+  background: rgba(0,0,0,0.25);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-family: "SF Mono", "Menlo", monospace;
+  color: var(--text-dim);
+  max-height: 120px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+
+.session-card .preview::-webkit-scrollbar { width: 3px; }
+.session-card .preview::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+.session-card .actions {
+  display: flex;
+  gap: 8px;
+}
+
+.session-card .actions button {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+  font-family: inherit;
+}
+
+.session-card .actions button:hover { opacity: 0.85; }
+
+.btn-read {
+  background: var(--surface2);
+  color: var(--text);
+}
+
+.btn-send {
+  background: var(--accent);
+  color: white;
+}
+
+/* Send modal */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-overlay.active { display: flex; }
+
+.modal {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 24px;
+  width: 420px;
+  max-width: 90vw;
+}
+
+.modal h2 { font-size: 16px; margin-bottom: 12px; }
+
+.modal textarea {
+  width: 100%;
+  height: 80px;
+  background: var(--bg);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px;
+  padding: 10px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+  outline: none;
+}
+
+.modal textarea:focus { border-color: var(--accent); }
+
+.modal .modal-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  justify-content: flex-end;
+}
+
+.modal .modal-actions button {
+  padding: 8px 18px;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.btn-cancel { background: var(--surface2); color: var(--text); }
+
+.loading {
+  text-align: center;
+  color: var(--text-dim);
+  padding: 40px;
+  font-size: 14px;
+}
+
+.refresh-btn {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: white;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(233, 69, 96, 0.4);
+  transition: transform 0.2s;
+}
+
+.refresh-btn:hover { transform: scale(1.1); }
+.refresh-btn.spinning { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.nav {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.nav a {
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  transition: background 0.15s;
+}
+
+.nav a:hover { background: rgba(255,255,255,0.05); }
+.nav a.active { color: var(--accent); background: rgba(233, 69, 96, 0.1); }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="/dashboard" class="active">控制面板</a>
+  <a href="/" target="_blank">聊天</a>
+</div>
+
+<h1>Roboot 控制面板</h1>
+<p class="subtitle">管理你的 Claude Code 会话</p>
+
+<div class="stats" id="stats">
+  <div class="stat-card">
+    <div class="number" id="session-count">-</div>
+    <div class="label">活跃会话</div>
+  </div>
+  <div class="stat-card">
+    <div class="number" id="project-list">-</div>
+    <div class="label">项目</div>
+  </div>
+</div>
+
+<div class="sessions" id="sessions">
+  <div class="loading">加载中...</div>
+</div>
+
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <h2>发送消息到 <span id="modal-project"></span></h2>
+    <textarea id="modal-input" placeholder="输入要发送的内容..."></textarea>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeModal()">取消</button>
+      <button class="btn-send" onclick="doSend()">发送</button>
+    </div>
+  </div>
+</div>
+
+<button class="refresh-btn" onclick="refresh()" title="刷新">↻</button>
+
+<script>
+const API = '/api';
+let currentProject = '';
+
+async function loadSessions() {
+  const el = document.getElementById('sessions');
+  try {
+    const resp = await fetch(`${API}/sessions`);
+    const data = await resp.json();
+
+    document.getElementById('session-count').textContent = data.sessions.length;
+    document.getElementById('project-list').textContent = data.sessions.map(s => s.project).join(', ');
+
+    if (data.sessions.length === 0) {
+      el.innerHTML = '<div class="loading">没有运行中的 Claude Code 会话</div>';
+      return;
+    }
+
+    el.innerHTML = data.sessions.map(s => `
+      <div class="session-card" id="card-${s.project}">
+        <div class="project-name">
+          <span class="dot"></span>
+          ${s.project}
+        </div>
+        <div class="meta">
+          <span>PID ${s.pid}</span>
+          <span>${s.tty}</span>
+          <span>${s.cwd}</span>
+        </div>
+        <div class="preview" id="preview-${s.project}">点击"查看"读取最新输出</div>
+        <div class="actions">
+          <button class="btn-read" onclick="readSession('${s.project}')">查看输出</button>
+          <button class="btn-send" onclick="openModal('${s.project}')">发送消息</button>
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    el.innerHTML = `<div class="loading">加载失败: ${e.message}</div>`;
+  }
+}
+
+async function readSession(project) {
+  const preview = document.getElementById(`preview-${project}`);
+  preview.textContent = '读取中...';
+  try {
+    const resp = await fetch(`${API}/sessions/${encodeURIComponent(project)}/read`);
+    const data = await resp.json();
+    preview.textContent = data.content || '(空)';
+    preview.scrollTop = preview.scrollHeight;
+  } catch (e) {
+    preview.textContent = `读取失败: ${e.message}`;
+  }
+}
+
+function openModal(project) {
+  currentProject = project;
+  document.getElementById('modal-project').textContent = project;
+  document.getElementById('modal-input').value = '';
+  document.getElementById('modal').classList.add('active');
+  document.getElementById('modal-input').focus();
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('active');
+}
+
+async function doSend() {
+  const text = document.getElementById('modal-input').value.trim();
+  if (!text) return;
+  closeModal();
+  try {
+    const resp = await fetch(`${API}/sessions/${encodeURIComponent(currentProject)}/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    const data = await resp.json();
+    alert(data.result || '已发送');
+  } catch (e) {
+    alert(`发送失败: ${e.message}`);
+  }
+}
+
+async function refresh() {
+  const btn = document.querySelector('.refresh-btn');
+  btn.classList.add('spinning');
+  await loadSessions();
+  btn.classList.remove('spinning');
+}
+
+// Handle Escape key for modal
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+});
+
+// Initial load + auto refresh every 30s
+loadSessions();
+setInterval(loadSessions, 30000);
+</script>
+</body>
+</html>
