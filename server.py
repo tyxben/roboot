@@ -27,6 +27,7 @@ from tools.claude_code import (
     create_claude_session,
 )
 from tools.vision import look, screenshot
+from tools.soul import update_self, remember_user, add_note, build_personality, get_name, get_voice
 
 ALL_TOOLS = [
     shell,
@@ -36,6 +37,9 @@ ALL_TOOLS = [
     create_claude_session,
     look,
     screenshot,
+    update_self,
+    remember_user,
+    add_note,
 ]
 
 app = FastAPI(title="Roboot")
@@ -79,7 +83,6 @@ def _get_runtime() -> arcana.Runtime:
                 default_model=config.get("default_model"),
             ),
         )
-        _runtime._personality = config.get("personality", "")
     return _runtime
 
 
@@ -149,7 +152,7 @@ async def api_send_to_session(session_id: str, body: dict):
     return {"result": result}
 
 
-TTS_VOICE = "zh-CN-YunxiNeural"
+TTS_VOICE_DEFAULT = "zh-CN-YunxiNeural"
 
 
 def _extract_spoken_text(text: str) -> str:
@@ -207,7 +210,8 @@ async def api_tts(body: dict):
     if not text:
         return Response(content=b"", media_type="audio/mpeg")
 
-    comm = edge_tts.Communicate(text, voice=TTS_VOICE, rate="+10%")
+    voice = get_voice() or TTS_VOICE_DEFAULT
+    comm = edge_tts.Communicate(text, voice=voice, rate="+10%")
     audio_bytes = b""
     async for chunk in comm.stream():
         if chunk["type"] == "audio":
@@ -220,9 +224,11 @@ async def api_tts(body: dict):
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     runtime = _get_runtime()
-    session = runtime.create_chat_session(system_prompt=runtime._personality)
+    # Build personality fresh from soul.md each session
+    personality = build_personality()
+    session = runtime.create_chat_session(system_prompt=personality)
 
-    name = _load_config().get("name", "Roboot")
+    name = get_name()
     await ws.send_json({"type": "response", "content": f"Hey，我是 {name}。有什么事？"})
 
     while True:
