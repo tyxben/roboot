@@ -150,50 +150,69 @@ async def api_send_to_session(session_id: str, body: dict):
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     runtime = _get_runtime()
+    session = runtime.create_chat_session(system_prompt=runtime._personality)
 
-    async with runtime.chat(system_prompt=runtime._personality) as session:
-        # Welcome
-        await ws.send_json({"type": "response", "content": "你好，我是 Roboot。"})
+    await ws.send_json({"type": "response", "content": "你好，我是 Roboot。"})
 
-        while True:
-            try:
-                data = await ws.receive_text()
-                msg = json.loads(data)
-                user_text = msg.get("content", "").strip()
-                if not user_text:
-                    continue
+    while True:
+        try:
+            data = await ws.receive_text()
+            msg = json.loads(data)
+            user_text = msg.get("content", "").strip()
+            if not user_text:
+                continue
 
-                # Show thinking
-                await ws.send_json({"type": "thinking"})
+            await ws.send_json({"type": "thinking"})
 
-                response = await session.send(user_text)
+            full_text = ""
+            tools_used = 0
 
-                # Check if response references sessions → send session list for UI actions
-                resp_data = {
-                    "type": "response",
-                    "content": response.content,
-                    "tools_used": response.tool_calls_made,
-                    "tokens": response.tokens_used,
-                    "cost": response.cost_usd,
-                }
+            async for event in session.stream(user_text):
+                etype = event.event_type
 
-                # If tools were used, include current sessions so frontend can offer "open" buttons
-                if response.tool_calls_made and response.tool_calls_made > 0:
-                    try:
-                        all_sessions = await bridge.list_sessions()
-                        resp_data["sessions"] = [
-                            {"id": s.session_id, "project": s.project, "name": s.name}
-                            for s in all_sessions
-                        ]
-                    except Exception:
-                        pass
+                if etype == "text_delta" and event.content:
+                    full_text += event.content
+                    await ws.send_json({
+                        "type": "delta",
+                        "text": event.content,
+                    })
 
-                await ws.send_json(resp_data)
+                elif etype == "tool_start":
+                    tools_used += 1
+                    await ws.send_json({
+                        "type": "tool_start",
+                        "name": event.tool_name or "",
+                    })
 
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                await ws.send_json({"type": "error", "content": str(e)})
+                elif etype == "tool_end":
+                    await ws.send_json({
+                        "type": "tool_end",
+                        "name": event.tool_name or "",
+                    })
+
+            # Send final complete message
+            resp_data = {
+                "type": "done",
+                "content": full_text,
+                "tools_used": tools_used,
+            }
+
+            if tools_used > 0:
+                try:
+                    all_sessions = await bridge.list_sessions()
+                    resp_data["sessions"] = [
+                        {"id": s.session_id, "project": s.project, "name": s.name}
+                        for s in all_sessions
+                    ]
+                except Exception:
+                    pass
+
+            await ws.send_json(resp_data)
+
+        except WebSocketDisconnect:
+            break
+        except Exception as e:
+            await ws.send_json({"type": "error", "content": str(e)})
 
 
 @app.on_event("shutdown")
