@@ -289,7 +289,8 @@ body {
     </div>
     <div class="chat-messages" id="chat-messages"></div>
     <div class="input-bar">
-      <textarea id="txt-chat" rows="1" placeholder="跟 Roboot 说点什么..."></textarea>
+      <button id="mic-btn" onclick="toggleMic()" title="语音输入" style="width:34px;height:34px;border:none;border-radius:8px;background:var(--surface2);color:var(--text-dim);font-size:16px;cursor:pointer;flex-shrink:0;">🎤</button>
+      <textarea id="txt-chat" rows="1" placeholder="跟 Roboot 说点什么... (或按麦克风语音输入)"></textarea>
       <button id="chat-send-btn" onclick="chatSend()">↑</button>
     </div>
   </div>
@@ -556,7 +557,80 @@ function setupTextarea(id, onSubmit) {
 setupTextarea('txt-session', sendToSession);
 setupTextarea('txt-chat', chatSend);
 
-// Load sessions once on startup — no auto-refresh
+// ===== Voice Input (Web Speech API) =====
+var micActive = false;
+var recognition = null;
+
+function toggleMic() {
+  if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+    showToast('浏览器不支持语音输入，请用 Chrome');
+    return;
+  }
+
+  if (micActive) {
+    stopMic();
+    return;
+  }
+
+  var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SpeechRecognition();
+  recognition.lang = 'zh-CN';
+  recognition.continuous = false;
+  recognition.interimResults = true;
+
+  var btn = document.getElementById('mic-btn');
+  var inp = document.getElementById('txt-chat');
+
+  recognition.onstart = function() {
+    micActive = true;
+    btn.style.background = 'var(--accent)';
+    btn.style.color = 'white';
+    inp.placeholder = '正在听...';
+  };
+
+  recognition.onresult = function(e) {
+    var transcript = '';
+    for (var i = e.resultIndex; i < e.results.length; i++) {
+      transcript += e.results[i][0].transcript;
+    }
+    inp.value = transcript;
+
+    // If final result, auto-send
+    if (e.results[e.results.length - 1].isFinal) {
+      stopMic();
+      if (transcript.trim()) {
+        chatSend();
+      }
+    }
+  };
+
+  recognition.onerror = function(e) {
+    if (e.error !== 'no-speech') {
+      showToast('语音识别错误: ' + e.error);
+    }
+    stopMic();
+  };
+
+  recognition.onend = function() {
+    stopMic();
+  };
+
+  recognition.start();
+}
+
+function stopMic() {
+  micActive = false;
+  var btn = document.getElementById('mic-btn');
+  btn.style.background = 'var(--surface2)';
+  btn.style.color = 'var(--text-dim)';
+  document.getElementById('txt-chat').placeholder = '跟 Roboot 说点什么...';
+  if (recognition) {
+    try { recognition.stop(); } catch(e) {}
+    recognition = null;
+  }
+}
+
+// Load sessions once on startup
 loadSessions();
 </script>
 </body>

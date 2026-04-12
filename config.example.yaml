@@ -20,6 +20,12 @@ voice:
   # 系统设置 → 辅助功能 → 朗读内容 → 系统语音 → 管理语音 → 中文
   tts_voice: ""
 
+# Telegram Bot（远程控制）
+telegram:
+  bot_token: ""  # 从 @BotFather 获取
+  # 限制访问（填 Telegram user ID，空则不限制）
+  allowed_users: []
+
 # 机器人性格
 personality: |
   你是 Roboot，一个运行在用户 Mac 上的私人 AI 助手。
