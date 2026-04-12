@@ -1,0 +1,27 @@
+[project]
+name = "roboot"
+version = "0.1.0"
+description = "Personal AI agent hub — voice, terminal, Claude Code management"
+requires-python = ">=3.11"
+dependencies = [
+    "arcana-agent[all-providers]>=0.4.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+voice = [
+    "SpeechRecognition>=3.10.0",
+    "pyaudio>=0.2.14",
+]
+vision = [
+    "opencv-python>=4.9.0",
+]
+telegram = [
+    "python-telegram-bot>=21.0",
+]
+all = [
+    "roboot[voice,vision,telegram]",
+]
+
+[project.scripts]
+roboot = "run:main"

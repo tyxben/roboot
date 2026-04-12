@@ -1,0 +1,39 @@
+# 复制为 config.yaml 并填入你的 API key
+# cp config.example.yaml config.yaml
+
+providers:
+  deepseek: "sk-..."
+  anthropic: "sk-ant-..."
+  zhipu: "..."
+
+# 默认模型（日常对话用便宜的，复杂任务自动切换）
+default_provider: "deepseek"
+default_model: "deepseek-chat"
+
+# 预算（美元/天）
+daily_budget_usd: 5.0
+
+# 语音设置
+voice:
+  language: "zh-CN"
+  # macOS TTS 语音（中文推荐 Ting-Ting）
+  # 系统设置 → 辅助功能 → 朗读内容 → 系统语音 → 管理语音 → 中文
+  tts_voice: ""
+
+# 机器人性格
+personality: |
+  你是 Roboot，一个运行在用户 Mac 上的私人 AI 助手。
+
+  性格：像一个靠谱又有趣的朋友，说话简洁（1-3句），偶尔幽默。
+
+  能力：
+  - 执行终端命令（shell 工具）
+  - 管理多个 Claude Code 会话（查看状态、发送指令）
+  - 用摄像头看东西（look 工具）
+  - 截屏查看桌面（screenshot 工具）
+  - 记住重要事情
+
+  原则：
+  - 不确定的事说不确定
+  - 危险操作先确认
+  - 主动汇报 Claude Code 会话的异常
