@@ -9,9 +9,12 @@ from pathlib import Path
 
 import subprocess
 
+import tempfile
+
+import edge_tts
 import yaml
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import arcana
@@ -146,6 +149,26 @@ async def api_send_to_session(session_id: str, body: dict):
     return {"result": result}
 
 
+TTS_VOICE = "zh-CN-YunxiNeural"  # 男声，自然
+
+
+@app.post("/api/tts")
+async def api_tts(body: dict):
+    """Convert text to speech using Edge TTS. Returns mp3 audio."""
+    text = body.get("text", "")
+    if not text:
+        return Response(content=b"", media_type="audio/mpeg")
+
+    comm = edge_tts.Communicate(text, voice=TTS_VOICE, rate="+10%")
+    # Collect all audio bytes
+    audio_bytes = b""
+    async for chunk in comm.stream():
+        if chunk["type"] == "audio":
+            audio_bytes += chunk["data"]
+
+    return Response(content=audio_bytes, media_type="audio/mpeg")
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -168,27 +191,32 @@ async def websocket_endpoint(ws: WebSocket):
             tools_used = 0
 
             async for event in session.stream(user_text):
-                etype = event.event_type
+                etype = str(event.event_type)
 
-                if etype == "text_delta" and event.content:
+                if "LLM_CHUNK" in etype and event.content:
                     full_text += event.content
                     await ws.send_json({
                         "type": "delta",
                         "text": event.content,
                     })
 
-                elif etype == "tool_start":
+                elif "TOOL_START" in etype or "TOOL_CALL_START" in etype:
                     tools_used += 1
                     await ws.send_json({
                         "type": "tool_start",
                         "name": event.tool_name or "",
                     })
 
-                elif etype == "tool_end":
+                elif "TOOL_END" in etype or "TOOL_RESULT" in etype:
                     await ws.send_json({
                         "type": "tool_end",
                         "name": event.tool_name or "",
                     })
+
+                elif "RUN_COMPLETE" in etype and event.content:
+                    # Final content from run_complete as fallback
+                    if not full_text:
+                        full_text = event.content
 
             # Send final complete message
             resp_data = {

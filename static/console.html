@@ -445,9 +445,25 @@ function showChat() {
   document.getElementById('txt-chat').focus();
 }
 
-var streamBubble = null;  // Current streaming message bubble
-var streamText = '';      // Accumulated text during streaming
-var sentenceBuffer = '';  // Buffer for TTS sentence detection
+var streamBubble = null;
+var streamText = '';
+var sentenceBuffer = '';
+var renderTimer = null;   // Throttle DOM updates
+
+function flushRender() {
+  if (streamBubble && streamText) {
+    streamBubble.innerHTML = renderMD(streamText);
+    var box = document.getElementById('chat-messages');
+    box.scrollTop = box.scrollHeight;
+  }
+  renderTimer = null;
+}
+
+function scheduleRender() {
+  if (!renderTimer) {
+    renderTimer = setTimeout(flushRender, 80);
+  }
+}
 
 function connectWS() {
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -462,25 +478,24 @@ function connectWS() {
 
     } else if (data.type === 'delta') {
       removeThinking();
-      // Streaming text chunk
       streamText += data.text;
       if (!streamBubble) {
         streamBubble = document.createElement('div');
         streamBubble.className = 'chat-msg bot';
         document.getElementById('chat-messages').appendChild(streamBubble);
       }
-      streamBubble.innerHTML = renderMD(streamText);
-      document.getElementById('chat-messages').scrollTop = 999999;
+      // Throttled render — update DOM at most every 80ms
+      scheduleRender();
 
-      // JARVIS: queue sentences for TTS as they complete
+      // JARVIS: buffer sentences for TTS
       if (jarvisMode) {
         sentenceBuffer += data.text;
+        // Split on sentence-ending punctuation
         var match = sentenceBuffer.match(/^(.*?[。！？.!?\n])/);
         if (match) {
           var sentence = match[1].trim();
           sentenceBuffer = sentenceBuffer.slice(match[0].length);
           if (sentence) queueSpeak(sentence);
-          if (sentenceBuffer === '') setJarvisState('speaking');
         }
       }
 
@@ -498,8 +513,9 @@ function connectWS() {
       // Tool finished, continue streaming
 
     } else if (data.type === 'done') {
-      // Stream complete
+      // Stream complete — final render
       removeThinking();
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       if (streamBubble) {
         streamBubble.innerHTML = renderMD(data.content || streamText);
         if (data.tools_used > 0) {
@@ -508,11 +524,12 @@ function connectWS() {
           b.textContent = data.tools_used + ' tool call' + (data.tools_used > 1 ? 's' : '');
           streamBubble.appendChild(b);
         }
+        document.getElementById('chat-messages').scrollTop = 999999;
       }
       if (data.sessions && data.sessions.length > 0) {
         addSessionButtons(data.sessions);
       }
-      // JARVIS: speak remaining buffer
+      // JARVIS: speak remaining text in buffer
       if (jarvisMode && sentenceBuffer.trim()) {
         queueSpeak(sentenceBuffer.trim());
         sentenceBuffer = '';
@@ -647,6 +664,15 @@ function toggleMic() {
 
 function startListening(isJarvis) {
   var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    showToast('浏览器不支持语音，请用 Chrome');
+    return;
+  }
+
+  // Don't start if already listening or speaking
+  if (micActive) return;
+  if (isSpeaking) return;
+
   recognition = new SpeechRecognition();
   recognition.lang = 'zh-CN';
   recognition.continuous = false;
@@ -654,9 +680,11 @@ function startListening(isJarvis) {
 
   var btn = document.getElementById('mic-btn');
   var inp = document.getElementById('txt-chat');
+  var gotResult = false;
 
   recognition.onstart = function() {
     micActive = true;
+    gotResult = false;
     btn.style.background = 'var(--accent)';
     btn.style.color = 'white';
     if (isJarvis) {
@@ -664,6 +692,7 @@ function startListening(isJarvis) {
     } else {
       inp.placeholder = '正在听...';
     }
+    console.log('[mic] started listening');
   };
 
   recognition.onresult = function(e) {
@@ -672,35 +701,60 @@ function startListening(isJarvis) {
       transcript += e.results[i][0].transcript;
     }
     inp.value = transcript;
+    console.log('[mic] heard:', transcript);
+
     if (e.results[e.results.length - 1].isFinal) {
+      gotResult = true;
       micActive = false;
       btn.style.background = 'var(--surface2)';
       btn.style.color = 'var(--text-dim)';
+      recognition = null;
       if (transcript.trim()) {
         chatSend();
       }
+      // Don't restart here — wait for agent to respond + TTS to finish
     }
   };
 
   recognition.onerror = function(e) {
+    console.log('[mic] error:', e.error);
+    micActive = false;
+    btn.style.background = 'var(--surface2)';
+    btn.style.color = 'var(--text-dim)';
+    recognition = null;
+
     if (e.error !== 'no-speech' && e.error !== 'aborted') {
       showToast('语音: ' + e.error);
     }
-    stopMic();
-    // In JARVIS mode, retry listening after a pause
-    if (jarvisMode && e.error === 'no-speech') {
-      setTimeout(function() { if (jarvisMode) startListening(true); }, 500);
+    // JARVIS: keep trying to listen
+    if (jarvisMode && !isSpeaking) {
+      setTimeout(function() { if (jarvisMode) startListening(true); }, 800);
     }
   };
 
   recognition.onend = function() {
+    console.log('[mic] ended, gotResult=' + gotResult);
     micActive = false;
     btn.style.background = 'var(--surface2)';
     btn.style.color = 'var(--text-dim)';
     inp.placeholder = '跟 Roboot 说点什么...';
+    recognition = null;
+
+    // JARVIS: if we didn't get a result (silence timeout), restart listening
+    if (jarvisMode && !gotResult && !isSpeaking) {
+      setTimeout(function() { if (jarvisMode) startListening(true); }, 300);
+    }
   };
 
-  recognition.start();
+  try {
+    recognition.start();
+  } catch(e) {
+    console.log('[mic] start failed:', e);
+    micActive = false;
+    if (jarvisMode) {
+      setTimeout(function() { if (jarvisMode) startListening(true); }, 1000);
+    }
+  }
 }
 
 function stopMic() {
@@ -713,26 +767,6 @@ function stopMic() {
 
 // ===== JARVIS Mode =====
 var jarvisMode = false;
-var jarvisSynth = window.speechSynthesis || null;
-var jarvisVoice = null;
-
-// Find a good Chinese voice
-function findVoice() {
-  if (!jarvisSynth) return;
-  var voices = jarvisSynth.getVoices();
-  // Prefer: Ting-Ting, or any zh voice
-  for (var i = 0; i < voices.length; i++) {
-    if (voices[i].lang.startsWith('zh')) {
-      jarvisVoice = voices[i];
-      if (voices[i].name.indexOf('Ting') >= 0) break;
-    }
-  }
-}
-
-if (jarvisSynth) {
-  jarvisSynth.onvoiceschanged = findVoice;
-  findVoice();
-}
 
 function toggleJarvis() {
   jarvisMode = !jarvisMode;
@@ -744,20 +778,31 @@ function toggleJarvis() {
     btn.style.color = 'white';
     btn.textContent = '退出贾维斯';
     orb.style.display = 'block';
-    // Make sure we're in chat view
+
+    // Make sure we're in chat view and WS is connected
     if (!document.getElementById('panel-chat').classList.contains('visible')) {
       showChat();
     }
-    if (!ws) connectWS();
-    setJarvisState('listening');
-    startListening(true);
+    if (!ws) {
+      connectWS();
+      // Wait for WS to connect before starting to listen
+      setTimeout(function() {
+        if (jarvisMode) {
+          setJarvisState('listening');
+          startListening(true);
+        }
+      }, 1000);
+    } else {
+      setJarvisState('listening');
+      startListening(true);
+    }
   } else {
     btn.style.background = 'var(--surface2)';
     btn.style.color = 'var(--text)';
     btn.textContent = '贾维斯模式';
     orb.style.display = 'none';
     stopMic();
-    if (jarvisSynth) jarvisSynth.cancel();
+    stopSpeaking();
   }
 }
 
@@ -783,12 +828,13 @@ function setJarvisState(state) {
   }
 }
 
-// TTS sentence queue — speaks sentences one by one, resumes listening after last
+// TTS queue — Edge TTS via server API, plays sentences one by one
 var speakQueue = [];
 var isSpeaking = false;
+var currentAudio = null;
 
 function queueSpeak(text) {
-  if (!jarvisSynth || !text) return;
+  if (!text) return;
   speakQueue.push(text);
   if (!isSpeaking) drainSpeakQueue();
 }
@@ -796,7 +842,7 @@ function queueSpeak(text) {
 function drainSpeakQueue() {
   if (speakQueue.length === 0) {
     isSpeaking = false;
-    // All done speaking — resume listening if stream is also done
+    // Done speaking — resume listening if stream is also done
     if (jarvisMode && !streamBubble) {
       setTimeout(function() { if (jarvisMode) startListening(true); }, 300);
     }
@@ -807,13 +853,38 @@ function drainSpeakQueue() {
   setJarvisState('speaking');
   var text = speakQueue.shift();
 
-  var utter = new SpeechSynthesisUtterance(text);
-  utter.lang = 'zh-CN';
-  utter.rate = 1.15;
-  if (jarvisVoice) utter.voice = jarvisVoice;
-  utter.onend = function() { drainSpeakQueue(); };
-  utter.onerror = function() { drainSpeakQueue(); };
-  jarvisSynth.speak(utter);
+  // Call server Edge TTS API
+  fetch('/api/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: text }),
+  }).then(function(r) { return r.blob(); })
+    .then(function(blob) {
+      var url = URL.createObjectURL(blob);
+      currentAudio = new Audio(url);
+      currentAudio.onended = function() {
+        URL.revokeObjectURL(url);
+        currentAudio = null;
+        drainSpeakQueue();
+      };
+      currentAudio.onerror = function() {
+        URL.revokeObjectURL(url);
+        currentAudio = null;
+        drainSpeakQueue();
+      };
+      currentAudio.play();
+    }).catch(function() {
+      drainSpeakQueue();
+    });
+}
+
+function stopSpeaking() {
+  speakQueue = [];
+  isSpeaking = false;
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio = null;
+  }
 }
 
 // Load sessions once on startup
