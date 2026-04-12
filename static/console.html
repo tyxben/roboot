@@ -243,7 +243,7 @@ body {
 
 <div class="sidebar">
   <div class="sidebar-header">
-    <h1><span class="logo">R</span> Roboot</h1>
+    <h1><span class="logo">A</span> Ava</h1>
     <div class="count" id="session-count">加载中...</div>
   </div>
   <div class="session-list" id="session-list"></div>
@@ -283,8 +283,8 @@ body {
   <div class="panel" id="panel-chat">
     <div class="panel-header">
       <div class="title">
-        <h2 id="chat-title">Roboot AI 助手</h2>
-        <div class="meta" id="chat-meta">自然语言控制你的所有会话</div>
+        <h2 id="chat-title">Ava</h2>
+        <div class="meta" id="chat-meta">你的私人 AI 助手</div>
       </div>
       <button id="jarvis-btn" onclick="toggleJarvis()" style="padding:5px 14px;border:none;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;background:var(--surface2);color:var(--text);">贾维斯模式</button>
     </div>
@@ -487,16 +487,9 @@ function connectWS() {
       // Throttled render — update DOM at most every 80ms
       scheduleRender();
 
-      // JARVIS: buffer sentences for TTS
-      if (jarvisMode) {
-        sentenceBuffer += data.text;
-        // Split on sentence-ending punctuation
-        var match = sentenceBuffer.match(/^(.*?[。！？.!?\n])/);
-        if (match) {
-          var sentence = match[1].trim();
-          sentenceBuffer = sentenceBuffer.slice(match[0].length);
-          if (sentence) queueSpeak(sentence);
-        }
+      // JARVIS: just accumulate, speak after done (server extracts spoken part)
+      if (jarvisMode && !isSpeaking) {
+        setJarvisState('thinking');
       }
 
     } else if (data.type === 'tool_start') {
@@ -529,10 +522,9 @@ function connectWS() {
       if (data.sessions && data.sessions.length > 0) {
         addSessionButtons(data.sessions);
       }
-      // JARVIS: speak remaining text in buffer
-      if (jarvisMode && sentenceBuffer.trim()) {
-        queueSpeak(sentenceBuffer.trim());
-        sentenceBuffer = '';
+      // JARVIS: send full text to server TTS — server extracts spoken part
+      if (jarvisMode && (data.content || streamText)) {
+        queueSpeak(data.content || streamText);
       }
       streamBubble = null;
       streamText = '';
@@ -669,9 +661,11 @@ function startListening(isJarvis) {
     return;
   }
 
-  // Don't start if already listening or speaking
   if (micActive) return;
-  if (isSpeaking) return;
+  // If speaking, INTERRUPT — stop audio and start listening
+  if (isSpeaking) {
+    stopSpeaking();
+  }
 
   recognition = new SpeechRecognition();
   recognition.lang = 'zh-CN';
@@ -842,9 +836,9 @@ function queueSpeak(text) {
 function drainSpeakQueue() {
   if (speakQueue.length === 0) {
     isSpeaking = false;
-    // Done speaking — resume listening if stream is also done
-    if (jarvisMode && !streamBubble) {
-      setTimeout(function() { if (jarvisMode) startListening(true); }, 300);
+    // Done speaking — resume listening
+    if (jarvisMode) {
+      setTimeout(function() { if (jarvisMode && !micActive) startListening(true); }, 300);
     }
     return;
   }

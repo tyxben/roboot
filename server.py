@@ -149,18 +149,65 @@ async def api_send_to_session(session_id: str, body: dict):
     return {"result": result}
 
 
-TTS_VOICE = "zh-CN-YunxiNeural"  # 男声，自然
+TTS_VOICE = "zh-CN-YunxiNeural"
+
+
+def _extract_spoken_text(text: str) -> str:
+    """Extract only the part that should be spoken aloud.
+
+    Rules:
+    - Take text before the first code block (```)
+    - Take text before the first markdown list (lines starting with - or *)
+    - Take at most first 3 sentences
+    - Strip markdown formatting
+    """
+    if not text:
+        return ""
+
+    # Cut before code blocks
+    if "```" in text:
+        text = text.split("```")[0]
+
+    # Cut before markdown lists (lines starting with - or * or numbered)
+    lines = text.split("\n")
+    spoken_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(("- ", "* ", "1.", "2.", "3.", "|")):
+            break
+        spoken_lines.append(stripped)
+    text = " ".join(spoken_lines).strip()
+
+    # Strip markdown bold/italic
+    import re
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+
+    # Limit to ~3 sentences
+    sentences = re.split(r'([。！？.!?])', text)
+    result = ""
+    count = 0
+    for i in range(0, len(sentences) - 1, 2):
+        result += sentences[i] + sentences[i + 1]
+        count += 1
+        if count >= 3:
+            break
+    if not result and sentences:
+        result = sentences[0]
+
+    return result.strip()
 
 
 @app.post("/api/tts")
 async def api_tts(body: dict):
-    """Convert text to speech using Edge TTS. Returns mp3 audio."""
-    text = body.get("text", "")
+    """Convert text to speech. Extracts spoken part automatically."""
+    raw = body.get("text", "")
+    text = _extract_spoken_text(raw)
     if not text:
         return Response(content=b"", media_type="audio/mpeg")
 
     comm = edge_tts.Communicate(text, voice=TTS_VOICE, rate="+10%")
-    # Collect all audio bytes
     audio_bytes = b""
     async for chunk in comm.stream():
         if chunk["type"] == "audio":
@@ -175,7 +222,8 @@ async def websocket_endpoint(ws: WebSocket):
     runtime = _get_runtime()
     session = runtime.create_chat_session(system_prompt=runtime._personality)
 
-    await ws.send_json({"type": "response", "content": "你好，我是 Roboot。"})
+    name = _load_config().get("name", "Roboot")
+    await ws.send_json({"type": "response", "content": f"Hey，我是 {name}。有什么事？"})
 
     while True:
         try:
