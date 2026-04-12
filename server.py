@@ -156,50 +156,42 @@ TTS_VOICE_DEFAULT = "zh-CN-YunxiNeural"
 
 
 def _extract_spoken_text(text: str) -> str:
-    """Extract only the part that should be spoken aloud.
+    """Extract lines marked with > (blockquote) — the model's chosen spoken words.
 
-    Rules:
-    - Take text before the first code block (```)
-    - Take text before the first markdown list (lines starting with - or *)
-    - Take at most first 3 sentences
-    - Strip markdown formatting
+    The model is prompted to use > for what should be said aloud.
+    If no > lines found, fall back to first short sentence.
     """
+    import re
+
     if not text:
         return ""
 
-    # Cut before code blocks
-    if "```" in text:
-        text = text.split("```")[0]
-
-    # Cut before markdown lists (lines starting with - or * or numbered)
-    lines = text.split("\n")
+    # Primary: extract > blockquote lines (the model's spoken output)
     spoken_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(("- ", "* ", "1.", "2.", "3.", "|")):
-            break
-        spoken_lines.append(stripped)
-    text = " ".join(spoken_lines).strip()
+    for line in text.split("\n"):
+        if line.startswith("> "):
+            spoken_lines.append(line[2:].strip())
 
-    # Strip markdown bold/italic
-    import re
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'\*(.+?)\*', r'\1', text)
-    text = re.sub(r'`([^`]+)`', r'\1', text)
+    if spoken_lines:
+        result = " ".join(spoken_lines)
+        # Strip any remaining markdown
+        result = re.sub(r"\*\*(.+?)\*\*", r"\1", result)
+        result = re.sub(r"`([^`]+)`", r"\1", result)
+        return result.strip()
 
-    # Limit to ~3 sentences
-    sentences = re.split(r'([。！？.!?])', text)
-    result = ""
-    count = 0
-    for i in range(0, len(sentences) - 1, 2):
-        result += sentences[i] + sentences[i + 1]
-        count += 1
-        if count >= 3:
-            break
-    if not result and sentences:
-        result = sentences[0]
+    # Fallback: no > markers, take first sentence only
+    clean = re.sub(r"```[\s\S]*?```", "", text)
+    clean = re.sub(r"\*\*(.+?)\*\*", r"\1", clean)
+    lines = [l.strip() for l in clean.split("\n") if l.strip() and not l.strip().startswith(("-", "*", "|", "#", "1.", "2.", "3."))]
+    if not lines:
+        return ""
 
-    return result.strip()
+    first = lines[0]
+    # Cut at first sentence end
+    m = re.search(r"[。！？.!?]", first)
+    if m and m.end() < len(first):
+        return first[: m.end()]
+    return first[:80]
 
 
 @app.post("/api/tts")
