@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+from html import escape
 from pathlib import Path
 
 import httpx
@@ -111,25 +113,78 @@ def _truncate_for_telegram(text: str, max_len: int = 4000) -> str:
     return text[:max_len] + "\n\n...(截断)"
 
 
+# ANSI CSI / OSC sequences + stray control chars can break Telegram HTML parsing.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07?|\x1b[@-_]")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _sanitize_terminal_text(text: str) -> str:
+    """Strip ANSI escapes and stray control characters from terminal output.
+
+    Telegram rejects messages containing bell (\\x07), NUL, and other low-ASCII
+    control chars even inside <pre> blocks, which silently fails the HTML parse.
+    """
+    if not text:
+        return ""
+    text = _ANSI_RE.sub("", text)
+    text = _CTRL_RE.sub("", text)
+    return text
+
+
+async def _safe_reply(target, text: str, reply_markup=None, *, edit: bool = False) -> bool:
+    """Send a message, preferring HTML; fall back cleanly to plain text on parse failure.
+
+    `target` should be either a `CallbackQuery` (when edit=True) or a `Message`.
+    Returns True on success.
+    """
+    kwargs = {"reply_markup": reply_markup} if reply_markup else {}
+    try:
+        if edit:
+            await target.edit_message_text(text, parse_mode="HTML", **kwargs)
+        else:
+            await target.reply_text(text, parse_mode="HTML", **kwargs)
+        return True
+    except Exception as e:
+        logger.warning("HTML send failed (%s); falling back to plain text", e)
+
+    # Plain text fallback — strip HTML tags, unescape entities.
+    plain = re.sub(r"<[^>]+>", "", text)
+    plain = (plain.replace("&lt;", "<").replace("&gt;", ">")
+                    .replace("&amp;", "&").replace("&quot;", '"').replace("&#x27;", "'"))
+    try:
+        if edit:
+            await target.edit_message_text(plain[:4000], **kwargs)
+        else:
+            await target.reply_text(plain[:4000], **kwargs)
+        return True
+    except Exception as e:
+        logger.error("Plain text fallback also failed: %s", e)
+        return False
+
+
 # --- Helper: Build session content message ---
 
 async def _build_session_content(session_id: str, project: str) -> tuple[str, InlineKeyboardMarkup]:
     """Read session content and build message + action keyboard."""
     from iterm_bridge import bridge
 
-    content = await bridge.read_session(session_id, num_lines=50)
+    raw = await bridge.read_session(session_id, num_lines=50)
+    content = _sanitize_terminal_text(raw) or "(空)"
 
-    # Build display text — use HTML mode to avoid Markdown parsing issues
-    from html import escape
+    # Build display text — use HTML mode to avoid Markdown parsing issues.
     header = f"📋 会话: {escape(project)}\n\n"
-    escaped_content = escape(content or "(空)")
+    escaped_content = escape(content)
+
+    # Telegram limit: 4096 chars. Reserve headroom for header + <pre></pre>.
+    max_body = 4000 - len(header) - len("<pre></pre>") - 20
+    if len(escaped_content) > max_body:
+        # Keep the tail (most recent terminal output) and re-escape from a
+        # safe slice of the sanitized (not yet escaped) content so we never
+        # slice mid-entity.
+        tail = content[-max_body:]
+        escaped_content = "..." + escape(tail)
 
     full_text = header + f"<pre>{escaped_content}</pre>"
-    # Telegram limit: 4096 chars
-    if len(full_text) > 4000:
-        available = 4000 - len(header) - 20
-        escaped_content = "..." + escape(content[-(available):])
-        full_text = header + f"<pre>{escaped_content}</pre>"
 
     # Action buttons
     keyboard = InlineKeyboardMarkup([
@@ -193,11 +248,38 @@ async def cmd_sessions(update: Update, context) -> None:
     )
 
 
+async def _render_session_view(query, session_id: str, project: str, prefix_html: str = "") -> None:
+    """Render (or re-render) a session's content view with action buttons.
+
+    Tries to edit the current message; if that fails (HTML parse, message
+    deleted, etc.), posts a fresh reply. `prefix_html` is prepended to the body
+    and must be already HTML-safe (escape any variable text).
+    """
+    try:
+        body, keyboard = await _build_session_content(session_id, project)
+    except Exception as e:
+        logger.exception("read_session failed for %s", session_id)
+        await _safe_reply(query.message, f"读取会话失败: {escape(str(e))}")
+        return
+
+    text = (prefix_html + body) if prefix_html else body
+    if len(text) > 4000:
+        # Truncate the prefix, never the body (body already fits and has
+        # balanced <pre> tags).
+        if len(body) <= 4000:
+            text = body
+        else:
+            text = text[:4000]
+
+    if not await _safe_reply(query, text, reply_markup=keyboard, edit=True):
+        await _safe_reply(query.message, text, reply_markup=keyboard)
+
+
 async def callback_handler(update: Update, context) -> None:
     """Handle inline keyboard button presses."""
     query = update.callback_query
     user_id = query.from_user.id
-    print(f"[CALLBACK] user={user_id} data={query.data}", flush=True)
+    logger.info("[CALLBACK] user=%s data=%s", user_id, query.data)
 
     if not _is_allowed(user_id):
         await query.answer("未授权")
@@ -212,7 +294,13 @@ async def callback_handler(update: Update, context) -> None:
     if data.startswith("view:"):
         session_id = data[5:]
         # Find the project name
-        sessions = await bridge.list_sessions()
+        try:
+            sessions = await bridge.list_sessions()
+        except Exception as e:
+            logger.exception("list_sessions failed in view callback")
+            await _safe_reply(query.message, f"无法连接 iTerm2: {escape(str(e))}")
+            return
+
         project = session_id[:8]
         for s in sessions:
             if s.session_id == session_id:
@@ -224,37 +312,14 @@ async def callback_handler(update: Update, context) -> None:
             "project": project,
             "awaiting_command": False,
         }
-
-        try:
-            text, keyboard = await _build_session_content(session_id, project)
-            try:
-                await query.edit_message_text(
-                    text, reply_markup=keyboard, parse_mode="HTML",
-                )
-            except Exception as e:
-                logger.error(f"Edit failed: {e}")
-                await query.message.reply_text(
-                    text, reply_markup=keyboard, parse_mode="HTML",
-                )
-        except Exception as e:
-            logger.error(f"View session error: {e}")
-            await query.message.reply_text(f"读取会话失败: {e}")
+        await _render_session_view(query, session_id, project)
 
     # --- Refresh session content ---
     elif data.startswith("refresh:"):
         session_id = data[8:]
         state = _user_session_state.get(user_id, {})
         project = state.get("project", session_id[:8])
-
-        text, keyboard = await _build_session_content(session_id, project)
-        try:
-            await query.edit_message_text(
-                text, reply_markup=keyboard, parse_mode="HTML",
-            )
-        except Exception:
-            await query.message.reply_text(
-                text, reply_markup=keyboard, parse_mode="HTML",
-            )
+        await _render_session_view(query, session_id, project)
 
     # --- Send command: prompt user to type ---
     elif data.startswith("cmd:"):
@@ -266,64 +331,72 @@ async def callback_handler(update: Update, context) -> None:
             "awaiting_command": True,
         }
         project = state.get("project", session_id[:8])
-        await query.edit_message_text(
-            f"✏️ 请输入要发送到 [{project}] 的命令:\n\n"
-            "(直接打字发送，下一条消息将作为命令发送到该会话)",
-        )
+        # Plain text — no parse_mode needed, project may contain special chars.
+        try:
+            await query.edit_message_text(
+                f"✏️ 请输入要发送到 [{project}] 的命令:\n\n"
+                "(直接打字发送，下一条消息将作为命令发送到该会话)",
+            )
+        except Exception as e:
+            logger.warning("edit for cmd prompt failed: %s", e)
+            await query.message.reply_text(
+                f"✏️ 请输入要发送到 [{project}] 的命令:\n\n"
+                "(直接打字发送，下一条消息将作为命令发送到该会话)",
+            )
 
     # --- Allow (send "y") ---
     elif data.startswith("allow:"):
         session_id = data[6:]
-        result = await bridge.send_text(session_id, "y")
+        try:
+            result = await bridge.send_text(session_id, "y")
+        except Exception as e:
+            logger.exception("send_text y failed")
+            await _safe_reply(query.message, f"发送失败: {escape(str(e))}")
+            return
         state = _user_session_state.get(user_id, {})
         project = state.get("project", session_id[:8])
 
         if result == "sent":
-            # Wait briefly for the session to process, then refresh
             await asyncio.sleep(1)
-            text, keyboard = await _build_session_content(session_id, project)
-            try:
-                await query.edit_message_text(
-                    f"✅ 已发送 'y' 到 {project}\n\n" + text,
-                    reply_markup=keyboard,
-                    parse_mode="HTML",
-                )
-            except Exception:
-                await query.message.reply_text(
-                    f"✅ 已发送 'y' 到 {project}",
-                )
+            prefix = f"✅ 已发送 'y' 到 {escape(project)}\n\n"
+            await _render_session_view(query, session_id, project, prefix_html=prefix)
         else:
-            await query.edit_message_text(f"发送失败: {result}")
+            await _safe_reply(query, f"发送失败: {escape(str(result))}", edit=True)
 
     # --- Deny (send "n") ---
     elif data.startswith("deny:"):
         session_id = data[5:]
-        result = await bridge.send_text(session_id, "n")
+        try:
+            result = await bridge.send_text(session_id, "n")
+        except Exception as e:
+            logger.exception("send_text n failed")
+            await _safe_reply(query.message, f"发送失败: {escape(str(e))}")
+            return
         state = _user_session_state.get(user_id, {})
         project = state.get("project", session_id[:8])
 
         if result == "sent":
             await asyncio.sleep(1)
-            text, keyboard = await _build_session_content(session_id, project)
-            try:
-                await query.edit_message_text(
-                    f"❌ 已发送 'n' 到 {project}\n\n" + text,
-                    reply_markup=keyboard,
-                    parse_mode="HTML",
-                )
-            except Exception:
-                await query.message.reply_text(
-                    f"❌ 已发送 'n' 到 {project}",
-                )
+            prefix = f"❌ 已发送 'n' 到 {escape(project)}\n\n"
+            await _render_session_view(query, session_id, project, prefix_html=prefix)
         else:
-            await query.edit_message_text(f"发送失败: {result}")
+            await _safe_reply(query, f"发送失败: {escape(str(result))}", edit=True)
 
     # --- Back to session list ---
     elif data == "back_to_list":
         _user_session_state.pop(user_id, None)
-        sessions = await bridge.list_sessions()
+        try:
+            sessions = await bridge.list_sessions()
+        except Exception as e:
+            logger.exception("list_sessions failed in back_to_list")
+            await _safe_reply(query.message, f"无法连接 iTerm2: {escape(str(e))}")
+            return
+
         if not sessions:
-            await query.edit_message_text("没有运行中的会话")
+            try:
+                await query.edit_message_text("没有运行中的会话")
+            except Exception:
+                await query.message.reply_text("没有运行中的会话")
             return
 
         buttons = []
@@ -335,10 +408,16 @@ async def callback_handler(update: Update, context) -> None:
             )])
 
         keyboard = InlineKeyboardMarkup(buttons)
-        await query.edit_message_text(
-            f"📋 {len(sessions)} 个会话 — 点击查看详情:",
-            reply_markup=keyboard,
-        )
+        try:
+            await query.edit_message_text(
+                f"📋 {len(sessions)} 个会话 — 点击查看详情:",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            await query.message.reply_text(
+                f"📋 {len(sessions)} 个会话 — 点击查看详情:",
+                reply_markup=keyboard,
+            )
 
 
 async def cmd_remote(update: Update, context) -> None:
@@ -440,38 +519,43 @@ async def handle_message(update: Update, context) -> None:
 
     # Check if user is in "awaiting command" mode for a session
     state = _user_session_state.get(user_id, {})
-    print(f"[MSG] user={user_id} text='{text[:30]}' awaiting={state.get('awaiting_command')}", flush=True)
+    logger.info("[MSG] user=%s text=%r awaiting=%s", user_id, text[:60], state.get("awaiting_command"))
     if state.get("awaiting_command"):
         session_id = state["session_id"]
         project = state.get("project", session_id[:8])
         _user_session_state[user_id]["awaiting_command"] = False
-        logger.info(f"Sending '{text}' to session {project} ({session_id})")
+        logger.info("Sending %r to session %s (%s)", text, project, session_id)
 
         try:
             from iterm_bridge import bridge
             result = await bridge.send_text(session_id, text)
-            logger.info(f"send_text result: {result}")
+            logger.info("send_text result: %s", result)
         except Exception as e:
-            logger.error(f"send_text error: {e}")
+            logger.exception("send_text error")
             await update.message.reply_text(f"发送失败: {e}")
             return
 
-        if result == "sent":
-            await asyncio.sleep(1)
-            try:
-                content_text, keyboard = await _build_session_content(session_id, project)
-                from html import escape
-                reply = f"✅ 已发送到 {escape(project)}:\n<code>{escape(text)}</code>\n\n" + content_text
-                if len(reply) > 4000:
-                    reply = reply[:4000]
-                await update.message.reply_text(
-                    reply, reply_markup=keyboard, parse_mode="HTML",
-                )
-            except Exception as e:
-                logger.error(f"Send command display error: {e}")
-                await update.message.reply_text(f"✅ 已发送到 {project}")
-        else:
+        if result != "sent":
             await update.message.reply_text(f"发送失败: {result}")
+            return
+
+        # Brief pause so the terminal can process the command before we read it.
+        await asyncio.sleep(1)
+
+        # Send a short confirmation first (always delivers, even if rendering
+        # the terminal view fails).
+        ack = f"✅ 已发送到 <b>{escape(project)}</b>:\n<code>{escape(text)}</code>"
+        await _safe_reply(update.message, ack)
+
+        # Then send the refreshed session view as a separate message. This
+        # avoids any risk of the combined message exceeding 4096 chars and
+        # getting sliced mid-HTML-tag.
+        try:
+            content_text, keyboard = await _build_session_content(session_id, project)
+            await _safe_reply(update.message, content_text, reply_markup=keyboard)
+        except Exception as e:
+            logger.exception("build_session_content after send failed")
+            await update.message.reply_text(f"(无法刷新会话视图: {e})")
         return
 
     # Normal chat flow — route through Arcana agent
@@ -560,6 +644,16 @@ async def handle_voice(update: Update, context) -> None:
 
 
 def main():
+    # Surface our own logs (and WARN+ from libs) so debugging the bot locally
+    # — especially the session view / send-command flows — is painless.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
     token = CONFIG.get("telegram", {}).get("bot_token", "") or os.environ.get("TELEGRAM_BOT_TOKEN", "")
     if not token:
         print("需要 Telegram Bot Token:")
