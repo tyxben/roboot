@@ -210,6 +210,100 @@ class ITermBridge:
         except Exception as e:
             return f"Read error: {e}"
 
+    async def read_session_incremental(
+        self,
+        session_id: str,
+        after_line: int | None = None,
+        num_lines_initial: int = 1000,
+        color: bool = False,
+    ) -> dict:
+        """Incremental read.
+
+        - after_line=None  -> initial fetch: return up to num_lines_initial most recent lines.
+        - after_line=<int> -> delta fetch:   return all lines with absolute line number > after_line.
+
+        Returns:
+          {
+            "content":        str,   # rendered lines joined by "\n" (plain or ANSI-escaped if color=True)
+            "last_line":      int,   # absolute line number of the last line returned; -1 if empty
+            "overflow":       int,   # iTerm2's current overflow counter
+            "dropped_prefix": bool,  # True if after_line < overflow (caller's range partly gone)
+            "error":          str,   # only if session not found / API errored; other fields may be omitted
+          }
+        """
+        app = await self._get_app()
+        session = app.get_session_by_id(session_id)
+        if not session:
+            return {"error": f"Session {session_id} not found"}
+
+        try:
+            li = await session.async_get_line_info()
+            overflow = li.overflow
+            total = li.scrollback_buffer_height + li.mutable_area_height
+            # Absolute line numbers valid range: [overflow, overflow + total - 1].
+            last_valid = overflow + total - 1
+
+            dropped_prefix = False
+            do_initial = after_line is None
+
+            if not do_initial:
+                if after_line < overflow:
+                    # Caller's anchor is already gone from the buffer.
+                    dropped_prefix = True
+                    do_initial = True
+                elif after_line >= last_valid:
+                    # Nothing new.
+                    return {
+                        "content": "",
+                        "last_line": after_line,
+                        "overflow": overflow,
+                        "dropped_prefix": False,
+                    }
+
+            if do_initial:
+                # Up to num_lines_initial most recent lines.
+                first_line = overflow + max(0, total - num_lines_initial)
+                count = (overflow + total) - first_line
+            else:
+                first_line = after_line + 1
+                count = (overflow + total) - first_line
+
+            if count <= 0:
+                return {
+                    "content": "",
+                    "last_line": -1 if do_initial else after_line,
+                    "overflow": overflow,
+                    "dropped_prefix": dropped_prefix,
+                }
+
+            lines = await session.async_get_contents(first_line, count)
+            rendered: list[str] = []
+            for line in lines:
+                if color:
+                    rendered.append(_render_line_ansi(line))
+                else:
+                    rendered.append(line.string)
+
+            # Actual last absolute line number returned.
+            actual_count = len(rendered)
+            if actual_count == 0:
+                return {
+                    "content": "",
+                    "last_line": -1 if do_initial else after_line,
+                    "overflow": overflow,
+                    "dropped_prefix": dropped_prefix,
+                }
+            last_line = first_line + actual_count - 1
+
+            return {
+                "content": "\n".join(rendered),
+                "last_line": last_line,
+                "overflow": overflow,
+                "dropped_prefix": dropped_prefix,
+            }
+        except Exception as e:
+            return {"error": f"Read error: {e}"}
+
     async def send_text(self, session_id: str, text: str) -> str:
         """Send text to a session (like typing)."""
         app = await self._get_app()
