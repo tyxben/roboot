@@ -140,9 +140,17 @@ async def api_list_sessions():
 
 
 @app.get("/api/sessions/{session_id}/read")
-async def api_read_session(session_id: str):
-    """Read last N lines from a session via iTerm2 Python API."""
-    content = await bridge.read_session(session_id, num_lines=150)
+async def api_read_session(session_id: str, color: bool = False):
+    """Read last N lines from a session via iTerm2 Python API.
+
+    color=true returns ANSI-escaped content for frontend colorization
+    (via ansi_up or similar). Default stays plain for backwards compat
+    with existing consumers.
+    """
+    if color:
+        content = await bridge.read_session_ansi(session_id, num_lines=150)
+    else:
+        content = await bridge.read_session(session_id, num_lines=150)
     return {"content": content}
 
 

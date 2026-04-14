@@ -378,7 +378,15 @@ body {
     display: none !important;
   }
 }
+/* ANSI palette approximations -- tweak to match your iTerm2 theme */
+#terminal span { white-space: pre-wrap; }
 </style>
+<script type="module">
+  import { AnsiUp } from '/static/ansi_up.js';
+  const au = new AnsiUp();
+  au.use_classes = false;
+  window._ansiToHtml = (txt) => au.ansi_to_html(txt);
+</script>
 </head>
 <body>
 
@@ -567,16 +575,27 @@ function selectSession(id) {
   closeSidebar();
 }
 
+// Strip ANSI CSI/OSC sequences -- used for pattern matching in plain text.
+var ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)/g;
+function stripAnsi(s) { return s.replace(ANSI_RE, ''); }
+
 function refreshSession() {
   if (!currentId) return;
-  fetch('/api/sessions/' + encodeURIComponent(currentId) + '/read')
+  var useColor = typeof window._ansiToHtml === 'function';
+  var url = '/api/sessions/' + encodeURIComponent(currentId) + '/read'
+    + (useColor ? '?color=1' : '');
+  fetch(url)
     .then(function(r) { return r.json(); })
     .then(function(data) {
       var term = document.getElementById('terminal');
       var content = data.content || '(空)';
-      term.textContent = content;
+      if (useColor) {
+        term.innerHTML = window._ansiToHtml(content);
+      } else {
+        term.textContent = content;
+      }
       term.scrollTop = term.scrollHeight;
-      checkForConfirmation(content);
+      checkForConfirmation(useColor ? stripAnsi(content) : content);
     }).catch(function() {
       document.getElementById('terminal').textContent = '读取失败';
     });

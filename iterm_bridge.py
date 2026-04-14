@@ -8,6 +8,104 @@ from dataclasses import dataclass
 import iterm2
 
 
+# --- ANSI rendering helpers ------------------------------------------------
+# Walk LineContents cells and emit SGR escape sequences so the frontend (or
+# any ANSI-aware consumer) can re-render colors/styles. ansi_up on the web
+# side turns these into HTML spans.
+
+_SGR_RESET = "\x1b[0m"
+
+
+def _fg_param(color) -> str:
+    """Return SGR parameter for foreground color, '' for default."""
+    if color is None:
+        return ""
+    if color.is_rgb:
+        c = color.rgb
+        return f"38;2;{c.red};{c.green};{c.blue}"
+    if color.is_standard:
+        n = color.standard
+        if n < 8:
+            return str(30 + n)
+        if n < 16:
+            return str(90 + (n - 8))
+        return f"38;5;{n}"
+    return ""
+
+
+def _bg_param(color) -> str:
+    if color is None:
+        return ""
+    if color.is_rgb:
+        c = color.rgb
+        return f"48;2;{c.red};{c.green};{c.blue}"
+    if color.is_standard:
+        n = color.standard
+        if n < 8:
+            return str(40 + n)
+        if n < 16:
+            return str(100 + (n - 8))
+        return f"48;5;{n}"
+    return ""
+
+
+def _style_sgr(style) -> str:
+    """Build an SGR escape for a CellStyle (empty string = default/no styling)."""
+    if style is None:
+        return ""
+    params: list[str] = []
+    fg = _fg_param(style.fg_color)
+    bg = _bg_param(style.bg_color)
+    if fg:
+        params.append(fg)
+    if bg:
+        params.append(bg)
+    if style.bold:
+        params.append("1")
+    if style.faint:
+        params.append("2")
+    if style.italic:
+        params.append("3")
+    if style.underline:
+        params.append("4")
+    if not params:
+        return ""
+    return f"\x1b[{';'.join(params)}m"
+
+
+def _style_key(style) -> tuple:
+    """Hashable key for change detection between adjacent cells."""
+    if style is None:
+        return ()
+    return (
+        _fg_param(style.fg_color),
+        _bg_param(style.bg_color),
+        style.bold, style.faint, style.italic, style.underline,
+    )
+
+
+def _render_line_ansi(line) -> str:
+    """Render a LineContents to an ANSI-escaped string."""
+    parts: list[str] = []
+    last_key = None
+    x = 0
+    while True:
+        style = line.style_at(x)
+        if style is None:
+            break
+        key = _style_key(style)
+        if key != last_key:
+            parts.append(_SGR_RESET)
+            sgr = _style_sgr(style)
+            if sgr:
+                parts.append(sgr)
+            last_key = key
+        parts.append(line.string_at(x))
+        x += 1
+    parts.append(_SGR_RESET)
+    return "".join(parts).rstrip()
+
+
 @dataclass
 class SessionInfo:
     session_id: str
@@ -88,6 +186,30 @@ class ITermBridge:
         except Exception as e:
             return f"Read error: {e}"
 
+    async def read_session_ansi(self, session_id: str, num_lines: int = 150) -> str:
+        """Like read_session but emits ANSI SGR escapes for cell colors/styles.
+        Frontend can render via ansi_up or similar.
+        """
+        app = await self._get_app()
+        session = app.get_session_by_id(session_id)
+        if not session:
+            return f"Session {session_id} not found"
+
+        try:
+            li = await session.async_get_line_info()
+            total = li.scrollback_buffer_height + li.mutable_area_height
+            start = max(li.overflow, li.overflow + total - num_lines)
+            count = min(num_lines, total)
+            lines = await session.async_get_contents(start, count)
+            out_lines: list[str] = []
+            for line in lines:
+                if not line.string.strip():
+                    continue
+                out_lines.append(_render_line_ansi(line))
+            return "\n".join(out_lines)
+        except Exception as e:
+            return f"Read error: {e}"
+
     async def send_text(self, session_id: str, text: str) -> str:
         """Send text to a session (like typing)."""
         app = await self._get_app()
@@ -96,7 +218,10 @@ class ITermBridge:
             return f"Session {session_id} not found"
 
         try:
-            await session.async_send_text(text + "\n")
+            # Use \r (CR) not \n (LF): TUI apps like Claude Code treat \n as
+            # "insert newline in input" while \r is "press Enter / submit".
+            # Regular shells accept either, so \r is the safer default.
+            await session.async_send_text(text + "\r")
             return "sent"
         except Exception as e:
             return f"Send error: {e}"
