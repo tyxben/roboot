@@ -18,6 +18,11 @@ import websockets
 
 OFFICIAL_RELAY = "wss://relay.coordbound.com"
 
+# Heartbeat: ping interval and pong timeout (seconds).
+# Detects zombie connections (NAT timeout, laptop sleep) within ~60s.
+HEARTBEAT_INTERVAL = 30
+HEARTBEAT_TIMEOUT = 60
+
 
 class RelayClient:
     """Maintains a WebSocket connection to a relay server, forwarding
@@ -38,6 +43,9 @@ class RelayClient:
         self.running = False
         # Map of client_id -> Arcana ChatSession
         self.chat_sessions: dict = {}
+        # Heartbeat tracking (per-connection; reset on each _connect())
+        self._last_pong_at: float = 0.0
+        self._heartbeat_task: asyncio.Task | None = None
 
     @property
     def pairing_url(self) -> str:
@@ -76,6 +84,31 @@ class RelayClient:
                 asyncio.run_coroutine_threadsafe(ws.close(), self._loop)
         print("[relay] Token rotated — new pairing URL generated")
 
+    def revoke_all(self):
+        """Instantly disconnect all remote clients and invalidate current pairing.
+
+        Flow:
+          1. Send {"type":"revoke_all"} to relay DO. The DO broadcasts
+             {"type":"revoked"} to all clients, closes their sockets, and
+             deletes the stored pairing token so no new clients can pair.
+          2. Rotate our own token/session locally -- the old link is dead.
+
+        Safe to call from any thread (the server's FastAPI thread).
+        """
+        ws = self.ws
+        loop = self._loop
+        if ws is not None and loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    ws.send(json.dumps({"type": "revoke_all"})), loop
+                )
+            except Exception as e:
+                print(f"[relay] Failed to send revoke_all: {e}")
+        # Rotate locally -- this also closes the old socket, so even if the
+        # relay didn't receive revoke_all, all clients get dropped.
+        self.rotate_token()
+        print("[relay] All remote access revoked")
+
     async def start(self):
         """Start relay connection with auto-reconnect and exponential backoff."""
         self._loop = asyncio.get_event_loop()
@@ -100,6 +133,7 @@ class RelayClient:
         url = f"{self.relay_url}/ws/daemon/{self.session_id}?token={self.token}"
         async with websockets.connect(url) as ws:
             self.ws = ws
+            self._last_pong_at = time.time()
             # Register with relay
             await ws.send(
                 json.dumps(
@@ -112,15 +146,55 @@ class RelayClient:
             )
             print("[relay] Connected to relay")
 
-            # Process incoming messages until disconnect
-            async for raw_message in ws:
-                await self._handle_message(raw_message)
+            # Start heartbeat task -- pings the relay every 30s; if no pong
+            # within HEARTBEAT_TIMEOUT seconds, close the socket so the outer
+            # reconnect loop reconnects.
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+            try:
+                # Process incoming messages until disconnect
+                async for raw_message in ws:
+                    await self._handle_message(raw_message)
+            finally:
+                if self._heartbeat_task is not None:
+                    self._heartbeat_task.cancel()
+                    self._heartbeat_task = None
+
+    async def _heartbeat_loop(self, ws):
+        """Send periodic pings; close socket if pong not received in time."""
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                # Bail out if the socket was swapped (rotate_token / revoke)
+                if ws is not self.ws:
+                    return
+                # Detect zombie: no pong received for > HEARTBEAT_TIMEOUT s
+                if time.time() - self._last_pong_at > HEARTBEAT_TIMEOUT:
+                    print("[relay] Heartbeat timeout — closing connection")
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    return
+                try:
+                    await ws.send(
+                        json.dumps({"type": "ping", "ts": int(time.time() * 1000)})
+                    )
+                except Exception:
+                    return
+        except asyncio.CancelledError:
+            return
 
     async def _handle_message(self, raw: str):
         """Handle a message forwarded from a mobile client via the relay."""
         try:
             msg = json.loads(raw)
             msg_type = msg.get("type")
+
+            # Heartbeat pong from relay -- not client-scoped
+            if msg_type == "pong":
+                self._last_pong_at = time.time()
+                return
+
             client_id = msg.get("client_id", "default")
 
             if msg_type == "client_hello":

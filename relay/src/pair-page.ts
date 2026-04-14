@@ -370,6 +370,14 @@ var reconnectDelay = 1000;
 var sessions = [];
 var currentId = null;
 var autoTimer = null;
+// Heartbeat: send ping every 30s; if no pong within 60s close + reconnect.
+var HEARTBEAT_INTERVAL_MS = 30000;
+var HEARTBEAT_TIMEOUT_MS = 60000;
+var _hbPingTimer = null;
+var _hbWatchdog = null;
+var _lastPongAt = 0;
+// Revoked flag -- when set, suppress auto-reconnect and show final screen.
+var _revoked = false;
 
 // === Mobile Sidebar ===
 function toggleSidebar() {
@@ -464,12 +472,23 @@ function connectWS() {
     document.getElementById('chat-send-btn').disabled = false;
     // Load sessions list
     setTimeout(loadSessions, 500);
+    startHeartbeat();
   };
 
   ws.onmessage = function(e) {
     var data = JSON.parse(e.data);
 
-    if (data.type === 'thinking') {
+    if (data.type === 'pong') {
+      _lastPongAt = Date.now();
+      return;
+    } else if (data.type === 'revoked') {
+      _revoked = true;
+      stopHeartbeat();
+      showRevokedScreen(data.reason || 'daemon_revoked');
+      try { ws.close(); } catch(_e) {}
+      return;
+
+    } else if (data.type === 'thinking') {
       removeThinking();
       addThinking();
       if (jarvisMode) setJarvisState('thinking');
@@ -553,7 +572,12 @@ function connectWS() {
   ws.onclose = function() {
     connected = false;
     ws = null;
+    stopHeartbeat();
     document.getElementById('chat-send-btn').disabled = true;
+    if (_revoked) {
+      setConnStatus('Access revoked', false);
+      return;
+    }
     setConnStatus('Disconnected. Reconnecting...', false);
     if (reconnectDelay <= 30000) {
       setTimeout(function() {
@@ -564,6 +588,45 @@ function connectWS() {
   };
 
   ws.onerror = function() {};
+}
+
+// === Heartbeat ===
+function startHeartbeat() {
+  stopHeartbeat();
+  _lastPongAt = Date.now();
+  _hbPingTimer = setInterval(function() {
+    if (!ws || ws.readyState !== 1) return;
+    try {
+      ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+    } catch (_e) {}
+  }, HEARTBEAT_INTERVAL_MS);
+  _hbWatchdog = setInterval(function() {
+    if (!ws || ws.readyState !== 1) return;
+    if (Date.now() - _lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+      // Zombie connection -- close; onclose will trigger reconnect.
+      try { ws.close(); } catch (_e) {}
+    }
+  }, 5000);
+}
+
+function stopHeartbeat() {
+  if (_hbPingTimer) { clearInterval(_hbPingTimer); _hbPingTimer = null; }
+  if (_hbWatchdog) { clearInterval(_hbWatchdog); _hbWatchdog = null; }
+}
+
+// === Revoked screen ===
+function showRevokedScreen(reason) {
+  var body = document.body;
+  body.innerHTML = ''
+    + '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;'
+    + 'height:100vh;padding:24px;text-align:center;background:var(--bg);color:var(--text);font-family:-apple-system,\\"PingFang SC\\",system-ui,sans-serif;">'
+    + '<div style="width:72px;height:72px;border-radius:50%;background:rgba(248,81,73,0.15);'
+    + 'display:flex;align-items:center;justify-content:center;font-size:36px;margin-bottom:20px;">\\ud83d\\udd12</div>'
+    + '<h1 style="font-size:20px;font-weight:600;margin-bottom:10px;">访问已撤销</h1>'
+    + '<p style="color:var(--text-dim);font-size:14px;max-width:320px;line-height:1.5;">'
+    + '主机已撤销此配对链接。请向机主获取新的配对二维码。</p>'
+    + '<p style="color:var(--text-dim);font-size:11px;margin-top:20px;">reason: ' + reason + '</p>'
+    + '</div>';
 }
 
 function chatSend() {
