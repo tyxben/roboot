@@ -110,7 +110,8 @@ async function testDaemonAndClientFlow(): Promise<void> {
   // 1. Connect daemon with token
   console.log("  Connecting daemon...");
   const daemon = await connectWs(`/ws/daemon/${sessionId}?token=${token}`);
-  daemon.send(JSON.stringify({ type: "daemon_hello", version: "1.0" }));
+  // With E2EE, only whitelisted types are forwarded. Use an e2ee_handshake
+  // frame as a relay-round-trip probe since it traverses the DO verbatim.
   await sleep(200);
 
   // 2. Check session is active
@@ -121,21 +122,39 @@ async function testDaemonAndClientFlow(): Promise<void> {
   // 3. Connect client with same token
   console.log("  Connecting client...");
   const client = await connectWs(`/ws/client/${sessionId}?token=${token}`);
-  client.send(JSON.stringify({ type: "client_hello" }));
   await sleep(200);
 
-  // 4. Client -> Daemon
+  // 4. Client -> Daemon (handshake probe is forwarded; plaintext types are dropped)
   console.log("  Testing client -> daemon...");
   const daemonMsgPromise = waitForMessage(daemon);
-  const clientPayload = JSON.stringify({ type: "chat", text: "Hello from client" });
+  const clientPayload = JSON.stringify({
+    type: "e2ee_handshake",
+    client_id: "test-client",
+    pubkey: "dGVzdA==",
+  });
   client.send(clientPayload);
   const daemonReceived = await daemonMsgPromise;
-  assert(daemonReceived === clientPayload, "Daemon received client message");
+  assert(daemonReceived === clientPayload, "Daemon received client handshake");
 
-  // 5. Daemon -> Client (broadcast)
+  // 4b. Non-whitelisted types MUST be dropped by the relay.
+  console.log("  Testing plaintext filter...");
+  let droppedOk = true;
+  const sawPlain = waitForMessage(daemon, 500).then(() => {
+    droppedOk = false;
+  }).catch(() => {});
+  client.send(JSON.stringify({ type: "chat", text: "should be dropped" }));
+  await sawPlain;
+  assert(droppedOk, "Plaintext chat frame was dropped by relay");
+
+  // 5. Daemon -> Client (broadcast of encrypted envelope)
   console.log("  Testing daemon -> client...");
   const clientMsgPromise = waitForMessage(client);
-  const daemonPayload = JSON.stringify({ type: "response", text: "Hello from daemon" });
+  const daemonPayload = JSON.stringify({
+    type: "encrypted",
+    client_id: "test-client",
+    iv: "AAAAAAAAAAAAAAAA",
+    ct: "ZmFrZQ==",
+  });
   daemon.send(daemonPayload);
   const clientReceived = await clientMsgPromise;
   assert(clientReceived === daemonPayload, "Client received daemon broadcast");
@@ -157,21 +176,24 @@ async function testMultipleClients(): Promise<void> {
   const token = generateToken();
 
   const daemon = await connectWs(`/ws/daemon/${sessionId}?token=${token}`);
-  daemon.send(JSON.stringify({ type: "daemon_hello", version: "1.0" }));
   await sleep(200);
 
   // Connect 3 clients with valid token
   const clients: WebSocket[] = [];
   for (let i = 0; i < 3; i++) {
     const c = await connectWs(`/ws/client/${sessionId}?token=${token}`);
-    c.send(JSON.stringify({ type: "client_hello" }));
     clients.push(c);
   }
   await sleep(200);
 
-  // Daemon broadcasts -> all clients receive
+  // Daemon broadcasts an encrypted envelope -> all clients receive it verbatim
   const promises = clients.map((c) => waitForMessage(c));
-  const broadcastMsg = JSON.stringify({ type: "broadcast", data: "to all" });
+  const broadcastMsg = JSON.stringify({
+    type: "encrypted",
+    client_id: "broadcast",
+    iv: "AAAAAAAAAAAAAAAA",
+    ct: "ZmFrZQ==",
+  });
   daemon.send(broadcastMsg);
 
   const results = await Promise.all(promises);
@@ -190,11 +212,9 @@ async function testDaemonDisconnectCleansUp(): Promise<void> {
   const token = generateToken();
 
   const daemon = await connectWs(`/ws/daemon/${sessionId}?token=${token}`);
-  daemon.send(JSON.stringify({ type: "daemon_hello", version: "1.0" }));
   await sleep(200);
 
   const client = await connectWs(`/ws/client/${sessionId}?token=${token}`);
-  client.send(JSON.stringify({ type: "client_hello" }));
   await sleep(200);
 
   const closePromise = waitForClose(client, 5000);
@@ -235,7 +255,6 @@ async function testWrongTokenRejected(): Promise<void> {
 
   // Daemon connects with its token
   const daemon = await connectWs(`/ws/daemon/${sessionId}?token=${daemonToken}`);
-  daemon.send(JSON.stringify({ type: "daemon_hello", version: "1.0" }));
   await sleep(200);
 
   // Client tries with a different token -> should be rejected (403)
