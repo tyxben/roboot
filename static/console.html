@@ -521,6 +521,9 @@ var currentId = null;
 var autoTimer = null;
 var ws = null;
 var thinkingEl = null;
+// Tracks the last absolute iTerm2 line number we've rendered per session,
+// so polling can fetch only the delta after the first load.
+var lastLineBySession = {};
 
 var CONFIRM_PATTERNS = [
   /Do you want to proceed/i, /\[Y\/n\]/, /\[y\/N\]/, /\(y\/n\)/i,
@@ -558,6 +561,9 @@ function renderSessionList() {
 function selectSession(id) {
   if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
   currentId = id;
+  // Fresh session open: clear any prior line-anchor and wipe the terminal
+  // DOM so the next refresh does a full initial fetch.
+  delete lastLineBySession[id];
   var s = sessions.find(function(x) { return x.id === id; });
   renderSessionList();
   document.getElementById('chat-tab').classList.remove('active');
@@ -565,7 +571,9 @@ function selectSession(id) {
   showPanel('session');
   document.getElementById('sv-title').textContent = s ? (s.project || s.name) : id;
   document.getElementById('sv-meta').textContent = s ? s.name : '';
-  document.getElementById('terminal').textContent = '读取中...';
+  var term = document.getElementById('terminal');
+  term.innerHTML = '';
+  term.textContent = '读取中...';
   document.getElementById('confirm-bar').classList.remove('visible');
   refreshSession();
   autoTimer = setInterval(refreshSession, 3000);
@@ -582,22 +590,76 @@ function stripAnsi(s) { return s.replace(ANSI_RE, ''); }
 function refreshSession() {
   if (!currentId) return;
   var useColor = typeof window._ansiToHtml === 'function';
-  var url = '/api/sessions/' + encodeURIComponent(currentId) + '/read'
-    + (useColor ? '?color=1' : '');
+  var sid = currentId;
+  var lastLine = lastLineBySession[sid];
+  var initial = (typeof lastLine === 'undefined');
+  var params = [];
+  if (useColor) params.push('color=1');
+  if (!initial) params.push('after=' + encodeURIComponent(lastLine));
+  var url = '/api/sessions/' + encodeURIComponent(sid) + '/read'
+    + (params.length ? '?' + params.join('&') : '');
+
   fetch(url)
     .then(function(r) { return r.json(); })
     .then(function(data) {
+      // Guard: user may have switched sessions mid-flight.
+      if (currentId !== sid) return;
       var term = document.getElementById('terminal');
-      var content = data.content || '(空)';
-      if (useColor) {
-        term.innerHTML = window._ansiToHtml(content);
-      } else {
-        term.textContent = content;
+
+      // Incremental response from server carries dropped_prefix; if the
+      // caller's anchor fell out of iTerm2's scrollback, rewind to initial.
+      if (!initial && data.dropped_prefix === true) {
+        delete lastLineBySession[sid];
+        term.innerHTML = '';
+        // Rerun as initial fetch in the same tick.
+        refreshSession();
+        return;
       }
-      term.scrollTop = term.scrollHeight;
-      checkForConfirmation(useColor ? stripAnsi(content) : content);
+
+      var content = typeof data.content === 'string' ? data.content : '';
+
+      if (initial) {
+        var rendered = content.length ? content : '(空)';
+        if (useColor) {
+          term.innerHTML = window._ansiToHtml(rendered);
+        } else {
+          term.textContent = rendered;
+        }
+        if (typeof data.last_line === 'number' && data.last_line >= 0) {
+          lastLineBySession[sid] = data.last_line;
+        }
+        term.scrollTop = term.scrollHeight;
+      } else {
+        // Delta append only if there's new content.
+        if (content.length > 0) {
+          // Preserve scroll position when user is reading history.
+          var stickToBottom = (term.scrollTop + term.clientHeight >= term.scrollHeight - 20);
+          // Prefix with a newline so appended lines start on a fresh row,
+          // matching how join("\n") works server-side.
+          var chunk = useColor ? window._ansiToHtml(content) : content;
+          if (useColor) {
+            term.insertAdjacentHTML('beforeend', '\n' + chunk);
+          } else {
+            term.appendChild(document.createTextNode('\n' + chunk));
+          }
+          if (stickToBottom) term.scrollTop = term.scrollHeight;
+        }
+        if (typeof data.last_line === 'number' && data.last_line >= 0) {
+          lastLineBySession[sid] = data.last_line;
+        }
+      }
+
+      // Confirmation prompts appear at the end of output -- a partial tail
+      // suffices when we're in incremental mode. Skip when delta is empty
+      // so the bar doesn't flicker away while a prompt is still waiting.
+      if (initial || content.length > 0) {
+        checkForConfirmation(useColor ? stripAnsi(content) : content);
+      }
     }).catch(function() {
-      document.getElementById('terminal').textContent = '读取失败';
+      if (currentId !== sid) return;
+      if (initial) {
+        document.getElementById('terminal').textContent = '读取失败';
+      }
     });
 }
 

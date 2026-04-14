@@ -140,18 +140,37 @@ async def api_list_sessions():
 
 
 @app.get("/api/sessions/{session_id}/read")
-async def api_read_session(session_id: str, color: bool = False):
-    """Read last N lines from a session via iTerm2 Python API.
+async def api_read_session(session_id: str, color: bool = False, after: int | None = None):
+    """Read lines from a session via iTerm2 Python API.
 
     color=true returns ANSI-escaped content for frontend colorization
     (via ansi_up or similar). Default stays plain for backwards compat
     with existing consumers.
+
+    after=<int> switches to incremental mode: returns only lines with
+    absolute line number greater than `after`, plus bookkeeping fields
+    (`last_line`, `overflow`, `dropped_prefix`). When `after` is omitted,
+    behavior matches the prior API but the JSON body now also always
+    includes `last_line` so clients can seamlessly pivot to incremental
+    polling. Unknown-field-tolerant consumers are unaffected.
     """
-    if color:
-        content = await bridge.read_session_ansi(session_id, num_lines=150)
-    else:
-        content = await bridge.read_session(session_id, num_lines=150)
-    return {"content": content}
+    if after is not None:
+        result = await bridge.read_session_incremental(
+            session_id, after_line=after, color=color
+        )
+        return result
+
+    # Non-incremental path — use the incremental reader internally so we
+    # can report last_line back to the frontend for its first poll.
+    initial = await bridge.read_session_incremental(
+        session_id, after_line=None, num_lines_initial=1000, color=color
+    )
+    if "error" in initial and "content" not in initial:
+        return {"content": initial["error"], "last_line": -1}
+    return {
+        "content": initial.get("content", ""),
+        "last_line": initial.get("last_line", -1),
+    }
 
 
 @app.get("/api/network-info")
