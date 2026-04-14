@@ -32,6 +32,15 @@ const DAEMON_TAG = "daemon";
 const CLIENT_TAG_PREFIX = "client:";
 
 /**
+ * Heartbeat config. Each end sends {"type":"ping","ts":...} every 30s.
+ * Peer replies {"type":"pong","ts":<original>}. If a side sees no ping for
+ * HEARTBEAT_STALE_MS, it treats the connection as dead and closes.
+ */
+const HEARTBEAT_STALE_MS = 90 * 1000;
+/** Close code used when revoking all remote access. */
+const REVOKE_CLOSE_CODE = 4001;
+
+/**
  * Constant-time string comparison to prevent timing attacks on token verification.
  * Uses XOR accumulation so execution time is independent of where strings differ.
  */
@@ -176,6 +185,43 @@ export class RelaySession implements DurableObject {
     const isDaemon = this.isDaemonSocket(ws);
     const msgData = typeof message === "string" ? message : new TextDecoder().decode(message);
 
+    // Track last-seen per connection for heartbeat-based zombie detection.
+    // Uses the serialized attachment slot so it survives hibernation.
+    try {
+      ws.serializeAttachment({ lastSeenAt: Date.now() });
+    } catch {
+      // serializeAttachment may be unavailable in some runtimes; ignore.
+    }
+
+    // --- Intercept control messages (heartbeat + revoke) before forwarding ---
+    let parsed: { type?: string; ts?: number } | null = null;
+    try {
+      parsed = JSON.parse(msgData);
+    } catch {
+      parsed = null;
+    }
+
+    if (parsed && typeof parsed.type === "string") {
+      // Heartbeat: reply to ping locally, do NOT forward to peer.
+      if (parsed.type === "ping") {
+        try {
+          ws.send(JSON.stringify({ type: "pong", ts: parsed.ts ?? Date.now() }));
+        } catch {
+          // connection closed; ignore
+        }
+        return;
+      }
+      // Ignore stray pongs (shouldn't forward either).
+      if (parsed.type === "pong") {
+        return;
+      }
+      // Daemon-only: revoke all remote access.
+      if (parsed.type === "revoke_all" && isDaemon) {
+        await this.revokeAllClients();
+        return;
+      }
+    }
+
     if (isDaemon) {
       // Daemon -> broadcast to all clients
       this.broadcastToClients(msgData);
@@ -214,6 +260,9 @@ export class RelaySession implements DurableObject {
 
   /** Called when the inactivity alarm fires. */
   async alarm(): Promise<void> {
+    // Always sweep zombie sockets first.
+    this.sweepZombies();
+
     const lastActivity = (await this.state.storage.get<number>("lastActivity")) ?? 0;
     const elapsed = Date.now() - lastActivity;
 
@@ -281,6 +330,56 @@ export class RelaySession implements DurableObject {
         client.close(code, reason);
       } catch {
         // already closed
+      }
+    }
+  }
+
+  /**
+   * Broadcast a revoke notice to all clients, close their sockets, and wipe
+   * the stored pairing token so no new clients can connect with the old URL.
+   * The daemon stays connected — it will rotate its own token and resume.
+   */
+  private async revokeAllClients(): Promise<void> {
+    const clients = this.getClientWebSockets();
+    const notice = JSON.stringify({ type: "revoked", reason: "daemon_revoked" });
+    for (const client of clients) {
+      try {
+        client.send(notice);
+      } catch {
+        // already closed
+      }
+      try {
+        client.close(REVOKE_CLOSE_CODE, "Revoked by daemon");
+      } catch {
+        // already closed
+      }
+    }
+    // Wipe token so any in-flight pairing attempts with the old URL fail.
+    await this.state.storage.delete(TOKEN_KEY);
+  }
+
+  /**
+   * Close any connection whose last_seen is older than HEARTBEAT_STALE_MS.
+   * Called from alarm() so zombie sockets are cleaned up within ~1 sweep.
+   */
+  private sweepZombies(): void {
+    const now = Date.now();
+    const all = this.state.getWebSockets();
+    for (const ws of all) {
+      let lastSeen = 0;
+      try {
+        const attach = ws.deserializeAttachment() as { lastSeenAt?: number } | null;
+        lastSeen = attach?.lastSeenAt ?? 0;
+      } catch {
+        lastSeen = 0;
+      }
+      // If we've never heard from the peer, grace-period by using lastActivity.
+      if (lastSeen > 0 && now - lastSeen > HEARTBEAT_STALE_MS) {
+        try {
+          ws.close(1001, "Heartbeat timeout");
+        } catch {
+          // already closed
+        }
       }
     }
   }

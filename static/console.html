@@ -482,9 +482,12 @@ body {
             <img id="relay-qr-img" style="max-width:250px;width:100%;border-radius:12px;background:white;padding:10px;box-shadow:0 4px 12px rgba(0,0,0,0.3);">
           </div>
           <div id="relay-url" style="font-family:'SF Mono','Menlo',monospace;font-size:11px;color:var(--accent);background:rgba(0,0,0,0.3);padding:8px 12px;border-radius:6px;word-break:break-all;cursor:pointer;" onclick="copyToClipboard(this.textContent)"></div>
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;gap:8px;flex-wrap:wrap;">
             <span id="relay-expiry" style="font-size:11px;color:var(--text-dim);"></span>
-            <button onclick="refreshRelayToken()" style="font-size:12px;padding:4px 12px;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;">Refresh Link</button>
+            <div style="display:flex;gap:6px;">
+              <button onclick="refreshRelayToken()" style="font-size:12px;padding:4px 12px;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;">Refresh Link</button>
+              <button onclick="revokeRelayAccess()" style="font-size:12px;padding:4px 12px;background:var(--red);color:#fff;border:none;border-radius:6px;cursor:pointer;">撤销所有远程访问</button>
+            </div>
           </div>
         </div>
 
@@ -778,6 +781,28 @@ function refreshRelayToken() {
     })
     .catch(function() {
       showToast('Failed to refresh relay link');
+    });
+}
+
+function revokeRelayAccess() {
+  var ok = window.confirm('确认撤销？所有已连接的远程设备将立即断开，当前配对链接作废。');
+  if (!ok) return;
+  fetch('/api/relay-revoke', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.enabled && data.pairing_url) {
+        document.getElementById('relay-url').textContent = data.pairing_url;
+        document.getElementById('relay-qr-img').src = '/api/relay-qr?t=' + Date.now();
+        showToast('已撤销所有远程访问');
+        if (data.expires_at) {
+          scheduleRelayRefresh(data.expires_at);
+        }
+      } else {
+        showToast('Relay 未启用');
+      }
+    })
+    .catch(function() {
+      showToast('撤销失败');
     });
 }
 

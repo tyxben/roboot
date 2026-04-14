@@ -15,6 +15,7 @@ server.py (FastAPI)              <- Main entry point
 +-- REST /api/tts                <- Edge TTS (text -> mp3)
 +-- REST /api/relay-info         <- Relay pairing URL + expiry
 +-- REST /api/relay-refresh      <- Rotate relay token (POST)
++-- REST /api/relay-revoke       <- Kick all clients + rotate (POST)
 +-- REST /api/relay-qr           <- QR code PNG for relay pairing URL
 +-- REST /api/network-info       <- Local IP addresses
 +-- REST /api/qr-code            <- QR code PNG for LAN URL
@@ -102,6 +103,13 @@ API endpoints for token management:
 - `GET /api/relay-info` -- returns pairing URL and expiry timestamp
 - `POST /api/relay-refresh` -- rotates token, returns new pairing URL
 - `GET /api/relay-qr` -- QR code PNG for current pairing URL
+- `POST /api/relay-revoke` -- kicks all remote clients and rotates token
+
+### Revoke All Remote Access
+The local console has a red "撤销所有远程访问" button. It calls `POST /api/relay-revoke`, which invokes `RelayClient.revoke_all()`. Flow: daemon sends `{"type":"revoke_all"}` to the relay DO; the DO broadcasts `{"type":"revoked","reason":"daemon_revoked"}` to all clients and closes their sockets with code 4001, then deletes the stored pairing token so the old URL is dead; the daemon then rotates its own token. The remote pair page shows a Chinese "访问已撤销" screen and suppresses auto-reconnect. Use this if a pairing link leaks.
+
+### WebSocket Heartbeat
+Both daemon (`relay_client.py`) and mobile client (`pair-page.ts`) send `{"type":"ping","ts":<ms>}` every 30s. The relay DO (`relay-session.ts`) replies `{"type":"pong","ts":<original>}` and never forwards ping/pong to the peer. If no pong arrives within 60s, the sender closes its socket, which triggers reconnect (daemon) or the revoked flag path (client). The DO also tracks `lastSeenAt` per connection via `serializeAttachment`; when its alarm fires, it closes any socket that hasn't sent anything in 90s. Heartbeat frames stay outside any future E2EE envelope so the relay can route them.
 
 ### Streaming Protocol
 WebSocket messages from server to frontend:

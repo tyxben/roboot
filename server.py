@@ -198,6 +198,22 @@ async def api_relay_refresh():
     return {"enabled": False}
 
 
+@app.post("/api/relay-revoke")
+async def api_relay_revoke():
+    """Revoke all remote access: broadcast to clients, close their sockets,
+    invalidate the current pairing token, and rotate to a fresh link."""
+    global _relay_client
+    if _relay_client:
+        _relay_client.revoke_all()
+        return {
+            "enabled": True,
+            "revoked": True,
+            "pairing_url": _relay_client.pairing_url,
+            "expires_at": _relay_client.token_created_at + _relay_client.token_ttl,
+        }
+    return {"enabled": False, "revoked": False}
+
+
 @app.get("/api/qr-code")
 async def api_qr_code():
     """Generate QR code PNG for the primary network URL."""
