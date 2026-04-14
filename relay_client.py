@@ -501,20 +501,56 @@ class RelayClient:
             )
 
     async def _on_read_session(self, client_id: str, msg: dict):
-        """Read content from a specific iTerm2 session."""
+        """Read content from a specific iTerm2 session.
+
+        Supports incremental fetch: if `after_line` is present the daemon
+        only returns lines newer than that cursor. The response carries
+        `last_line` (cursor for next poll) and `dropped_prefix` (iTerm2
+        scrollback rolled over — client must do a full refresh).
+        """
         session_id = msg.get("session_id", "")
+        after_line = msg.get("after_line")
         try:
             from iterm_bridge import bridge
 
-            content = await bridge.read_session(session_id, num_lines=150)
+            result = await bridge.read_session_incremental(
+                session_id=session_id,
+                after_line=after_line,
+                num_lines_initial=1000,
+                color=False,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                await self._send_to_client(
+                    client_id,
+                    {
+                        "type": "session_content",
+                        "session_id": session_id,
+                        "content": f"Error: {result['error']}",
+                        "last_line": -1,
+                        "dropped_prefix": False,
+                    },
+                )
+                return
             await self._send_to_client(
                 client_id,
-                {"type": "session_content", "session_id": session_id, "content": content},
+                {
+                    "type": "session_content",
+                    "session_id": session_id,
+                    "content": result.get("content", ""),
+                    "last_line": result.get("last_line", -1),
+                    "dropped_prefix": bool(result.get("dropped_prefix", False)),
+                },
             )
         except Exception as e:
             await self._send_to_client(
                 client_id,
-                {"type": "session_content", "session_id": session_id, "content": f"Error: {e}"},
+                {
+                    "type": "session_content",
+                    "session_id": session_id,
+                    "content": f"Error: {e}",
+                    "last_line": -1,
+                    "dropped_prefix": False,
+                },
             )
 
     async def _on_send_session(self, client_id: str, msg: dict):

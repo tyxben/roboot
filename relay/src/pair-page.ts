@@ -370,6 +370,8 @@ var reconnectDelay = 1000;
 var sessions = [];
 var currentId = null;
 var autoTimer = null;
+// Per-session incremental cursor. undefined => need full initial fetch.
+var lastLineBySession = {};
 // Heartbeat: send ping every 30s; if no pong within 60s close + reconnect.
 var HEARTBEAT_INTERVAL_MS = 30000;
 var HEARTBEAT_TIMEOUT_MS = 60000;
@@ -728,8 +730,30 @@ function connectWS() {
     } else if (data.type === 'session_content') {
       if (data.session_id === currentId) {
         var term = document.getElementById('terminal');
-        term.textContent = data.content || '(empty)';
-        term.scrollTop = term.scrollHeight;
+        var content = data.content || '';
+        var lastLine = (typeof data.last_line === 'number') ? data.last_line : -1;
+        var droppedPrefix = !!data.dropped_prefix;
+        // iTerm2 scrollback rolled past our cursor — drop state, full refetch next tick.
+        if (droppedPrefix) {
+          delete lastLineBySession[currentId];
+          term.textContent = '';
+          refreshSession();
+          return;
+        }
+        // Preserve scroll if the user is reading history; only pin to bottom
+        // when they were already near it (within 40px).
+        var nearBottom = (term.scrollHeight - term.scrollTop - term.clientHeight) < 40;
+        if (lastLineBySession[currentId] === undefined) {
+          // Initial fetch: replace.
+          term.textContent = content || '(empty)';
+        } else if (content) {
+          // Incremental: append only non-empty delta. read_session_incremental
+          // returns newline-terminated chunks so concatenation is safe.
+          if (term.textContent === '(empty)') term.textContent = '';
+          term.textContent += content;
+        }
+        if (lastLine >= 0) lastLineBySession[currentId] = lastLine;
+        if (nearBottom) term.scrollTop = term.scrollHeight;
       }
 
     } else if (data.type === 'session_sent') {
@@ -894,6 +918,8 @@ function selectSession(id) {
   showPanel('session');
   document.getElementById('sv-title').textContent = s ? (s.project || s.name) : id;
   document.getElementById('sv-meta').textContent = s ? s.name : '';
+  // Reset incremental cursor + clear terminal so first fetch is a full tail.
+  delete lastLineBySession[id];
   document.getElementById('terminal').textContent = 'Loading...';
   refreshSession();
   autoTimer = setInterval(refreshSession, 3000);
@@ -903,7 +929,12 @@ function selectSession(id) {
 
 function refreshSession() {
   if (!currentId || !ws || ws.readyState !== 1) return;
-  secureSend({ type: 'read_session', session_id: currentId });
+  var cursor = lastLineBySession[currentId];
+  if (cursor === undefined) {
+    secureSend({ type: 'read_session', session_id: currentId });
+  } else {
+    secureSend({ type: 'read_session', session_id: currentId, after_line: cursor });
+  }
 }
 
 function toggleAuto() {
