@@ -371,6 +371,122 @@ var sessions = [];
 var currentId = null;
 var autoTimer = null;
 
+// === E2EE state ===
+// Each WebSocket connection gets a fresh ECDH keypair + derived AES-GCM key.
+// All app messages are wrapped in {type:"encrypted",iv,ct}; the handshake
+// itself travels in the clear so the Cloudflare relay can still route it.
+var CLIENT_ID = (crypto.randomUUID ? crypto.randomUUID() :
+  ('xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx').replace(/[xy]/g, function(c) {
+    var r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  }));
+var e2eeKey = null;        // CryptoKey for AES-GCM (after handshake)
+var e2eeReady = false;     // true once both pubkeys have been exchanged
+var e2eeKeypair = null;    // our ephemeral ECDH keypair for this WS
+var preHandshakeQueue = []; // outbound app messages buffered until handshake done
+var DEBUG_E2EE = false;    // flip to true in devtools to log (meta only, no plaintext)
+
+function _b64FromBytes(bytes) {
+  var s = '';
+  for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+function _bytesFromB64(b64) {
+  var s = atob(b64);
+  var out = new Uint8Array(s.length);
+  for (var i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+
+function resetE2EE() {
+  e2eeKey = null;
+  e2eeReady = false;
+  e2eeKeypair = null;
+  preHandshakeQueue = [];
+}
+
+async function startHandshake() {
+  // Generate an ephemeral P-256 keypair, ship the raw pubkey to the daemon.
+  // deriveBits is needed so we can feed the ECDH output through HKDF
+  // below — WebCrypto can't chain ECDH -> HKDF in a single deriveKey call.
+  e2eeKeypair = await crypto.subtle.generateKey(
+    { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']
+  );
+  var rawPub = new Uint8Array(
+    await crypto.subtle.exportKey('raw', e2eeKeypair.publicKey)
+  );
+  ws.send(JSON.stringify({
+    type: 'e2ee_handshake',
+    client_id: CLIENT_ID,
+    pubkey: _b64FromBytes(rawPub)
+  }));
+  if (DEBUG_E2EE) console.log('[e2ee] handshake sent', CLIENT_ID);
+}
+
+async function completeHandshake(daemonPubB64) {
+  var daemonPubBytes = _bytesFromB64(daemonPubB64);
+  var daemonPub = await crypto.subtle.importKey(
+    'raw', daemonPubBytes,
+    { name: 'ECDH', namedCurve: 'P-256' }, false, []
+  );
+  // Step 1: ECDH -> 256-bit shared secret (raw bits)
+  var sharedBits = await crypto.subtle.deriveBits(
+    { name: 'ECDH', public: daemonPub },
+    e2eeKeypair.privateKey,
+    256
+  );
+  // Step 2: import as HKDF key material
+  var hkdfKey = await crypto.subtle.importKey(
+    'raw', sharedBits, { name: 'HKDF' }, false, ['deriveKey']
+  );
+  // Step 3: HKDF-SHA256 -> AES-GCM key (same info string as the Python side)
+  e2eeKey = await crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: new Uint8Array(0),
+      info: new TextEncoder().encode('roboot-relay-e2ee-v1')
+    },
+    hkdfKey,
+    { name: 'AES-GCM', length: 256 },
+    false, ['encrypt', 'decrypt']
+  );
+  e2eeReady = true;
+  if (DEBUG_E2EE) console.log('[e2ee] handshake complete');
+  // Flush any app messages queued before the key was ready
+  var q = preHandshakeQueue; preHandshakeQueue = [];
+  for (var i = 0; i < q.length; i++) { secureSend(q[i]); }
+}
+
+async function secureSend(payload) {
+  // Encrypt + ship a JSON app message. Silently queues if the handshake
+  // hasn't finished yet so UI code never has to think about timing.
+  if (!ws || ws.readyState !== 1) return;
+  if (!e2eeReady) { preHandshakeQueue.push(payload); return; }
+  var iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  var plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  var ctBuf = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv }, e2eeKey, plaintext
+  );
+  ws.send(JSON.stringify({
+    type: 'encrypted',
+    client_id: CLIENT_ID,
+    iv: _b64FromBytes(iv),
+    ct: _b64FromBytes(new Uint8Array(ctBuf))
+  }));
+  if (DEBUG_E2EE) console.log('[e2ee] sent', payload.type, 'ct=' + ctBuf.byteLength + 'B');
+}
+
+async function secureDecrypt(envelope) {
+  if (!e2eeReady) throw new Error('no key');
+  var iv = _bytesFromB64(envelope.iv);
+  var ct = _bytesFromB64(envelope.ct);
+  var ptBuf = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: iv }, e2eeKey, ct
+  );
+  return JSON.parse(new TextDecoder().decode(ptBuf));
+}
+
 // === Mobile Sidebar ===
 function toggleSidebar() {
   document.getElementById('sidebar').classList.toggle('open');
@@ -448,6 +564,7 @@ function scheduleRender() {
 // === WebSocket ===
 function connectWS() {
   setConnStatus('Connecting...', false);
+  resetE2EE();
 
   try {
     ws = new WebSocket(RELAY_WS_URL);
@@ -456,18 +573,65 @@ function connectWS() {
     return;
   }
 
-  ws.onopen = function() {
-    ws.send(JSON.stringify({ type: 'client_hello' }));
+  ws.onopen = async function() {
     connected = true;
     reconnectDelay = 1000;
-    setConnStatus('Connected', true);
-    document.getElementById('chat-send-btn').disabled = false;
-    // Load sessions list
+    setConnStatus('Securing...', false);
+    // Queue the app-level hello/session-load until the key is derived.
+    secureSend({ type: 'client_hello' });
     setTimeout(loadSessions, 500);
+    try {
+      await startHandshake();
+    } catch (err) {
+      setConnStatus('Encryption setup failed: ' + err.message, false);
+      try { ws.close(4001, 'e2ee_init_failed'); } catch(_) {}
+    }
   };
 
-  ws.onmessage = function(e) {
-    var data = JSON.parse(e.data);
+  ws.onmessage = async function(e) {
+    var frame;
+    try { frame = JSON.parse(e.data); } catch (_) { return; }
+
+    // Handshake reply: derive the shared key. App messages are queued
+    // by secureSend() until this completes.
+    if (frame.type === 'e2ee_handshake') {
+      try {
+        await completeHandshake(frame.pubkey);
+        setConnStatus('Connected', true);
+        document.getElementById('chat-send-btn').disabled = false;
+      } catch (err) {
+        setConnStatus('Handshake failed: ' + err.message, false);
+        try { ws.close(4002, 'handshake_failed'); } catch(_) {}
+      }
+      return;
+    }
+
+    // Unencrypted error frames from the relay/daemon (e.g. handshake_failed).
+    // client_id === our id means this error is ours; missing client_id is
+    // treated as "addressed to us" too so the relay can still surface issues.
+    if (frame.type === 'error' && !frame.ct) {
+      if (!frame.client_id || frame.client_id === CLIENT_ID) {
+        addChatMsg('bot', 'Error: ' + (frame.content || 'unknown'));
+      }
+      return;
+    }
+
+    // Everything else MUST be encrypted.
+    if (frame.type !== 'encrypted') {
+      if (DEBUG_E2EE) console.warn('[e2ee] dropping unencrypted frame', frame.type);
+      return;
+    }
+    // The relay broadcasts daemon frames to every client; skip envelopes
+    // addressed to a different client rather than wasting work on decrypt.
+    if (frame.client_id && frame.client_id !== CLIENT_ID) return;
+
+    var data;
+    try {
+      data = await secureDecrypt(frame);
+    } catch (err) {
+      if (DEBUG_E2EE) console.warn('[e2ee] decrypt failed', err);
+      return;
+    }
 
     if (data.type === 'thinking') {
       removeThinking();
@@ -553,6 +717,7 @@ function connectWS() {
   ws.onclose = function() {
     connected = false;
     ws = null;
+    resetE2EE();
     document.getElementById('chat-send-btn').disabled = true;
     setConnStatus('Disconnected. Reconnecting...', false);
     if (reconnectDelay <= 30000) {
@@ -571,7 +736,7 @@ function chatSend() {
   var text = inp.value.trim();
   if (!text || !ws || ws.readyState !== 1) return;
   addChatMsg('user', text);
-  ws.send(JSON.stringify({ type: 'chat', content: text }));
+  secureSend({ type: 'chat', content: text });
   inp.value = ''; inp.style.height = 'auto';
   document.getElementById('chat-send-btn').disabled = true;
 }
@@ -636,7 +801,7 @@ function showChat() {
 
 function loadSessions() {
   if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({ type: 'get_sessions' }));
+    secureSend({ type: 'get_sessions' });
   }
 }
 
@@ -670,7 +835,7 @@ function selectSession(id) {
 
 function refreshSession() {
   if (!currentId || !ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ type: 'read_session', session_id: currentId }));
+  secureSend({ type: 'read_session', session_id: currentId });
 }
 
 function toggleAuto() {
@@ -690,7 +855,7 @@ function sendToSession() {
   var text = inp.value.trim();
   if (!text || !currentId || !ws || ws.readyState !== 1) return;
   inp.value = ''; inp.style.height = 'auto';
-  ws.send(JSON.stringify({ type: 'send_session', session_id: currentId, text: text }));
+  secureSend({ type: 'send_session', session_id: currentId, text: text });
   showToast('Sent');
   setTimeout(refreshSession, 1500);
 }

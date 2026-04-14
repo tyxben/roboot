@@ -103,6 +103,31 @@ API endpoints for token management:
 - `POST /api/relay-refresh` -- rotates token, returns new pairing URL
 - `GET /api/relay-qr` -- QR code PNG for current pairing URL
 
+### End-to-End Encryption (Relay)
+Application traffic between the Mac daemon and each mobile client is E2E encrypted. The Cloudflare Worker relay is a dumb pipe — it only sees ciphertext envelopes plus the handshake public keys. Keys never leave the endpoints.
+
+Handshake (ECDH P-256, HKDF-SHA256):
+1. Client opens the WebSocket, generates an ephemeral ECDH P-256 keypair, and sends `{"type":"e2ee_handshake","client_id":"<uuid>","pubkey":"<base64 raw uncompressed point>"}`.
+2. Daemon (`relay_client.py`) generates its own ephemeral P-256 keypair per `client_id`, derives a 32-byte AES-GCM key via `HKDF-SHA256(ecdh_shared, info="roboot-relay-e2ee-v1", salt=empty)`, and replies with the same frame shape carrying its pubkey.
+3. Browser derives the same key via WebCrypto (`deriveBits` → `importKey(HKDF)` → `deriveKey(AES-GCM)` with the same info string).
+
+Encrypted envelope (every app message after handshake):
+```
+{"type":"encrypted","client_id":"<uuid>","iv":"<base64 12B>","ct":"<base64 AES-GCM ciphertext>"}
+```
+Plaintext is the original JSON message UTF-8-encoded. Fresh 96-bit IV per message (`os.urandom(12)` / `crypto.getRandomValues`). AAD is empty; the client_id is not authenticated because the DO can already enforce it via its session scoping.
+
+Relay contract (`relay/src/relay-session.ts`):
+- Whitelist of forwardable message types: `e2ee_handshake`, `encrypted`, `ping`, `pong`, `error`. Anything else is dropped on the floor — a compromised client cannot smuggle plaintext through.
+- No crypto in the Worker. Auth, rate limiting, and token rotation logic are unchanged.
+
+Key lifecycle:
+- One AES key per (daemon, client_id) pair; multiple clients each get an independent key.
+- Daemon clears all ciphers on WebSocket (re)connect and on `rotate_token()`; clients clear on WebSocket close/reconnect, forcing a fresh handshake.
+- If a daemon-side cipher is missing when an `encrypted` frame arrives, the daemon replies with an unencrypted `{"type":"error","content":"handshake_required"}` and the browser's reconnect path handles rekeying.
+
+Debug: set `DEBUG_E2EE=1` in the daemon's environment (or flip `DEBUG_E2EE = true` in devtools for the browser) to log handshake + ciphertext metadata. Neither logger writes plaintext or key material.
+
 ### Streaming Protocol
 WebSocket messages from server to frontend:
 - `{"type": "thinking"}` -- agent is processing
