@@ -2,8 +2,13 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#e94560">
 <title>Roboot Console</title>
+<link rel="manifest" href="/static/manifest.json">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -27,6 +32,7 @@ body {
   background: var(--bg);
   color: var(--text);
   height: 100vh;
+  height: calc(var(--vh, 1vh) * 100); /* Mobile viewport fix */
   display: flex;
   overflow: hidden;
 }
@@ -237,11 +243,149 @@ body {
   font-size: 12px; opacity: 0; transition: opacity 0.25s; z-index: 50;
 }
 .toast.show { opacity: 1; }
+
+/* === MOBILE RESPONSIVE === */
+@media (max-width: 768px) {
+  :root {
+    --sidebar-w: 0px;
+  }
+
+  body {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: -280px;
+    width: 280px;
+    height: 100vh;
+    height: calc(var(--vh, 1vh) * 100);
+    z-index: 100;
+    transition: left 0.3s ease;
+    box-shadow: 2px 0 12px rgba(0,0,0,0.5);
+  }
+
+  .sidebar.open {
+    left: 0;
+  }
+
+  .main {
+    width: 100%;
+    height: 100vh;
+    height: calc(var(--vh, 1vh) * 100);
+  }
+
+  /* Mobile header with menu toggle */
+  .mobile-header {
+    display: flex !important;
+    padding: 12px 16px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    align-items: center;
+    gap: 12px;
+  }
+
+  .menu-toggle {
+    width: 36px;
+    height: 36px;
+    border: none;
+    background: var(--surface2);
+    color: var(--text);
+    border-radius: 8px;
+    font-size: 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mobile-header .title {
+    flex: 1;
+    font-size: 15px;
+    font-weight: 600;
+  }
+
+  .panel-header {
+    display: none;
+  }
+
+  .chat-messages,
+  .terminal {
+    padding: 12px;
+  }
+
+  .input-bar {
+    padding: 8px 12px;
+    /* Extra padding for browser toolbar */
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+    padding-bottom: calc(8px + env(safe-area-inset-bottom) + 60px);
+    /* Ensure visible above keyboard on mobile */
+    position: relative;
+    z-index: 10;
+    background: var(--surface);
+  }
+
+  /* Prevent zoom on input focus (iOS) */
+  .input-bar textarea,
+  .input-bar input {
+    font-size: 16px !important;
+  }
+
+  /* Fix for keyboard overlap */
+  .panel {
+    position: relative;
+  }
+
+  /* Chat messages container needs space at bottom */
+  .chat-messages {
+    padding-bottom: 80px !important;
+  }
+
+  .chat-msg {
+    max-width: 90%;
+    font-size: 14px;
+  }
+
+  .sidebar-footer {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  /* Backdrop for sidebar */
+  .sidebar-backdrop {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 99;
+  }
+
+  .sidebar-backdrop.open {
+    display: block;
+  }
+}
+
+/* Desktop: hide mobile elements */
+@media (min-width: 769px) {
+  .mobile-header {
+    display: none;
+  }
+
+  .sidebar-backdrop {
+    display: none !important;
+  }
+}
 </style>
 </head>
 <body>
 
-<div class="sidebar">
+<!-- Mobile sidebar backdrop -->
+<div class="sidebar-backdrop" id="sidebar-backdrop" onclick="closeSidebar()"></div>
+
+<div class="sidebar" id="sidebar">
   <div class="sidebar-header">
     <h1><span class="logo">A</span> Ava</h1>
     <div class="count" id="session-count">加载中...</div>
@@ -251,10 +395,19 @@ body {
     <div class="chat-tab" id="chat-tab" onclick="showChat()">
       <span class="icon">AI</span> Roboot 聊天
     </div>
+    <div class="chat-tab" id="network-tab" onclick="showNetwork()">
+      <span class="icon">📱</span> 移动访问
+    </div>
   </div>
 </div>
 
 <div class="main">
+  <!-- Mobile header -->
+  <div class="mobile-header">
+    <button class="menu-toggle" onclick="toggleSidebar()">☰</button>
+    <div class="title" id="mobile-title">Roboot</div>
+  </div>
+
   <div class="panel visible" id="panel-empty">
     <div class="empty-msg">选择一个会话，或点击 Roboot 聊天</div>
   </div>
@@ -298,6 +451,53 @@ body {
       <button id="mic-btn" onclick="toggleMic()" title="语音输入" style="width:34px;height:34px;border:none;border-radius:8px;background:var(--surface2);color:var(--text-dim);font-size:16px;cursor:pointer;flex-shrink:0;">🎤</button>
       <textarea id="txt-chat" rows="1" placeholder="跟 Roboot 说点什么..."></textarea>
       <button id="chat-send-btn" onclick="chatSend()">↑</button>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-network">
+    <div class="panel-header">
+      <div class="title">
+        <h2>移动访问</h2>
+        <div class="meta">扫描二维码在手机上访问</div>
+      </div>
+      <button onclick="loadNetworkInfo()">刷新</button>
+    </div>
+    <div style="flex:1;overflow-y:auto;padding:20px;">
+      <div style="max-width:600px;margin:0 auto;">
+        <div style="text-align:center;margin-bottom:30px;">
+          <img id="qr-code-img" src="/api/qr-code" alt="QR Code" style="max-width:300px;width:100%;border-radius:12px;background:white;padding:10px;box-shadow:0 4px 12px rgba(0,0,0,0.3);">
+        </div>
+
+        <div style="background:var(--surface2);border-radius:12px;padding:20px;margin-bottom:20px;">
+          <h3 style="font-size:14px;font-weight:600;margin-bottom:12px;color:var(--text);">网络地址</h3>
+          <div id="network-addresses" style="font-family:'SF Mono','Menlo',monospace;font-size:13px;color:var(--text-dim);">
+            加载中...
+          </div>
+        </div>
+
+        <div id="relay-section" style="background:var(--surface2);border-radius:12px;padding:20px;margin-bottom:20px;display:none;">
+          <h3 style="font-size:14px;font-weight:600;margin-bottom:12px;color:var(--green);">&#127760; 远程访问（外网可用）</h3>
+          <div style="font-size:13px;color:var(--text-dim);margin-bottom:12px;">不在同一 WiFi 也能用，全球可访问</div>
+          <div style="text-align:center;margin-bottom:12px;">
+            <img id="relay-qr-img" style="max-width:250px;width:100%;border-radius:12px;background:white;padding:10px;box-shadow:0 4px 12px rgba(0,0,0,0.3);">
+          </div>
+          <div id="relay-url" style="font-family:'SF Mono','Menlo',monospace;font-size:11px;color:var(--accent);background:rgba(0,0,0,0.3);padding:8px 12px;border-radius:6px;word-break:break-all;cursor:pointer;" onclick="copyToClipboard(this.textContent)"></div>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;">
+            <span id="relay-expiry" style="font-size:11px;color:var(--text-dim);"></span>
+            <button onclick="refreshRelayToken()" style="font-size:12px;padding:4px 12px;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;">Refresh Link</button>
+          </div>
+        </div>
+
+        <div style="background:var(--surface2);border-radius:12px;padding:20px;">
+          <h3 style="font-size:14px;font-weight:600;margin-bottom:12px;color:var(--text);">说明</h3>
+          <ul style="font-size:13px;line-height:1.6;color:var(--text-dim);margin-left:20px;">
+            <li>局域网访问：确保手机和电脑在同一 WiFi</li>
+            <li>远程访问：扫描远程二维码，任何网络都能用</li>
+            <li>使用手机相机扫描二维码</li>
+            <li>建议将页面添加到主屏幕以便快速访问</li>
+          </ul>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -350,6 +550,7 @@ function selectSession(id) {
   var s = sessions.find(function(x) { return x.id === id; });
   renderSessionList();
   document.getElementById('chat-tab').classList.remove('active');
+  document.getElementById('network-tab').classList.remove('active');
   showPanel('session');
   document.getElementById('sv-title').textContent = s ? (s.project || s.name) : id;
   document.getElementById('sv-meta').textContent = s ? s.name : '';
@@ -359,6 +560,8 @@ function selectSession(id) {
   autoTimer = setInterval(refreshSession, 3000);
   document.getElementById('auto-btn').classList.add('on');
   document.getElementById('auto-btn').textContent = '自动 ✓';
+  updateMobileTitle(s ? (s.project || s.name) : 'Session');
+  closeSidebar();
 }
 
 function refreshSession() {
@@ -440,9 +643,173 @@ function showChat() {
   currentId = null;
   renderSessionList();
   document.getElementById('chat-tab').classList.add('active');
+  document.getElementById('network-tab').classList.remove('active');
   showPanel('chat');
   if (!ws) connectWS();
   document.getElementById('txt-chat').focus();
+  updateMobileTitle('Roboot 聊天');
+  closeSidebar();
+}
+
+function showNetwork() {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  currentId = null;
+  renderSessionList();
+  document.getElementById('chat-tab').classList.remove('active');
+  document.getElementById('network-tab').classList.add('active');
+  showPanel('network');
+  loadNetworkInfo();
+  updateMobileTitle('移动访问');
+  closeSidebar();
+}
+
+function loadNetworkInfo() {
+  fetch('/api/network-info')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var container = document.getElementById('network-addresses');
+      var html = '';
+
+      if (data.primary_ip) {
+        html += '<div style="margin-bottom:12px;">';
+        html += '<div style="color:var(--green);font-weight:600;margin-bottom:4px;">主要地址 (推荐)</div>';
+        html += '<div style="color:var(--text);background:rgba(0,0,0,0.3);padding:8px 12px;border-radius:6px;cursor:pointer;" onclick="copyToClipboard(\'' + data.urls[0] + '\')">';
+        html += data.urls[0];
+        html += '</div>';
+        html += '</div>';
+      }
+
+      if (data.all_ips.length > 1) {
+        html += '<div>';
+        html += '<div style="color:var(--text-dim);font-weight:600;margin-bottom:4px;">其他网络接口</div>';
+        data.all_ips.forEach(function(ip) {
+          if (ip !== data.primary_ip) {
+            var url = 'http://' + ip + ':8765';
+            html += '<div style="color:var(--text-dim);background:rgba(0,0,0,0.2);padding:6px 10px;border-radius:6px;margin-bottom:4px;cursor:pointer;" onclick="copyToClipboard(\'' + url + '\')">';
+            html += url;
+            html += '</div>';
+          }
+        });
+        html += '</div>';
+      }
+
+      if (!data.primary_ip) {
+        html = '<div style="color:var(--red);">未检测到网络连接</div>';
+      }
+
+      container.innerHTML = html;
+
+      // Refresh QR code
+      document.getElementById('qr-code-img').src = '/api/qr-code?t=' + Date.now();
+    })
+    .catch(function() {
+      document.getElementById('network-addresses').innerHTML = '<div style="color:var(--red);">加载失败</div>';
+    });
+
+  // Also load relay info
+  fetch('/api/relay-info')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var section = document.getElementById('relay-section');
+      if (data.enabled && data.pairing_url) {
+        section.style.display = 'block';
+        document.getElementById('relay-url').textContent = data.pairing_url;
+        // Generate QR code for relay URL via a canvas-based approach
+        document.getElementById('relay-qr-img').src = '/api/relay-qr?t=' + Date.now();
+        // Set up token expiry timer
+        if (data.expires_at) {
+          scheduleRelayRefresh(data.expires_at);
+        }
+      } else {
+        section.style.display = 'none';
+      }
+    })
+    .catch(function() {});
+}
+
+var _relayRefreshTimer = null;
+var _relayExpiryTimer = null;
+
+function scheduleRelayRefresh(expiresAt) {
+  // Clear existing timers
+  if (_relayRefreshTimer) { clearTimeout(_relayRefreshTimer); _relayRefreshTimer = null; }
+  if (_relayExpiryTimer) { clearInterval(_relayExpiryTimer); _relayExpiryTimer = null; }
+
+  // Update the countdown display every second
+  _relayExpiryTimer = setInterval(function() {
+    var remaining = Math.floor(expiresAt - Date.now() / 1000);
+    var el = document.getElementById('relay-expiry');
+    if (!el) return;
+    if (remaining <= 0) {
+      el.textContent = 'Token expired';
+      el.style.color = 'var(--red)';
+    } else {
+      var mins = Math.floor(remaining / 60);
+      var secs = remaining % 60;
+      el.textContent = 'Expires in ' + mins + ':' + (secs < 10 ? '0' : '') + secs;
+      el.style.color = remaining < 60 ? 'var(--red)' : 'var(--text-dim)';
+    }
+  }, 1000);
+
+  // Auto-refresh when less than 60 seconds remain
+  var msUntilRefresh = (expiresAt - 60) * 1000 - Date.now();
+  if (msUntilRefresh <= 0) {
+    // Already within the refresh window — refresh now
+    refreshRelayToken();
+  } else {
+    _relayRefreshTimer = setTimeout(function() {
+      refreshRelayToken();
+    }, msUntilRefresh);
+  }
+}
+
+function refreshRelayToken() {
+  fetch('/api/relay-refresh', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.enabled && data.pairing_url) {
+        document.getElementById('relay-url').textContent = data.pairing_url;
+        document.getElementById('relay-qr-img').src = '/api/relay-qr?t=' + Date.now();
+        showToast('Relay link refreshed');
+        if (data.expires_at) {
+          scheduleRelayRefresh(data.expires_at);
+        }
+      }
+    })
+    .catch(function() {
+      showToast('Failed to refresh relay link');
+    });
+}
+
+function copyToClipboard(text) {
+  navigator.clipboard.writeText(text).then(function() {
+    showToast('已复制: ' + text);
+  }).catch(function() {
+    showToast('复制失败');
+  });
+}
+
+// Mobile sidebar toggle
+function toggleSidebar() {
+  var sidebar = document.getElementById('sidebar');
+  var backdrop = document.getElementById('sidebar-backdrop');
+  sidebar.classList.toggle('open');
+  backdrop.classList.toggle('open');
+}
+
+function closeSidebar() {
+  var sidebar = document.getElementById('sidebar');
+  var backdrop = document.getElementById('sidebar-backdrop');
+  sidebar.classList.remove('open');
+  backdrop.classList.remove('open');
+}
+
+// Update mobile title when switching views
+function updateMobileTitle(title) {
+  var mobileTitle = document.getElementById('mobile-title');
+  if (mobileTitle) {
+    mobileTitle.textContent = title;
+  }
 }
 
 var streamBubble = null;
@@ -602,6 +969,7 @@ function renderMD(t) {
   t = t.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
   t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
   t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%;border-radius:8px;margin:8px 0;">');
   t = t.replace(/\n/g, '<br>');
   return t;
 }
@@ -636,6 +1004,13 @@ function setupTextarea(id, onSubmit) {
       onSubmit();
     }
   });
+
+  // Mobile: scroll input into view when keyboard appears
+  el.addEventListener('focus', function() {
+    setTimeout(function() {
+      el.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }, 300); // Wait for keyboard animation
+  });
 }
 
 setupTextarea('txt-session', sendToSession);
@@ -646,6 +1021,11 @@ var micActive = false;
 var recognition = null;
 
 function toggleMic() {
+  // Check if HTTPS is required (not localhost and not secure context)
+  if (!window.isSecureContext && window.location.hostname !== 'localhost') {
+    showToast('⚠️ 语音功能需要 HTTPS（或配置 Tailscale）');
+    return;
+  }
   if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
     showToast('浏览器不支持语音输入，请用 Chrome');
     return;
@@ -662,10 +1042,7 @@ function startListening(isJarvis) {
   }
 
   if (micActive) return;
-  // If speaking, INTERRUPT — stop audio and start listening
-  if (isSpeaking) {
-    stopSpeaking();
-  }
+  // Full-duplex: allow listening even while speaking (no interruption needed)
 
   recognition = new SpeechRecognition();
   recognition.lang = 'zh-CN';
@@ -720,8 +1097,8 @@ function startListening(isJarvis) {
     if (e.error !== 'no-speech' && e.error !== 'aborted') {
       showToast('语音: ' + e.error);
     }
-    // JARVIS: keep trying to listen
-    if (jarvisMode && !isSpeaking) {
+    // JARVIS: keep trying to listen (full-duplex: even while speaking)
+    if (jarvisMode) {
       setTimeout(function() { if (jarvisMode) startListening(true); }, 800);
     }
   };
@@ -735,7 +1112,8 @@ function startListening(isJarvis) {
     recognition = null;
 
     // JARVIS: if we didn't get a result (silence timeout), restart listening
-    if (jarvisMode && !gotResult && !isSpeaking) {
+    // Full-duplex: restart even while speaking
+    if (jarvisMode && !gotResult) {
       setTimeout(function() { if (jarvisMode) startListening(true); }, 300);
     }
   };
@@ -763,6 +1141,12 @@ function stopMic() {
 var jarvisMode = false;
 
 function toggleJarvis() {
+  // Check if HTTPS is required for voice features
+  if (!jarvisMode && !window.isSecureContext && window.location.hostname !== 'localhost') {
+    showToast('⚠️ JARVIS 语音模式需要 HTTPS（或配置 Tailscale）');
+    return;
+  }
+
   jarvisMode = !jarvisMode;
   var btn = document.getElementById('jarvis-btn');
   var orb = document.getElementById('jarvis-orb');
@@ -883,6 +1267,53 @@ function stopSpeaking() {
 
 // Load sessions once on startup
 loadSessions();
+
+// ===== Mobile Viewport Height Fix =====
+// Fix for Chrome mobile toolbar covering bottom content
+function updateViewportHeight() {
+  var vh = window.innerHeight * 0.01;
+  document.documentElement.style.setProperty('--vh', vh + 'px');
+}
+
+updateViewportHeight();
+window.addEventListener('resize', updateViewportHeight);
+window.addEventListener('orientationchange', updateViewportHeight);
+
+// Also update when keyboard shows/hides (visualViewport API)
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', updateViewportHeight);
+}
+
+// ===== PWA Service Worker Registration =====
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function() {
+    navigator.serviceWorker.register('/static/sw.js').then(function(registration) {
+      console.log('[PWA] Service Worker registered:', registration.scope);
+    }).catch(function(error) {
+      console.log('[PWA] Service Worker registration failed:', error);
+    });
+  });
+}
+
+// PWA install prompt
+var deferredPrompt;
+window.addEventListener('beforeinstallprompt', function(e) {
+  console.log('[PWA] Install prompt available');
+  e.preventDefault();
+  deferredPrompt = e;
+
+  // Show install button or toast after a delay
+  setTimeout(function() {
+    if (deferredPrompt && !window.matchMedia('(display-mode: standalone)').matches) {
+      showToast('💡 提示: 可将 Roboot 添加到主屏幕');
+    }
+  }, 5000);
+});
+
+window.addEventListener('appinstalled', function() {
+  console.log('[PWA] App installed');
+  deferredPrompt = null;
+});
 </script>
 </body>
 </html>

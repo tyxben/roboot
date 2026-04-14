@@ -17,6 +17,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from network_utils import get_primary_ip, get_local_ip_addresses, generate_qr_code, generate_qr_ascii
+
 import arcana
 
 from tools.shell import shell
@@ -26,7 +28,7 @@ from tools.claude_code import (
     send_to_session,
     create_claude_session,
 )
-from tools.vision import look, screenshot
+from tools.vision import look, screenshot, enroll_face, list_faces, forget_face
 from tools.soul import update_self, remember_user, add_note, build_personality, get_name, get_voice
 
 ALL_TOOLS = [
@@ -37,6 +39,9 @@ ALL_TOOLS = [
     create_claude_session,
     look,
     screenshot,
+    enroll_face,
+    list_faces,
+    forget_face,
     update_self,
     remember_user,
     add_note,
@@ -50,6 +55,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # --- Config & Runtime (created once) ---
 
 _runtime: arcana.Runtime | None = None
+_relay_client = None  # Set when relay is enabled
 
 
 def _load_config() -> dict:
@@ -140,6 +146,82 @@ async def api_read_session(session_id: str):
     return {"content": content}
 
 
+@app.get("/api/network-info")
+async def api_network_info():
+    """Get network information including local IPs and QR code for mobile access."""
+    primary_ip = get_primary_ip()
+    all_ips = get_local_ip_addresses()
+
+    # Detect if SSL is enabled
+    cert_file = Path(__file__).parent / "certs" / "cert.pem"
+    protocol = "https" if cert_file.exists() else "http"
+
+    result = {
+        "primary_ip": primary_ip,
+        "all_ips": all_ips,
+        "urls": [],
+        "ssl_enabled": cert_file.exists(),
+    }
+
+    if primary_ip:
+        url = f"{protocol}://{primary_ip}:8765"
+        result["urls"].append(url)
+        result["qr_url"] = url
+
+    return result
+
+
+@app.get("/api/relay-info")
+async def api_relay_info():
+    """Get relay pairing URL if relay is enabled."""
+    global _relay_client
+    if _relay_client:
+        return {
+            "enabled": True,
+            "pairing_url": _relay_client.pairing_url,
+            "expires_at": _relay_client.token_created_at + _relay_client.token_ttl,
+        }
+    return {"enabled": False, "pairing_url": None}
+
+
+@app.post("/api/relay-refresh")
+async def api_relay_refresh():
+    """Rotate relay pairing token and return new pairing URL."""
+    global _relay_client
+    if _relay_client:
+        _relay_client.rotate_token()
+        return {
+            "enabled": True,
+            "pairing_url": _relay_client.pairing_url,
+            "expires_at": _relay_client.token_created_at + _relay_client.token_ttl,
+        }
+    return {"enabled": False}
+
+
+@app.get("/api/qr-code")
+async def api_qr_code():
+    """Generate QR code PNG for the primary network URL."""
+    primary_ip = get_primary_ip()
+    if not primary_ip:
+        return Response(content=b"", media_type="image/png")
+
+    cert_file = Path(__file__).parent / "certs" / "cert.pem"
+    protocol = "https" if cert_file.exists() else "http"
+    url = f"{protocol}://{primary_ip}:8765"
+    qr_bytes = generate_qr_code(url, size=8)
+    return Response(content=qr_bytes, media_type="image/png")
+
+
+@app.get("/api/relay-qr")
+async def api_relay_qr():
+    """Generate QR code PNG for the relay pairing URL."""
+    global _relay_client
+    if not _relay_client:
+        return Response(content=b"", media_type="image/png")
+    qr_bytes = generate_qr_code(_relay_client.pairing_url, size=6)
+    return Response(content=qr_bytes, media_type="image/png")
+
+
 @app.post("/api/sessions/{session_id}/send")
 async def api_send_to_session(session_id: str, body: dict):
     """Send text to a session via iTerm2 Python API."""
@@ -159,7 +241,7 @@ def _extract_spoken_text(text: str) -> str:
     """Extract lines marked with > (blockquote) — the model's chosen spoken words.
 
     The model is prompted to use > for what should be said aloud.
-    If no > lines found, fall back to first short sentence.
+    If no > lines found, fall back to first few sentences (up to 300 chars).
     """
     import re
 
@@ -179,19 +261,46 @@ def _extract_spoken_text(text: str) -> str:
         result = re.sub(r"`([^`]+)`", r"\1", result)
         return result.strip()
 
-    # Fallback: no > markers, take first sentence only
+    # Fallback: no > markers, take first few sentences (up to 300 chars)
     clean = re.sub(r"```[\s\S]*?```", "", text)
     clean = re.sub(r"\*\*(.+?)\*\*", r"\1", clean)
     lines = [l.strip() for l in clean.split("\n") if l.strip() and not l.strip().startswith(("-", "*", "|", "#", "1.", "2.", "3."))]
     if not lines:
         return ""
 
-    first = lines[0]
-    # Cut at first sentence end
-    m = re.search(r"[。！？.!?]", first)
-    if m and m.end() < len(first):
-        return first[: m.end()]
-    return first[:80]
+    # Collect multiple sentences up to 300 chars
+    spoken_text = ""
+    for line in lines:
+        if len(spoken_text) + len(line) > 300:
+            break
+        spoken_text += line + " "
+        # Stop at natural paragraph break
+        if line.endswith(("。", "！", "？", ".", "!", "?")):
+            continue
+
+    # Trim to reasonable length
+    spoken_text = spoken_text.strip()
+    if len(spoken_text) > 300:
+        # Cut at last sentence boundary within 300 chars
+        spoken_text = spoken_text[:300]
+        m = re.search(r".*[。！？.!?]", spoken_text)
+        if m:
+            spoken_text = m.group()
+
+    return spoken_text
+
+
+@app.get("/static/cert.pem")
+async def download_cert():
+    """Download SSL certificate for manual trust (optional)."""
+    cert_path = Path(__file__).parent / "certs" / "cert.pem"
+    if cert_path.exists():
+        return FileResponse(
+            cert_path,
+            media_type="application/x-pem-file",
+            filename="roboot-cert.pem"
+        )
+    return {"error": "Certificate not found"}
 
 
 @app.post("/api/tts")
@@ -300,5 +409,116 @@ async def shutdown():
 if __name__ == "__main__":
     import uvicorn
 
-    print("Roboot Web UI: http://localhost:8765")
-    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="warning")
+    # Check for SSL certificates
+    cert_file = Path(__file__).parent / "certs" / "cert.pem"
+    key_file = Path(__file__).parent / "certs" / "key.pem"
+    use_ssl = cert_file.exists() and key_file.exists()
+    protocol = "https" if use_ssl else "http"
+
+    # Display startup banner with network information
+    print("\n" + "=" * 60)
+    print("🤖 Roboot - Personal AI Agent Hub")
+    print("=" * 60)
+
+    if use_ssl:
+        print("\n🔒 SSL/TLS: ENABLED (HTTPS + WSS)")
+        print("   ✅ Encrypted communication")
+        print("   ✅ Camera & voice enabled")
+    else:
+        print("\n⚠️  SSL/TLS: DISABLED (HTTP only)")
+        print("   ❌ Camera & voice require HTTPS")
+        print("   💡 Run: python -m tools.generate_cert to enable SSL")
+
+    # Local access
+    print(f"\n📍 Local access:")
+    print(f"   {protocol}://localhost:8765")
+
+    # Network access with QR code
+    primary_ip = get_primary_ip()
+    if primary_ip:
+        network_url = f"{protocol}://{primary_ip}:8765"
+        print(f"\n📱 Mobile access (scan QR code):")
+        print(f"   {network_url}")
+
+        if use_ssl:
+            print("\n   ⚠️  First time: Trust the certificate on your phone")
+            print("   📖 See docs/ssl-trust-guide.md for instructions")
+        print()
+
+        # Generate and display QR code in terminal
+        try:
+            qr_ascii = generate_qr_ascii(network_url)
+            print(qr_ascii)
+            print()
+        except Exception as e:
+            print(f"   (QR code generation failed: {e})")
+
+        all_ips = get_local_ip_addresses()
+        if len(all_ips) > 1:
+            print("\n🌐 Other network interfaces:")
+            for ip in all_ips:
+                if ip != primary_ip:
+                    print(f"   {protocol}://{ip}:8765")
+    else:
+        print("\n⚠️  No network interface detected (localhost only)")
+
+    # Optional: Connect to relay for remote access
+    config = _load_config()
+    relay_config = config.get("remote_access", {})
+    relay_method = relay_config.get("method", "none")
+    relay_enabled = (
+        relay_method in ("official_relay", "custom_relay")
+        or relay_config.get("relay", {}).get("enabled", False)
+    )
+
+    if relay_enabled:
+        relay_url = relay_config.get("relay", {}).get(
+            "endpoint", "wss://relay.coordbound.com"
+        )
+
+        from relay_client import RelayClient
+
+        relay = RelayClient(
+            relay_url=relay_url,
+            runtime=_get_runtime(),
+            build_personality=build_personality,
+            get_name=get_name,
+        )
+        _relay_client = relay
+
+        pairing_url = relay.pairing_url
+        print(f"\n\U0001F30D Remote access (relay):")
+        print(f"   {pairing_url}")
+        print()
+        try:
+            qr_ascii = generate_qr_ascii(pairing_url)
+            print(qr_ascii)
+        except Exception:
+            pass
+
+        # Start relay in a background thread with its own event loop
+        import threading
+
+        def _run_relay():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(relay.start())
+
+        relay_thread = threading.Thread(target=_run_relay, daemon=True)
+        relay_thread.start()
+        print("\n\u2705 Relay started -- remote access enabled")
+
+    print("\n" + "=" * 60 + "\n")
+
+    # Start server - bind to 0.0.0.0 to accept connections from network
+    if use_ssl:
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=8765,
+            log_level="warning",
+            ssl_keyfile=str(key_file),
+            ssl_certfile=str(cert_file),
+        )
+    else:
+        uvicorn.run(app, host="0.0.0.0", port=8765, log_level="warning")

@@ -1,0 +1,13 @@
+name = "roboot-relay"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+workers_dev = true
+
+[durable_objects]
+bindings = [
+  { name = "RELAY_SESSIONS", class_name = "RelaySession" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelaySession"]

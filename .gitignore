@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 memory.json
 .DS_Store
+certs/
+.faces/
+static/captures/
+node_modules/
+relay/node_modules/
+relay/dist/
+.wrangler/

@@ -1,0 +1,21 @@
+{
+  "name": "roboot-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker relay for Roboot daemon-client WebSocket bridging",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "test": "tsx test/test-relay.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241205.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^3.99.0",
+    "ws": "^8.18.0",
+    "@types/ws": "^8.5.13"
+  }
+}

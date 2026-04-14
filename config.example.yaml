@@ -1,32 +1,30 @@
 # 复制为 config.yaml 并填入你的 API key
 # cp config.example.yaml config.yaml
 
+# LLM 提供商 API key（至少填一个）
 providers:
-  deepseek: "sk-..."
-  anthropic: "sk-ant-..."
-  zhipu: "..."
+  deepseek: "sk-..."          # https://platform.deepseek.com — 推荐，便宜稳定
+  anthropic: "sk-ant-..."     # https://console.anthropic.com
+  zhipu: "..."                # https://open.bigmodel.cn — GLM 系列
 
-# 默认模型（日常对话用便宜的，复杂任务自动切换）
+# 默认模型（日常对话用便宜的，复杂任务可手动切换）
 default_provider: "deepseek"
 default_model: "deepseek-chat"
 
-# 预算（美元/天）
+# 每日预算上限（美元）
 daily_budget_usd: 5.0
 
 # 语音设置
 voice:
-  language: "zh-CN"
-  # macOS TTS 语音（中文推荐 Ting-Ting）
-  # 系统设置 → 辅助功能 → 朗读内容 → 系统语音 → 管理语音 → 中文
+  # Edge TTS 语音名称，留空使用默认（zh-CN-YunxiNeural）
+  # 可选值示例：zh-CN-XiaoxiaoNeural, zh-CN-YunjianNeural, en-US-JennyNeural
+  # 完整列表：edge-tts --list-voices
   tts_voice: ""
 
-# Telegram Bot（远程控制）
-telegram:
-  bot_token: ""  # 从 @BotFather 获取
-  # 限制访问（填 Telegram user ID，空则不限制）
-  allowed_users: []
+# 助手名称（也可以通过聊天让助手自己改）
+name: "Roboot"
 
-# 机器人性格
+# 助手性格（也可以直接编辑 soul.md）
 personality: |
   你是 Roboot，一个运行在用户 Mac 上的私人 AI 助手。
 
@@ -43,3 +41,24 @@ personality: |
   - 不确定的事说不确定
   - 危险操作先确认
   - 主动汇报 Claude Code 会话的异常
+
+# Telegram Bot（远程控制）
+telegram:
+  bot_token: ""               # 从 @BotFather 获取
+  # 限制访问（填 Telegram user ID，空列表则不限制）
+  # 获取你的 ID：给 @userinfobot 发消息
+  allowed_users: []
+
+# 远程访问设置
+remote_access:
+  # 远程访问方式: "none" | "official_relay" | "custom_relay"
+  method: "none"
+
+  relay:
+    # 是否启用 relay 连接
+    enabled: false
+    # Relay 服务器地址
+    # 官方 relay（免费，Cloudflare Workers 全球加速）
+    endpoint: "wss://relay.coordbound.com"
+    # 或部署自己的 relay:
+    # endpoint: "wss://your-own-relay.example.com"

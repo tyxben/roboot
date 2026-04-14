@@ -1,0 +1,41 @@
+{
+  "name": "Roboot - Personal AI Agent",
+  "short_name": "Roboot",
+  "description": "Personal AI agent hub with voice interface and terminal control",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#e94560",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["productivity", "utilities"],
+  "shortcuts": [
+    {
+      "name": "Chat",
+      "short_name": "Chat",
+      "description": "Open Roboot chat",
+      "url": "/?view=chat",
+      "icons": []
+    },
+    {
+      "name": "Mobile Access",
+      "short_name": "QR Code",
+      "description": "View QR code for mobile access",
+      "url": "/?view=network",
+      "icons": []
+    }
+  ]
+}
