@@ -1,14 +1,40 @@
-"""Relay client -- connects Roboot to the central relay for remote access."""
+"""Relay client -- connects Roboot to the central relay for remote access.
+
+End-to-end encryption
+---------------------
+Every daemon<->client pair performs an ECDH P-256 handshake over the relay
+immediately after the client identifies itself. From that moment on, all
+application messages travel as `encrypted` envelopes — the relay sees only
+random-looking ciphertext plus a per-message IV.
+
+Protocol summary:
+  1. Client opens WebSocket to relay and sends
+       {"type": "e2ee_handshake", "client_id": "<uuid>", "pubkey": "<b64>"}
+  2. Daemon generates its own ephemeral P-256 keypair for that client_id,
+     derives a shared secret via HKDF-SHA256, and replies with
+       {"type": "e2ee_handshake", "client_id": "<uuid>", "pubkey": "<b64>"}
+  3. Both sides now share a 256-bit AES-GCM key. Further traffic is
+       {"type": "encrypted", "client_id": "<uuid>", "iv": "<b64>", "ct": "<b64>"}
+     The plaintext is the original JSON message object, serialized with UTF-8.
+
+Handshake messages stay unencrypted so the relay can still route them.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import os
 import secrets
 import time
 import uuid
 
 import websockets
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 # Relay protocol:
 # 1. Daemon connects to wss://relay.coordbound.com/ws/daemon/{session_id}
@@ -22,6 +48,38 @@ OFFICIAL_RELAY = "wss://relay.coordbound.com"
 # Detects zombie connections (NAT timeout, laptop sleep) within ~60s.
 HEARTBEAT_INTERVAL = 30
 HEARTBEAT_TIMEOUT = 60
+
+# Flip with DEBUG_E2EE=1 to log handshake + per-message ciphertext metadata.
+# Never logs plaintext or key material even when enabled.
+_DEBUG_E2EE = os.environ.get("DEBUG_E2EE") == "1"
+
+
+def _b64e(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _b64d(data: str) -> bytes:
+    return base64.b64decode(data.encode("ascii"))
+
+
+def _derive_session_key(private_key: ec.EllipticCurvePrivateKey, peer_pubkey_bytes: bytes) -> bytes:
+    """Do ECDH + HKDF-SHA256 to produce a 32-byte AES-GCM key."""
+    peer_public = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), peer_pubkey_bytes)
+    shared = private_key.exchange(ec.ECDH(), peer_public)
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"roboot-relay-e2ee-v1",
+    ).derive(shared)
+
+
+def _pubkey_bytes(private_key: ec.EllipticCurvePrivateKey) -> bytes:
+    """Export the public key as a raw uncompressed SEC1 point (65 bytes)."""
+    return private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint,
+    )
 
 
 class RelayClient:
@@ -46,6 +104,8 @@ class RelayClient:
         # Heartbeat tracking (per-connection; reset on each _connect())
         self._last_pong_at: float = 0.0
         self._heartbeat_task: asyncio.Task | None = None
+        # Map of client_id -> AESGCM cipher (one per daemon<->client pair)
+        self._ciphers: dict[str, AESGCM] = {}
 
     @property
     def pairing_url(self) -> str:
@@ -70,8 +130,9 @@ class RelayClient:
         self.session_id = str(uuid.uuid4())
         self.token = secrets.token_hex(32)
         self.token_created_at = time.time()
-        # Clear chat sessions since clients will need to re-pair
+        # Clear chat sessions + crypto state: every client must re-handshake.
         self.chat_sessions.clear()
+        self._ciphers.clear()
         # Close existing WebSocket so the reconnect loop picks up new creds.
         # Grab a local reference to avoid races, then set self.ws = None so
         # _send_to_client() stops using the old socket immediately.
@@ -134,7 +195,11 @@ class RelayClient:
         async with websockets.connect(url) as ws:
             self.ws = ws
             self._last_pong_at = time.time()
-            # Register with relay
+            # Fresh connection -> drop any leftover per-client crypto state.
+            self._ciphers.clear()
+            self.chat_sessions.clear()
+            # Register with relay (plaintext -- daemon_hello isn't whitelisted
+            # by the relay DO, so it's dropped; kept for backwards log clarity).
             await ws.send(
                 json.dumps(
                     {
@@ -153,7 +218,7 @@ class RelayClient:
             try:
                 # Process incoming messages until disconnect
                 async for raw_message in ws:
-                    await self._handle_message(raw_message)
+                    await self._handle_raw(raw_message)
             finally:
                 if self._heartbeat_task is not None:
                     self._heartbeat_task.cancel()
@@ -184,18 +249,136 @@ class RelayClient:
         except asyncio.CancelledError:
             return
 
-    async def _handle_message(self, raw: str):
-        """Handle a message forwarded from a mobile client via the relay."""
+    # -------------------------------------------------------------------------
+    # Message dispatch (E2EE-aware)
+    # -------------------------------------------------------------------------
+
+    async def _handle_raw(self, raw: str):
+        """Top-level dispatch: handshake + encrypted envelopes are unwrapped
+        here, then the decrypted payload is dispatched to _handle_message.
+        """
         try:
             msg = json.loads(raw)
             msg_type = msg.get("type")
 
-            # Heartbeat pong from relay -- not client-scoped
+            # Heartbeat pong from relay -- not client-scoped, plaintext.
             if msg_type == "pong":
                 self._last_pong_at = time.time()
                 return
 
-            client_id = msg.get("client_id", "default")
+            client_id = msg.get("client_id")
+
+            if msg_type == "e2ee_handshake":
+                await self._on_handshake(client_id, msg)
+                return
+
+            if msg_type == "encrypted":
+                if not client_id or client_id not in self._ciphers:
+                    # No key established — either the client skipped the
+                    # handshake (protocol violation) or the daemon restarted
+                    # and lost state. Ask the client to re-handshake.
+                    await self._send_plain(
+                        {
+                            "type": "error",
+                            "client_id": client_id,
+                            "content": "handshake_required",
+                        }
+                    )
+                    return
+                try:
+                    plaintext = self._decrypt(client_id, msg)
+                except Exception as e:
+                    if _DEBUG_E2EE:
+                        print(f"[relay][e2ee] decrypt failed for {client_id}: {e}")
+                    await self._send_plain(
+                        {
+                            "type": "error",
+                            "client_id": client_id,
+                            "content": "decrypt_failed",
+                        }
+                    )
+                    return
+                inner = json.loads(plaintext)
+                await self._handle_message(client_id, inner)
+                return
+
+            # Unknown / unencrypted app message -> ignored. The relay DO
+            # already filters out anything that isn't handshake/encrypted/
+            # ping/pong/error so we only reach here for protocol oddities.
+            if _DEBUG_E2EE:
+                print(f"[relay][e2ee] dropping unencrypted msg type={msg_type}")
+
+        except Exception as e:
+            print(f"[relay] Error handling message: {e}")
+
+    async def _on_handshake(self, client_id: str | None, msg: dict):
+        """Complete the ECDH handshake for a new client.
+
+        Generates a fresh ephemeral keypair per client so compromise of one
+        session cannot decrypt another.
+        """
+        if not client_id:
+            if _DEBUG_E2EE:
+                print("[relay][e2ee] handshake missing client_id")
+            return
+        client_pub_b64 = msg.get("pubkey")
+        if not client_pub_b64:
+            return
+
+        try:
+            client_pub_bytes = _b64d(client_pub_b64)
+            private_key = ec.generate_private_key(ec.SECP256R1())
+            key_bytes = _derive_session_key(private_key, client_pub_bytes)
+            self._ciphers[client_id] = AESGCM(key_bytes)
+            # Fresh crypto state means any previous chat session for this
+            # client_id should also be reset.
+            self.chat_sessions.pop(client_id, None)
+
+            daemon_pub_b64 = _b64e(_pubkey_bytes(private_key))
+            await self._send_plain(
+                {
+                    "type": "e2ee_handshake",
+                    "client_id": client_id,
+                    "pubkey": daemon_pub_b64,
+                }
+            )
+            if _DEBUG_E2EE:
+                print(f"[relay][e2ee] handshake complete for {client_id}")
+        except Exception as e:
+            print(f"[relay] handshake failed for {client_id}: {e}")
+            await self._send_plain(
+                {
+                    "type": "error",
+                    "client_id": client_id,
+                    "content": "handshake_failed",
+                }
+            )
+
+    def _encrypt(self, client_id: str, payload: dict) -> dict:
+        """Wrap a plaintext message in an `encrypted` envelope."""
+        cipher = self._ciphers[client_id]
+        iv = os.urandom(12)
+        plaintext = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        ct = cipher.encrypt(iv, plaintext, None)
+        return {
+            "type": "encrypted",
+            "client_id": client_id,
+            "iv": _b64e(iv),
+            "ct": _b64e(ct),
+        }
+
+    def _decrypt(self, client_id: str, envelope: dict) -> str:
+        """Return the JSON-string plaintext inside an encrypted envelope."""
+        cipher = self._ciphers[client_id]
+        iv = _b64d(envelope["iv"])
+        ct = _b64d(envelope["ct"])
+        plaintext = cipher.decrypt(iv, ct, None)
+        return plaintext.decode("utf-8")
+
+    async def _handle_message(self, client_id: str, msg: dict):
+        """Handle a *decrypted* message from a mobile client."""
+        try:
+            msg_type = msg.get("type")
 
             if msg_type == "client_hello":
                 await self._on_client_hello(client_id)
@@ -209,6 +392,7 @@ class RelayClient:
                 await self._on_send_session(client_id, msg)
             elif msg_type == "client_disconnect":
                 self.chat_sessions.pop(client_id, None)
+                self._ciphers.pop(client_id, None)
 
         except Exception as e:
             print(f"[relay] Error handling message: {e}")
@@ -349,10 +533,27 @@ class RelayClient:
                 client_id, {"type": "session_sent", "session_id": session_id, "ok": False, "error": str(e)}
             )
 
+    # -------------------------------------------------------------------------
+    # Send helpers
+    # -------------------------------------------------------------------------
+
     async def _send_to_client(self, client_id: str, data: dict):
-        """Send a message to a specific client through the relay."""
+        """Send an *encrypted* application message to a specific client."""
+        if not self.ws:
+            return
+        cipher = self._ciphers.get(client_id)
+        if cipher is None:
+            # No session key yet — drop. Happens if a tool completes after
+            # the client has disconnected.
+            if _DEBUG_E2EE:
+                print(f"[relay][e2ee] no key for {client_id}, dropping {data.get('type')}")
+            return
+        envelope = self._encrypt(client_id, data)
+        await self.ws.send(json.dumps(envelope))
+
+    async def _send_plain(self, data: dict):
+        """Send a control/handshake message that MUST bypass encryption."""
         if self.ws:
-            data["client_id"] = client_id
             await self.ws.send(json.dumps(data))
 
     def stop(self):

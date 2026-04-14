@@ -26,6 +26,25 @@ const SESSION_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
 /** Storage key for the pairing token set by the daemon. */
 const TOKEN_KEY = "pairingToken";
 
+/**
+ * Message types the relay is allowed to forward.
+ *
+ * All application messages (chat, streaming, tool events, etc.) travel as
+ * `encrypted` envelopes once the E2EE handshake completes. The handshake
+ * itself plus control frames (ping/pong/error) stay unencrypted so the
+ * relay can continue to route them without knowing any keys.
+ *
+ * Messages of any other type are rejected — this prevents a compromised
+ * client from smuggling plaintext app messages past E2EE.
+ */
+const ALLOWED_MESSAGE_TYPES = new Set<string>([
+  "e2ee_handshake",
+  "encrypted",
+  "ping",
+  "pong",
+  "error",
+]);
+
 /** Tag used to identify the daemon WebSocket in hibernation storage. */
 const DAEMON_TAG = "daemon";
 /** Tag prefix for client WebSockets. */
@@ -194,6 +213,7 @@ export class RelaySession implements DurableObject {
     }
 
     // --- Intercept control messages (heartbeat + revoke) before forwarding ---
+    // These are plaintext by design so the relay can route them without keys.
     let parsed: { type?: string; ts?: number } | null = null;
     try {
       parsed = JSON.parse(msgData);
@@ -222,12 +242,29 @@ export class RelaySession implements DurableObject {
       }
     }
 
+    // Relay only forwards whitelisted message types — application traffic
+    // must travel as `encrypted` envelopes. Silently dropping keeps the DO
+    // simple and prevents plaintext leakage bugs upstream.
+    if (!this.isAllowedMessage(msgData)) {
+      return;
+    }
+
     if (isDaemon) {
       // Daemon -> broadcast to all clients
       this.broadcastToClients(msgData);
     } else {
       // Client -> forward to daemon
       this.forwardToDaemon(msgData);
+    }
+  }
+
+  /** Parse the JSON envelope and check that its `type` is allowed. */
+  private isAllowedMessage(raw: string): boolean {
+    try {
+      const parsed = JSON.parse(raw) as { type?: unknown };
+      return typeof parsed.type === "string" && ALLOWED_MESSAGE_TYPES.has(parsed.type);
+    } catch {
+      return false;
     }
   }
 
