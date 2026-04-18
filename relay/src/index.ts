@@ -58,7 +58,12 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 function getDurableObjectStub(env: Env, sessionId: string): DurableObjectStub {
   const id = env.RELAY_SESSIONS.idFromName(sessionId);
-  return env.RELAY_SESSIONS.get(id);
+  // Pin the DO to APAC on first creation. Both target users (Japan + China)
+  // are here; without a hint CF may place it anywhere (we've seen latency
+  // suggesting transpacific detours). Only affects new DOs — existing ones
+  // stay where they were first instantiated. A fresh daemon restart picks
+  // a new session_id, which creates a new DO, which gets this hint.
+  return env.RELAY_SESSIONS.get(id, { locationHint: "apac" });
 }
 
 /** Validate that a string looks like a UUID v4. */
