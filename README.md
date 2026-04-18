@@ -1,174 +1,107 @@
-# Roboot -- 个人 AI Agent Hub
+# Roboot
 
-运行在 Mac 上的 AI 助手，管理 Claude Code 会话，支持语音对话，手机远程控制。
+A personal AI agent hub that lives on your Mac: chat, voice, camera, and hands-on control of your iTerm2 Claude Code sessions -- from a laptop, a phone on the same Wi-Fi, or anywhere in the world via an end-to-end encrypted relay.
 
-## 功能
+Built for people who already run a lot of Claude Code sessions and want one place to watch and talk to them.
 
-- **AI 聊天** -- 流式输出、工具调用、多模型切换（DeepSeek / Claude / GLM）
-- **iTerm2 Claude Code 会话管理** -- 自动发现所有会话，查看输出、发送指令、一键允许/拒绝
-- **JARVIS 语音模式** -- 浏览器端语音输入 + Edge TTS 朗读，说完自动继续听，支持打断
-- **摄像头 + 人脸识别** -- 拍照看世界、注册人脸、自动识别已知的人
-- **远程访问** -- 局域网二维码、Telegram Bot、Relay 远程控制台三种方式
+![demo](docs/demo.gif)
 
-## 快速开始
+## Requirements
 
-### 安装依赖
+- **macOS** -- iTerm2 integration is macOS-only
+- **Python 3.11+**
+- **[iTerm2](https://iterm2.com/)** with the Python API enabled: *iTerm2 → Settings → General → Magic → Enable Python API*
+- At least one LLM API key (DeepSeek recommended -- cheap and stable with tool calling)
 
-```bash
-pip install "arcana-agent[all-providers]>=0.4.0" pyyaml fastapi "uvicorn[standard]" edge-tts iterm2 "qrcode[pil]"
-
-# 人脸识别（可选）
-pip install opencv-python face_recognition
-
-# Telegram 远程控制（可选）
-pip install python-telegram-bot
-```
-
-### 配置
+## Quickstart
 
 ```bash
-cp config.example.yaml config.yaml
+git clone https://github.com/tyxben/roboot.git && cd roboot
+pip install "arcana-agent[all-providers]>=0.4.0" pyyaml fastapi "uvicorn[standard]" edge-tts iterm2 "qrcode[pil]" cryptography
+cp config.example.yaml config.yaml    # then edit and add your API key
+python server.py                      # open http://localhost:8765
 ```
 
-编辑 `config.yaml`，至少填一个 LLM provider 的 API key（推荐 deepseek，便宜）。
+That's it. The welcome message will appear when the WebSocket connects.
 
-### 启动
+### Other entry points
 
 ```bash
-# iTerm2 设置（首次）
-# iTerm2 -> Settings -> General -> Magic -> 勾选 Enable Python API
-
-python server.py
-# 打开 http://localhost:8765
+python run.py                     # Keyboard-only CLI
+python run.py --voice             # Local mic + macOS `say` TTS
+python -m adapters.telegram_bot   # Telegram bot (requires telegram.bot_token)
+chainlit run chainlit_app.py -w   # Alternative Chainlit UI
 ```
 
-其他启动方式：
+## Remote access
 
-```bash
-python run.py                       # 终端键盘模式
-python run.py --voice               # 终端语音模式
-python -m adapters.telegram_bot     # Telegram 远程
-chainlit run chainlit_app.py -w     # Chainlit UI
-```
+Three ways to reach your Roboot from off-device. See [SECURITY.md](SECURITY.md) for the threat model before exposing any of them.
 
-## 远程访问
+- **LAN (zero-config)** -- the server binds `0.0.0.0:8765`; a QR code is printed at startup. Scan it from a phone on the same Wi-Fi. Uses a self-signed TLS cert with trust-on-first-use.
+- **Telegram bot** -- set `telegram.bot_token` in `config.yaml`, run `python -m adapters.telegram_bot`. Gate access with `telegram.allowed_users`.
+- **Relay** -- a Cloudflare Worker forwards WebSocket traffic between the daemon and a browser pair page. Traffic is end-to-end encrypted (ECDH P-256 → HKDF → AES-GCM); the relay only sees ciphertext envelopes. Pairing tokens rotate every 30 minutes and can be revoked instantly from the local console.
 
-### 方式 1：局域网（零配置）
-
-启动后终端会显示二维码，手机扫码直接访问。支持响应式布局和 PWA（添加到主屏幕）。
-
-同一 Wi-Fi 下即可使用，无需任何配置。
-
-### 方式 2：Telegram Bot（填个 Token）
-
-1. 在 Telegram 找 @BotFather，创建 bot，拿到 token
-2. 填入 `config.yaml`:
-   ```yaml
-   telegram:
-     bot_token: "123456:ABC-DEF..."
-     allowed_users: [你的Telegram用户ID]
-   ```
-3. 启动：`python -m adapters.telegram_bot`
-
-出门后通过 Telegram 跟助手聊天、管理 Claude Code 会话。
-
-### 方式 3：Relay 远程控制台（全球可用）
-
-通过 Cloudflare Worker 中转，在任何地方访问完整的 Web 控制台。
-
-1. 在 `config.yaml` 中启用：
-   ```yaml
-   remote_access:
-     method: "official_relay"
-     relay:
-       enabled: true
-       endpoint: "wss://relay.coordbound.com"
-   ```
-2. 启动 `python server.py`，终端会显示 relay 配对二维码
-3. 手机扫码打开配对页面，自动建立 WebSocket 连接
-
-配对 URL 包含一次性加密 token，30 分钟后自动过期。
-
-## 安全
-
-- Token 30 分钟自动过期（可通过 `/api/relay-refresh` 手动刷新）
-- 256-bit 加密随机 token（`secrets.token_hex(32)`）
-- 常量时间比较防时序攻击（relay 端 `timingSafeEqual`）
-- WebSocket 连接建立后不受 token 过期影响（已认证的连接保持有效）
-- Relay 限流：每 IP 每小时最多 10 个会话
-- Telegram 可限制 `allowed_users` 白名单
-
-## 架构图
+## Architecture
 
 ```
-+------------------+     +-------------------+     +------------------+
-|  浏览器/手机      |     |  Telegram          |     |  Relay 控制台     |
-|  console.html    |     |  adapters/         |     |  relay/          |
-|  (WebSocket)     |     |  telegram_bot.py   |     |  (CF Worker)     |
-+--------+---------+     +--------+----------+     +--------+---------+
-         |                         |                         |
-         v                         v                         v
-+--------+-------------------------+-------------------------+---------+
-|                        server.py (FastAPI)                           |
-|  /ws              流式聊天（LLM_CHUNK 事件）                          |
-|  /api/sessions/*  iTerm2 会话控制                                     |
-|  /api/tts         Edge TTS 语音合成                                   |
-|  /api/relay-*     Relay 状态/刷新/二维码                               |
-+--------+--------------------+--------------------+-------------------+
-         |                    |                    |
-    arcana.Runtime      iterm_bridge.py      relay_client.py
-    (LLM + Tools)       (iTerm2 API)         (Relay WebSocket)
-         |
-    tools/
-    +-- shell.py          终端命令
-    +-- claude_code.py    Claude Code 会话
-    +-- vision.py         摄像头 + 截屏 + 人脸
-    +-- soul.py           自我修改 + 记忆
-    +-- face_db.py        人脸数据库
+server.py (FastAPI)              <- Main entry point
+├── WebSocket /ws                <- Streaming chat (LLM_CHUNK events)
+├── REST /api/sessions/*         <- Direct iTerm2 session control
+├── REST /api/tts                <- Edge TTS (text -> mp3)
+├── REST /api/relay-*            <- Relay status / refresh / revoke / QR
+├── REST /api/network-info       <- Local IP addresses + QR
+└── Static /static/console.html  <- Unified web console
+
+relay_client.py                  <- Connects to the Cloudflare Worker relay
+iterm_bridge.py                  <- Persistent iTerm2 Python API connection
+soul.md                          <- Self-modifiable assistant identity
+config.yaml                      <- API keys + provider config (gitignored)
+
+tools/
+├── shell.py                     <- Terminal command execution
+├── claude_code.py               <- iTerm2 session list/read/send/create
+├── vision.py                    <- Camera + screenshot + face recognition
+├── face_db.py                   <- Face encoding storage (.faces/)
+└── soul.py                      <- Self-modification + user memory
+
+adapters/
+├── telegram_bot.py              <- Remote control via Telegram
+├── voice.py                     <- Local mic STT + macOS TTS
+└── keyboard.py                  <- Terminal text input
+
+relay/                           <- Cloudflare Worker relay
+├── src/index.ts                 <- Worker entry, routing, rate limiting
+├── src/relay-session.ts         <- Durable Object: daemon↔client session mgmt
+├── src/pair-page.ts             <- Browser pairing page
+└── wrangler.toml                <- Cloudflare deployment config
 ```
 
-## 配置参考 (config.yaml)
+Deeper architecture notes (agent framework, TTS conventions, soul system, E2EE handshake, streaming protocol) live in [CLAUDE.md](CLAUDE.md).
 
-参见 `config.example.yaml`，包含所有可用选项及注释说明。核心配置：
+## Adding a tool
 
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `providers.deepseek` | DeepSeek API key | 必填（至少一个） |
-| `default_provider` | 默认 LLM 提供商 | `deepseek` |
-| `default_model` | 默认模型 | `deepseek-chat` |
-| `daily_budget_usd` | 每日预算（美元） | `5.0` |
-| `voice.tts_voice` | Edge TTS 语音 | 空（用默认） |
-| `telegram.bot_token` | Telegram Bot token | 空（不启用） |
-| `remote_access.method` | 远程访问方式 | `none` |
+1. Create `tools/my_tool.py`.
+2. Decorate with `@arcana.tool(when_to_use=..., what_to_expect=...)`.
+3. Import it and add it to `ALL_TOOLS` in `server.py`.
 
-## 添加新工具
+Arcana handles registration; no other wiring is needed. See the "Adding a New Tool" section in [CLAUDE.md](CLAUDE.md) for conventions.
 
-1. 创建 `tools/my_tool.py`
-2. 用 `@arcana.tool()` 装饰器，填写 `when_to_use` 描述何时调用
-3. 在 `server.py` 的 `ALL_TOOLS` 列表中导入并添加
-4. 完成 -- Arcana 自动注册，无需其他改动
+## Configuration
 
-示例：
+Every option is documented inline in [`config.example.yaml`](config.example.yaml). The assistant can also rewrite parts of its own identity by editing `soul.md` through the `soul` tool.
 
-```python
-import arcana
+## Security
 
-@arcana.tool(
-    when_to_use="当用户需要做某件事时",
-    what_to_expect="返回结果描述",
-)
-async def my_tool(param: str) -> str:
-    """工具说明。"""
-    return f"结果: {param}"
-```
+If you plan to expose Roboot beyond localhost, read [SECURITY.md](SECURITY.md) first. It lists what is and isn't protected, known gaps, and how to report vulnerabilities.
 
-## 技术栈
+## License
 
-- **Agent**: [Arcana](https://github.com/tyxben/arcana) 0.4.0
-- **LLM**: DeepSeek（默认）/ Claude / GLM / OpenAI
-- **TTS**: Edge TTS（微软神经网络语音，免费）
-- **STT**: Chrome Web Speech API（浏览器端）
-- **人脸识别**: face_recognition + OpenCV
-- **iTerm2**: Python API WebSocket 持久连接
-- **Web**: FastAPI + WebSocket + 原生 HTML/JS
-- **Relay**: Cloudflare Workers + Durable Objects
+[MIT](LICENSE) -- Copyright (c) 2026 tyxben.
+
+## Credits
+
+- [Arcana](https://github.com/tyxben/arcana) -- the agent framework
+- [DeepSeek](https://platform.deepseek.com) -- default LLM provider
+- [iTerm2](https://iterm2.com/) Python API -- terminal integration
+- [Cloudflare Workers](https://workers.cloudflare.com/) + Durable Objects -- relay infrastructure
+- [Edge TTS](https://github.com/rany2/edge-tts) -- neural voice synthesis
