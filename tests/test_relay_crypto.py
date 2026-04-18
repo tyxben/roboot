@@ -257,3 +257,138 @@ def test_hkdf_info_string_is_stable():
 
     src = inspect.getsource(relay_client._derive_session_key)
     assert b"roboot-relay-e2ee-v1".decode() in src
+
+
+# ---------------------------------------------------------------------------
+# Signed handshake (v0.3.0) — daemon identity, client_id binding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handshake_rejects_client_id_mismatch():
+    """Client declaring a client_id that doesn't match SHA256(its pubkey)[:16]
+    must be rejected with an error frame and get no cipher allocated."""
+    import hashlib
+
+    client = _make_client()
+    captured: list[dict] = []
+
+    async def fake_send_plain(data):
+        captured.append(data)
+
+    client._send_plain = fake_send_plain  # type: ignore[assignment]
+
+    browser_priv = ec.generate_private_key(ec.SECP256R1())
+    browser_pub_b64 = _b64e(_pubkey_bytes(browser_priv))
+    # Deliberately wrong client_id
+    await client._on_handshake(
+        "deadbeef" * 4,  # 32 hex chars, but not the real hash
+        {"type": "e2ee_handshake", "client_id": "deadbeef" * 4, "pubkey": browser_pub_b64},
+    )
+
+    assert captured, "daemon should have emitted an error frame"
+    assert captured[0]["type"] == "error"
+    assert captured[0]["content"] == "client_id_mismatch"
+    assert "deadbeef" * 4 not in client._ciphers, "no cipher for rejected client"
+
+
+@pytest.mark.asyncio
+async def test_handshake_accepts_correct_client_id_and_signs_reply():
+    """Correctly-derived client_id → handshake proceeds, reply carries
+    id_pubkey + sig, signature verifies against the daemon's long-term key."""
+    import hashlib
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    client = _make_client()
+    captured: list[dict] = []
+
+    async def fake_send_plain(data):
+        captured.append(data)
+
+    client._send_plain = fake_send_plain  # type: ignore[assignment]
+
+    browser_priv = ec.generate_private_key(ec.SECP256R1())
+    browser_pub_bytes = _pubkey_bytes(browser_priv)
+    browser_pub_b64 = _b64e(browser_pub_bytes)
+    expected_id = hashlib.sha256(browser_pub_bytes).digest()[:16].hex()
+
+    await client._on_handshake(
+        expected_id,
+        {"type": "e2ee_handshake", "client_id": expected_id, "pubkey": browser_pub_b64},
+    )
+
+    assert captured, "daemon should have replied"
+    reply = captured[0]
+    assert reply["type"] == "e2ee_handshake"
+    assert reply["client_id"] == expected_id
+    # New fields
+    assert "id_pubkey" in reply
+    assert "sig" in reply
+
+    # Verify: signature is over daemon_pub ‖ client_pub ‖ client_id (ascii)
+    daemon_pub_bytes = _b64d(reply["pubkey"])
+    id_pub_bytes = _b64d(reply["id_pubkey"])
+    sig_bytes = _b64d(reply["sig"])
+    payload = daemon_pub_bytes + browser_pub_bytes + expected_id.encode("ascii")
+
+    pub = Ed25519PublicKey.from_public_bytes(id_pub_bytes)
+    pub.verify(sig_bytes, payload)  # raises if invalid
+
+    # Cipher was registered
+    assert expected_id in client._ciphers
+
+
+@pytest.mark.asyncio
+async def test_handshake_signature_fails_if_payload_modified():
+    """If an attacker tampered with the daemon's ephemeral pubkey between
+    daemon and browser, verifying the signature against the tampered
+    value must fail. (Sanity check on the domain.)"""
+    import hashlib
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    client = _make_client()
+    captured: list[dict] = []
+    client._send_plain = lambda d: captured.append(d) or _noop()  # type: ignore
+
+    async def fake_send_plain(data):
+        captured.append(data)
+
+    client._send_plain = fake_send_plain  # type: ignore[assignment]
+
+    browser_priv = ec.generate_private_key(ec.SECP256R1())
+    browser_pub_bytes = _pubkey_bytes(browser_priv)
+    expected_id = hashlib.sha256(browser_pub_bytes).digest()[:16].hex()
+    await client._on_handshake(
+        expected_id,
+        {"type": "e2ee_handshake", "client_id": expected_id, "pubkey": _b64e(browser_pub_bytes)},
+    )
+    reply = captured[0]
+
+    daemon_pub_bytes = _b64d(reply["pubkey"])
+    tampered = bytearray(daemon_pub_bytes)
+    tampered[0] ^= 0x01
+    bad_payload = bytes(tampered) + browser_pub_bytes + expected_id.encode("ascii")
+
+    pub = Ed25519PublicKey.from_public_bytes(_b64d(reply["id_pubkey"]))
+    with pytest.raises(InvalidSignature):
+        pub.verify(_b64d(reply["sig"]), bad_payload)
+
+
+async def _noop():
+    return None
+
+
+def test_pairing_url_contains_fingerprint():
+    """pairing_url must include the #fp=… fragment so browsers can verify
+    the daemon's long-term identity out-of-band."""
+    client = _make_client()
+    url = client.pairing_url
+    assert "#fp=" in url
+    # 26 base32 chars after #fp=
+    fp_part = url.split("#fp=")[1]
+    assert len(fp_part) == 26
+    assert fp_part.islower()
+    assert fp_part == client.fingerprint

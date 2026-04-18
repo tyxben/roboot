@@ -30,8 +30,11 @@ import secrets
 import time
 import uuid
 
+import hashlib
+
 import websockets
 import chat_store
+import identity
 from chat_handler import handle_chat
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -98,6 +101,10 @@ class RelayClient:
         self.token = secrets.token_hex(32)
         self.token_created_at: float = time.time()
         self.token_ttl: int = token_ttl  # seconds, default 30 minutes
+        # Long-term ed25519 identity: signs handshake replies so browsers can
+        # detect a compromised relay from swapping daemon pubkeys. Fingerprint
+        # ships in the pairing URL fragment (browser-only, never sent to relay).
+        self._id_key, self._id_pub_bytes, self.fingerprint = identity.load_or_create()
         self.ws = None
         self._loop = None  # Set when start() runs; used for cross-thread close
         self.running = False
@@ -125,11 +132,16 @@ class RelayClient:
     @property
     def pairing_url(self) -> str:
         """URL a mobile client should open to pair with this daemon.
-        Contains both session_id and cryptographic token for authentication."""
+
+        Contains session_id, token, and an identity fingerprint. The fragment
+        (`#fp=…`) is intentional: URL fragments are never sent to servers by
+        any browser, so this side-channel lets the browser verify the daemon's
+        long-term identity without trusting the relay to deliver it honestly.
+        """
         base = self.relay_url.replace("wss://", "https://").replace(
             "ws://", "http://"
         )
-        return f"{base}/pair/{self.session_id}?token={self.token}"
+        return f"{base}/pair/{self.session_id}?token={self.token}#fp={self.fingerprint}"
 
     @property
     def token_expired(self) -> bool:
@@ -346,7 +358,14 @@ class RelayClient:
         """Complete the ECDH handshake for a new client.
 
         Generates a fresh ephemeral keypair per client so compromise of one
-        session cannot decrypt another.
+        session cannot decrypt another. Also:
+        - Rejects if the client's self-declared client_id doesn't match
+          SHA256(client_pub)[:16].hex(). Binds the id to the ephemeral key
+          so a token-holder can't impersonate another client's routing slot.
+        - Signs the reply with the daemon's long-term ed25519 key over
+          (daemon_pub ‖ client_pub ‖ client_id). Browser verifies against
+          the fingerprint embedded in the pairing URL fragment, catching
+          MITM at the relay even if the relay code is compromised.
         """
         if not client_id:
             if _DEBUG_E2EE:
@@ -358,6 +377,24 @@ class RelayClient:
 
         try:
             client_pub_bytes = _b64d(client_pub_b64)
+            # Bind client_id ↔ pubkey. Attacker can still pair with their
+            # own key, but can't steal a specific client_id slot.
+            expected_id = hashlib.sha256(client_pub_bytes).digest()[:16].hex()
+            if client_id != expected_id:
+                if _DEBUG_E2EE:
+                    print(
+                        f"[relay][e2ee] client_id mismatch: got {client_id}, "
+                        f"expected {expected_id}"
+                    )
+                await self._send_plain(
+                    {
+                        "type": "error",
+                        "client_id": client_id,
+                        "content": "client_id_mismatch",
+                    }
+                )
+                return
+
             private_key = ec.generate_private_key(ec.SECP256R1())
             key_bytes = _derive_session_key(private_key, client_pub_bytes)
             self._ciphers[client_id] = AESGCM(key_bytes)
@@ -365,12 +402,20 @@ class RelayClient:
             # client_id should also be reset.
             self.chat_sessions.pop(client_id, None)
 
-            daemon_pub_b64 = _b64e(_pubkey_bytes(private_key))
+            daemon_pub_bytes = _pubkey_bytes(private_key)
+            daemon_pub_b64 = _b64e(daemon_pub_bytes)
+            # Signature domain: concatenation with no separators is fine
+            # because all three components are fixed length (65 + 65 + 32).
+            sig_payload = daemon_pub_bytes + client_pub_bytes + client_id.encode("ascii")
+            sig_b64 = _b64e(self._id_key.sign(sig_payload))
+
             await self._send_plain(
                 {
                     "type": "e2ee_handshake",
                     "client_id": client_id,
                     "pubkey": daemon_pub_b64,
+                    "id_pubkey": _b64e(self._id_pub_bytes),
+                    "sig": sig_b64,
                 }
             )
             if _DEBUG_E2EE:

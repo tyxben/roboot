@@ -442,10 +442,9 @@ var _revoked = false;
 // Each WebSocket connection gets a fresh ECDH keypair + derived AES-GCM key.
 // All app messages are wrapped in {type:"encrypted",iv,ct}; the handshake
 // itself travels in the clear so the Cloudflare relay can still route it.
-var CLIENT_ID = (crypto.randomUUID ? crypto.randomUUID() :
-  ('xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx').replace(/[xy]/g, function(c) {
-    var r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
-  }));
+// client_id is derived from the client's own ephemeral pubkey, so a
+// token-holder cannot impersonate another client's routing slot.
+var CLIENT_ID = null;      // set in startHandshake after keypair is generated
 var e2eeKey = null;        // CryptoKey for AES-GCM (after handshake)
 var e2eeReady = false;     // true once both pubkeys have been exchanged
 var e2eeKeypair = null;    // our ephemeral ECDH keypair for this WS
@@ -462,6 +461,41 @@ function _bytesFromB64(b64) {
   var out = new Uint8Array(s.length);
   for (var i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
   return out;
+}
+function _hex(bytes) {
+  var out = '';
+  for (var i = 0; i < bytes.length; i++) {
+    var h = bytes[i].toString(16);
+    out += h.length === 1 ? '0' + h : h;
+  }
+  return out;
+}
+// RFC 4648 base32 of a Uint8Array, no padding. Matches Python's
+// base64.b32encode(...).rstrip('=') output byte-for-byte.
+function _base32(bytes) {
+  var A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  var bits = 0, value = 0, out = '';
+  for (var i = 0; i < bytes.length; i++) {
+    value = (value << 8) | bytes[i];
+    bits += 8;
+    while (bits >= 5) {
+      out += A[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += A[(value << (5 - bits)) & 31];
+  return out;
+}
+async function _sha256(bytes) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+}
+// Read the daemon identity fingerprint from the URL fragment. Fragments are
+// never sent to the server by any browser, so this value cannot be spoofed
+// by a compromised relay — only by someone who controls the user's initial
+// link delivery (e.g. swaps the QR code physically).
+function _urlFingerprint() {
+  var m = (location.hash || '').match(/(?:^#|[#&])fp=([A-Za-z0-9]+)/);
+  return m ? m[1].toLowerCase() : '';
 }
 
 function resetE2EE() {
@@ -481,6 +515,11 @@ async function startHandshake() {
   var rawPub = new Uint8Array(
     await crypto.subtle.exportKey('raw', e2eeKeypair.publicKey)
   );
+  // client_id = SHA256(client_ephemeral_pub)[:16] in hex. Deterministic +
+  // cryptographically bound to the key, so a token-holder can't claim
+  // someone else's client_id without finding a pubkey collision.
+  var pubHash = await _sha256(rawPub);
+  CLIENT_ID = _hex(pubHash.slice(0, 16));
   ws.send(JSON.stringify({
     type: 'e2ee_handshake',
     client_id: CLIENT_ID,
@@ -489,8 +528,49 @@ async function startHandshake() {
   if (DEBUG_E2EE) console.log('[e2ee] handshake sent', CLIENT_ID);
 }
 
-async function completeHandshake(daemonPubB64) {
-  var daemonPubBytes = _bytesFromB64(daemonPubB64);
+async function completeHandshake(frame) {
+  // Step 0: verify daemon identity before trusting anything else.
+  // The daemon's ephemeral ECDH pubkey is signed by its long-term ed25519
+  // key. The fingerprint of that long-term key was delivered out-of-band
+  // in the URL fragment (which never touches the relay).
+  if (!frame.id_pubkey || !frame.sig) {
+    throw new Error('handshake reply missing identity/signature — daemon needs upgrade?');
+  }
+  var expectedFp = _urlFingerprint();
+  if (!expectedFp) {
+    throw new Error('pairing URL missing #fp=... fragment — rescan QR');
+  }
+  var idPubBytes = _bytesFromB64(frame.id_pubkey);
+  if (idPubBytes.length !== 32) throw new Error('bad id_pubkey length');
+  var idHash = await _sha256(idPubBytes);
+  var actualFp = _base32(idHash.slice(0, 16)).toLowerCase();
+  if (actualFp !== expectedFp) {
+    throw new Error('identity fingerprint mismatch (expected ' + expectedFp + ', got ' + actualFp + ') — possible MITM');
+  }
+
+  var daemonPubBytes = _bytesFromB64(frame.pubkey);
+  var clientPubBytes = new Uint8Array(
+    await crypto.subtle.exportKey('raw', e2eeKeypair.publicKey)
+  );
+  // Signature domain: daemon_pub ‖ client_pub ‖ client_id (ASCII bytes).
+  // All three pieces are fixed-length so concat is unambiguous.
+  var clientIdBytes = new TextEncoder().encode(CLIENT_ID);
+  var sigInput = new Uint8Array(daemonPubBytes.length + clientPubBytes.length + clientIdBytes.length);
+  sigInput.set(daemonPubBytes, 0);
+  sigInput.set(clientPubBytes, daemonPubBytes.length);
+  sigInput.set(clientIdBytes, daemonPubBytes.length + clientPubBytes.length);
+  var sigBytes = _bytesFromB64(frame.sig);
+  var idKey;
+  try {
+    idKey = await crypto.subtle.importKey('raw', idPubBytes, { name: 'Ed25519' }, false, ['verify']);
+  } catch (e) {
+    throw new Error('this browser lacks WebCrypto Ed25519 support — upgrade (Chrome 113+, Safari 17+, Firefox 129+)');
+  }
+  var sigOk = await crypto.subtle.verify({ name: 'Ed25519' }, idKey, sigBytes, sigInput);
+  if (!sigOk) throw new Error('handshake signature invalid — possible MITM');
+
+  // Step 1: ECDH -> 256-bit shared secret (raw bits). Only runs after the
+  // daemon identity has been proven.
   var daemonPub = await crypto.subtle.importKey(
     'raw', daemonPubBytes,
     { name: 'ECDH', namedCurve: 'P-256' }, false, []
@@ -678,21 +758,24 @@ function connectWS() {
     // by secureSend() until this completes.
     if (frame.type === 'e2ee_handshake') {
       try {
-        await completeHandshake(frame.pubkey);
+        await completeHandshake(frame);
         setConnStatus('Connected', true);
         updateSendBtn();
       } catch (err) {
-        setConnStatus('Handshake failed: ' + err.message, false);
-        try { ws.close(4002, 'handshake_failed'); } catch(_) {}
+        // Hard-fail the connection: we do NOT proceed without a verified
+        // daemon identity. The user should rescan the QR; a compromised
+        // relay would keep failing here on every attempt.
+        setConnStatus('Handshake rejected: ' + err.message, false);
+        try { ws.close(4003, 'handshake_rejected'); } catch(_) {}
       }
       return;
     }
 
     // Unencrypted error frames from the relay/daemon (e.g. handshake_failed).
-    // client_id === our id means this error is ours; missing client_id is
-    // treated as "addressed to us" too so the relay can still surface issues.
+    // Treat as ours if client_id matches — or if we haven't computed ours
+    // yet (the error may be about our in-flight handshake).
     if (frame.type === 'error' && !frame.ct) {
-      if (!frame.client_id || frame.client_id === CLIENT_ID) {
+      if (!frame.client_id || !CLIENT_ID || frame.client_id === CLIENT_ID) {
         addChatMsg('bot', 'Error: ' + (frame.content || 'unknown'));
       }
       return;

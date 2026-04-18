@@ -112,18 +112,26 @@ The local console has a red "撤销所有远程访问" button. It calls `POST /a
 Both daemon (`relay_client.py`) and mobile client (`pair-page.ts`) send `{"type":"ping","ts":<ms>}` every 30s. The relay DO (`relay-session.ts`) replies `{"type":"pong","ts":<original>}` and never forwards ping/pong to the peer. If no pong arrives within 60s, the sender closes its socket, which triggers reconnect (daemon) or the revoked flag path (client). The DO also tracks `lastSeenAt` per connection via `serializeAttachment`; when its alarm fires, it closes any socket that hasn't sent anything in 90s. Heartbeat frames stay outside any future E2EE envelope so the relay can route them.
 
 ### End-to-End Encryption (Relay)
-Application traffic between the Mac daemon and each mobile client is E2E encrypted. The Cloudflare Worker relay is a dumb pipe — it only sees ciphertext envelopes plus the handshake public keys. Keys never leave the endpoints.
+Application traffic between the Mac daemon and each mobile client is E2E encrypted AND the daemon authenticates itself via a long-term ed25519 identity key, so even a compromised Cloudflare Worker cannot successfully MITM. The Worker relay is a dumb pipe — it only sees ciphertext envelopes plus the handshake public keys. Keys never leave the endpoints.
 
-Handshake (ECDH P-256, HKDF-SHA256):
-1. Client opens the WebSocket, generates an ephemeral ECDH P-256 keypair, and sends `{"type":"e2ee_handshake","client_id":"<uuid>","pubkey":"<base64 raw uncompressed point>"}`.
-2. Daemon (`relay_client.py`) generates its own ephemeral P-256 keypair per `client_id`, derives a 32-byte AES-GCM key via `HKDF-SHA256(ecdh_shared, info="roboot-relay-e2ee-v1", salt=empty)`, and replies with the same frame shape carrying its pubkey.
-3. Browser derives the same key via WebCrypto (`deriveBits` → `importKey(HKDF)` → `deriveKey(AES-GCM)` with the same info string).
+Daemon identity (`identity.py`): on first run the daemon generates an ed25519 keypair at `.identity/daemon.ed25519.key` (raw 32B, 0600 perms, gitignored). Its fingerprint — `base32(SHA256(pub)[:16]).lower()`, 26 chars — is embedded in the pairing URL as a `#fp=…` fragment. Fragments are **never** sent to any server by any browser, so this fingerprint reaches the browser out-of-band from the relay. Losing the key file invalidates all previously-distributed pairing URLs.
+
+Handshake (ECDH P-256, HKDF-SHA256, ed25519-signed):
+1. Client opens the WebSocket, generates an ephemeral ECDH P-256 keypair, computes `client_id = SHA256(client_pub)[:16].hex()` (binds the id to the key — a token-holder cannot spoof another client's slot), and sends `{"type":"e2ee_handshake","client_id":"<hex>","pubkey":"<base64 raw uncompressed point>"}`.
+2. Daemon (`relay_client.py::_on_handshake`) verifies `client_id == SHA256(client_pub)[:16].hex()` and rejects on mismatch. It generates an ephemeral P-256 keypair, derives a 32-byte AES-GCM key via `HKDF-SHA256(ecdh_shared, info="roboot-relay-e2ee-v1", salt=empty)`, and replies with `{"type":"e2ee_handshake","client_id":"<hex>","pubkey":"<b64 daemon_ephemeral_pub>","id_pubkey":"<b64 ed25519_pub_32B>","sig":"<b64 ed25519_sig>"}`. The signature covers `daemon_pub ‖ client_pub ‖ client_id.encode()` (all fixed lengths so concat is unambiguous).
+3. Browser (`pair-page.ts::completeHandshake`) verifies:
+   - `base32(SHA256(id_pubkey)[:16]).lower()` matches the `fp` from the URL fragment (catches a swapped daemon identity).
+   - `ed25519.verify(id_pubkey, sig, daemon_pub ‖ client_pub ‖ client_id)` succeeds (catches a swapped ephemeral pub with mismatched signature).
+   On failure: close WS with code 4003, show error screen, do NOT derive a session key.
+4. After both verifications pass, browser runs the same HKDF-SHA256 chain (`deriveBits` → `importKey(HKDF)` → `deriveKey(AES-GCM)`) to arrive at the matching AES key.
+
+Browser requirement: WebCrypto Ed25519 (Chrome 113+, Firefox 129+, Safari 17+).
 
 Encrypted envelope (every app message after handshake):
 ```
-{"type":"encrypted","client_id":"<uuid>","iv":"<base64 12B>","ct":"<base64 AES-GCM ciphertext>"}
+{"type":"encrypted","client_id":"<hex>","iv":"<base64 12B>","ct":"<base64 AES-GCM ciphertext>"}
 ```
-Plaintext is the original JSON message UTF-8-encoded. Fresh 96-bit IV per message (`os.urandom(12)` / `crypto.getRandomValues`). AAD is empty; the client_id is not authenticated because the DO can already enforce it via its session scoping.
+Plaintext is the original JSON message UTF-8-encoded. Fresh 96-bit IV per message (`os.urandom(12)` / `crypto.getRandomValues`). AAD is empty; `client_id` is bound to the pubkey by construction, so a tampered `client_id` in the envelope would look up a cipher that fails GCM authentication.
 
 Relay contract (`relay/src/relay-session.ts`):
 - Whitelist of forwardable message types: `e2ee_handshake`, `encrypted`, `ping`, `pong`, `error`. Anything else is dropped on the floor — a compromised client cannot smuggle plaintext through.
