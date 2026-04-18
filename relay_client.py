@@ -106,6 +106,14 @@ class RelayClient:
         self._heartbeat_task: asyncio.Task | None = None
         # Map of client_id -> AESGCM cipher (one per daemon<->client pair)
         self._ciphers: dict[str, AESGCM] = {}
+        # Clients that have asked for the session list at least once during
+        # this WS connection. Only these get the `sessions` piggyback on `done`.
+        self._sessions_subscribed: set[str] = set()
+        # Strong refs to in-flight handler tasks. asyncio.create_task only
+        # returns a weak ref via the event loop, so a task with no other
+        # owner can be GC'd mid-await — silently cancelled. Hold refs here
+        # and discard on completion.
+        self._handler_tasks: set[asyncio.Task] = set()
 
     @property
     def pairing_url(self) -> str:
@@ -133,6 +141,7 @@ class RelayClient:
         # Clear chat sessions + crypto state: every client must re-handshake.
         self.chat_sessions.clear()
         self._ciphers.clear()
+        self._sessions_subscribed.clear()
         # Close existing WebSocket so the reconnect loop picks up new creds.
         # Grab a local reference to avoid races, then set self.ws = None so
         # _send_to_client() stops using the old socket immediately.
@@ -192,12 +201,16 @@ class RelayClient:
         if self.token_expired:
             self.rotate_token()
         url = f"{self.relay_url}/ws/daemon/{self.session_id}?token={self.token}"
-        async with websockets.connect(url) as ws:
+        # ping_interval=None disables the library's protocol-level ping; we
+        # run our own app-level {"type":"ping"} heartbeat (see _heartbeat_loop)
+        # which the relay DO handles without waking from hibernation.
+        async with websockets.connect(url, ping_interval=None) as ws:
             self.ws = ws
             self._last_pong_at = time.time()
             # Fresh connection -> drop any leftover per-client crypto state.
             self._ciphers.clear()
             self.chat_sessions.clear()
+            self._sessions_subscribed.clear()
             # Register with relay (plaintext -- daemon_hello isn't whitelisted
             # by the relay DO, so it's dropped; kept for backwards log clarity).
             await ws.send(
@@ -216,9 +229,14 @@ class RelayClient:
             # reconnect loop reconnects.
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
             try:
-                # Process incoming messages until disconnect
+                # Process incoming messages. Spawn each handler as its own
+                # task so slow work (LLM streaming, iTerm2 reads) doesn't
+                # block the reader — otherwise the pong frames pile up in
+                # the ws buffer and our heartbeat falsely times out.
                 async for raw_message in ws:
-                    await self._handle_raw(raw_message)
+                    task = asyncio.create_task(self._handle_raw(raw_message))
+                    self._handler_tasks.add(task)
+                    task.add_done_callback(self._handler_tasks.discard)
             finally:
                 if self._heartbeat_task is not None:
                     self._heartbeat_task.cancel()
@@ -393,6 +411,7 @@ class RelayClient:
             elif msg_type == "client_disconnect":
                 self.chat_sessions.pop(client_id, None)
                 self._ciphers.pop(client_id, None)
+                self._sessions_subscribed.discard(client_id)
 
         except Exception as e:
             print(f"[relay] Error handling message: {e}")
@@ -461,7 +480,11 @@ class RelayClient:
             "tools_used": tools_used,
         }
 
-        if tools_used > 0:
+        # Only piggyback the session list to clients that have actually
+        # opened the sidebar (and thus called get_sessions). Saves one
+        # list_sessions iTerm2 round-trip per tool-using chat for mobile
+        # clients that never opened the drawer.
+        if tools_used > 0 and client_id in self._sessions_subscribed:
             try:
                 from iterm_bridge import bridge
 
@@ -477,6 +500,7 @@ class RelayClient:
 
     async def _on_get_sessions(self, client_id: str):
         """Return the list of iTerm2 Claude Code sessions."""
+        self._sessions_subscribed.add(client_id)
         try:
             from iterm_bridge import bridge
 

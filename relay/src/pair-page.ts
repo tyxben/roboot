@@ -211,7 +211,32 @@ body {
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--green); flex-shrink: 0;
 }
+.session-item .dot.waiting { background: var(--yellow); animation: pulse 1.5s ease infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 .session-item .label { font-size: 13px; font-weight: 500; flex: 1; }
+
+/* Confirm bar — shown when Claude Code is waiting for approval */
+.confirm-bar {
+  display: none;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  background: rgba(210,153,34,0.08);
+  align-items: center; gap: 10px; flex-shrink: 0;
+}
+.confirm-bar.visible { display: flex; }
+.confirm-bar .prompt {
+  flex: 1; font-size: 12.5px; color: var(--yellow);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-family: "SF Mono","Menlo",monospace;
+}
+.confirm-bar button {
+  padding: 6px 14px; border: none; border-radius: 6px;
+  font-size: 12.5px; cursor: pointer; font-family: inherit; font-weight: 600;
+}
+.btn-allow { background: var(--green); color: #000; }
+.btn-deny { background: var(--red); color: white; }
+.btn-allow:hover { opacity: 0.9; }
+.btn-deny:hover { opacity: 0.9; }
 
 /* Terminal */
 .terminal {
@@ -329,6 +354,11 @@ body {
       <button id="auto-btn" onclick="toggleAuto()">Auto Refresh</button>
     </div>
     <div class="terminal" id="terminal"></div>
+    <div class="confirm-bar" id="confirm-bar">
+      <span class="prompt" id="confirm-prompt">Waiting for confirmation...</span>
+      <button class="btn-allow" onclick="quickSend('y')">Allow</button>
+      <button class="btn-deny" onclick="quickSend('n')">Deny</button>
+    </div>
     <div class="input-bar">
       <textarea id="txt-session" rows="1" placeholder="Send to this session..." style="font-family:'SF Mono','Menlo',monospace;"></textarea>
       <button onclick="sendToSession()">&#8593;</button>
@@ -369,9 +399,26 @@ var connected = false;
 var reconnectDelay = 1000;
 var sessions = [];
 var currentId = null;
+// autoOn = user intent (stays true even when we pause the timer because the
+// tab is hidden); autoTimer = actual setInterval handle, nulled when paused.
+var autoOn = false;
 var autoTimer = null;
+// True once the user has opened the sidebar (or we're on desktop where it's
+// always visible). Persists across reconnects so the daemon re-subscribes.
+var sessionsWanted = false;
 // Per-session incremental cursor. undefined => need full initial fetch.
 var lastLineBySession = {};
+// Pattern matches Claude Code waiting-for-approval prompts. Scanned over
+// the last ~10 lines of terminal output each refresh; when a pattern hits,
+// the confirm bar appears with Allow/Deny buttons that send y/n.
+var CONFIRM_PATTERNS = [
+  /Do you want to proceed/i, /\\[Y\\/n\\]/, /\\[y\\/N\\]/, /\\(y\\/n\\)/i,
+  /Allow|Deny/, /allow this/i, /approve this/i,
+  /Press Enter to continue/i, /Do you want to/i, /Shall I/i,
+  /要继续吗/, /是否允许/, /确认/,
+];
+var ANSI_RE = /\\x1b\\[[0-9;?]*[ -\\/]*[@-~]|\\x1b\\].*?(?:\\x07|\\x1b\\\\)/g;
+function stripAnsi(s) { return s.replace(ANSI_RE, ''); }
 // Heartbeat: send ping every 30s; if no pong within 60s close + reconnect.
 var HEARTBEAT_INTERVAL_MS = 30000;
 var HEARTBEAT_TIMEOUT_MS = 60000;
@@ -499,8 +546,16 @@ async function secureDecrypt(envelope) {
 
 // === Mobile Sidebar ===
 function toggleSidebar() {
-  document.getElementById('sidebar').classList.toggle('open');
+  var sb = document.getElementById('sidebar');
+  var opening = !sb.classList.contains('open');
+  sb.classList.toggle('open');
   document.getElementById('sidebar-backdrop').classList.toggle('open');
+  // First open on mobile: subscribe to sessions now that the user actually
+  // wants to see the list. Subsequent reconnects re-fetch automatically.
+  if (opening && !sessionsWanted) {
+    sessionsWanted = true;
+    loadSessions();
+  }
 }
 function closeSidebar() {
   document.getElementById('sidebar').classList.remove('open');
@@ -589,7 +644,13 @@ function connectWS() {
     setConnStatus('Securing...', false);
     // Queue the app-level hello/session-load until the key is derived.
     secureSend({ type: 'client_hello' });
-    setTimeout(loadSessions, 500);
+    // Lazy session list: only fetch if the sidebar is actually visible
+    // (desktop always, mobile only after toggleSidebar has opened it once).
+    // sessionsWanted persists across reconnects so the daemon re-subscribes.
+    if (sessionsWanted || window.innerWidth > 768) {
+      sessionsWanted = true;
+      setTimeout(loadSessions, 500);
+    }
     startHeartbeat();
     try {
       await startHandshake();
@@ -743,7 +804,8 @@ function connectWS() {
         // Preserve scroll if the user is reading history; only pin to bottom
         // when they were already near it (within 40px).
         var nearBottom = (term.scrollHeight - term.scrollTop - term.clientHeight) < 40;
-        if (lastLineBySession[currentId] === undefined) {
+        var wasInitial = (lastLineBySession[currentId] === undefined);
+        if (wasInitial) {
           // Initial fetch: replace.
           term.textContent = content || '(empty)';
         } else if (content) {
@@ -754,6 +816,11 @@ function connectWS() {
         }
         if (lastLine >= 0) lastLineBySession[currentId] = lastLine;
         if (nearBottom) term.scrollTop = term.scrollHeight;
+        // Check for waiting-for-approval prompts. Skip empty deltas so the
+        // bar doesn't flicker away while a prompt is still on screen.
+        if (wasInitial || content.length > 0) {
+          checkForConfirmation(stripAnsi(content));
+        }
       }
 
     } else if (data.type === 'session_sent') {
@@ -883,12 +950,21 @@ function showPanel(name) {
 }
 
 function showChat() {
-  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  autoOn = false;
+  stopAutoTimer();
   currentId = null;
   renderSessionList();
   document.getElementById('chat-tab').classList.add('active');
   showPanel('chat');
   closeSidebar();
+}
+
+function startAutoTimer() {
+  if (autoTimer || !autoOn || !currentId || document.hidden) return;
+  autoTimer = setInterval(refreshSession, 3000);
+}
+function stopAutoTimer() {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
 }
 
 function loadSessions() {
@@ -903,14 +979,14 @@ function renderSessionList() {
     var active = currentId === s.id;
     var label = s.project || s.name || s.id.substring(0,8);
     return '<div class="session-item' + (active ? ' active' : '') + '" onclick="selectSession(\\'' + s.id + '\\')">'
-      + '<span class="dot"></span>'
+      + '<span class="dot" id="dot-' + s.id.replace(/[^a-zA-Z0-9]/g,'') + '"></span>'
       + '<span class="label">' + label + '</span></div>';
   }).join('');
   document.getElementById('session-count').textContent = sessions.length + ' sessions';
 }
 
 function selectSession(id) {
-  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  stopAutoTimer();
   currentId = id;
   var s = sessions.find(function(x) { return x.id === id; });
   renderSessionList();
@@ -921,8 +997,10 @@ function selectSession(id) {
   // Reset incremental cursor + clear terminal so first fetch is a full tail.
   delete lastLineBySession[id];
   document.getElementById('terminal').textContent = 'Loading...';
+  document.getElementById('confirm-bar').classList.remove('visible');
   refreshSession();
-  autoTimer = setInterval(refreshSession, 3000);
+  autoOn = true;
+  startAutoTimer();
   document.getElementById('auto-btn').textContent = 'Auto \\u2713';
   closeSidebar();
 }
@@ -939,15 +1017,28 @@ function refreshSession() {
 
 function toggleAuto() {
   var btn = document.getElementById('auto-btn');
-  if (autoTimer) {
-    clearInterval(autoTimer); autoTimer = null;
+  if (autoOn) {
+    autoOn = false;
+    stopAutoTimer();
     btn.textContent = 'Auto Refresh';
   } else {
-    autoTimer = setInterval(refreshSession, 3000);
-    btn.textContent = 'Auto \\u2713';
+    autoOn = true;
     refreshSession();
+    startAutoTimer();
+    btn.textContent = 'Auto \\u2713';
   }
 }
+
+// Pause polling when the tab/page is hidden (backgrounded, locked, switched
+// away). On return, immediately refresh once then resume the timer.
+document.addEventListener('visibilitychange', function() {
+  if (document.hidden) {
+    stopAutoTimer();
+  } else if (autoOn && currentId) {
+    refreshSession();
+    startAutoTimer();
+  }
+});
 
 function sendToSession() {
   var inp = document.getElementById('txt-session');
@@ -956,6 +1047,35 @@ function sendToSession() {
   inp.value = ''; inp.style.height = 'auto';
   secureSend({ type: 'send_session', session_id: currentId, text: text });
   showToast('Sent');
+  setTimeout(refreshSession, 1500);
+}
+
+function checkForConfirmation(content) {
+  var lines = content.split('\\n');
+  var tail = lines.slice(-10).join('\\n');
+  var bar = document.getElementById('confirm-bar');
+  var promptEl = document.getElementById('confirm-prompt');
+  var found = false;
+  for (var i = 0; i < CONFIRM_PATTERNS.length; i++) {
+    if (CONFIRM_PATTERNS[i].test(tail)) {
+      found = true;
+      for (var j = lines.length - 1; j >= Math.max(0, lines.length - 10); j--) {
+        if (CONFIRM_PATTERNS[i].test(lines[j])) { promptEl.textContent = lines[j].trim(); break; }
+      }
+      break;
+    }
+  }
+  bar.classList.toggle('visible', found);
+  var dotId = currentId ? currentId.replace(/[^a-zA-Z0-9]/g,'') : '';
+  var dot = document.getElementById('dot-' + dotId);
+  if (dot) dot.classList.toggle('waiting', found);
+}
+
+function quickSend(text) {
+  if (!currentId || !ws || ws.readyState !== 1) return;
+  secureSend({ type: 'send_session', session_id: currentId, text: text });
+  showToast(text === 'y' ? 'Allowed' : 'Denied');
+  document.getElementById('confirm-bar').classList.remove('visible');
   setTimeout(refreshSession, 1500);
 }
 
