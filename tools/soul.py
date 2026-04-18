@@ -1,13 +1,22 @@
-"""Soul tools — the assistant's self-modifiable identity, stored as soul.md."""
+"""Soul tools — the assistant's self-modifiable identity, stored as soul.md.
+
+Every write snapshots the prior file to `.soul/history/<iso>.md` so that a
+bad replace (the agent clobbering a whole personality section when it only
+meant to tweak one trait) can be reviewed or hand-restored. Appends to
+About User + Notes are timestamped so the transcript shows when each fact
+was learned.
+"""
 
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 
 import arcana
 
 SOUL_PATH = Path(__file__).parent.parent / "soul.md"
+SOUL_HISTORY_DIR = Path(__file__).parent.parent / ".soul" / "history"
 
 
 def _read_soul() -> str:
@@ -17,7 +26,19 @@ def _read_soul() -> str:
 
 
 def _write_soul(content: str):
+    # Snapshot the prior state so clobbered bullets aren't lost forever.
+    # Skip if no prior file (first write) or if content is unchanged.
+    if SOUL_PATH.exists():
+        prior = SOUL_PATH.read_text()
+        if prior != content:
+            SOUL_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            (SOUL_HISTORY_DIR / f"{ts}.md").write_text(prior)
     SOUL_PATH.write_text(content)
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d")
 
 
 def _extract_section(content: str, heading: str) -> str:
@@ -173,7 +194,7 @@ async def remember_user(fact: str) -> str:
     section = _extract_section(soul, "About User")
     if fact in section:
         return "已经记住了"
-    new_line = f"- {fact}"
+    new_line = f"- ({_today()}) {fact}"
     if section == "（通过对话自然积累）" or not section:
         new_section = new_line
     else:
@@ -191,7 +212,7 @@ async def add_note(note: str) -> str:
     """给自己写一条笔记。"""
     soul = _read_soul()
     section = _extract_section(soul, "Notes")
-    new_line = f"- {note}"
+    new_line = f"- ({_today()}) {note}"
     if section == "（自己的想法和记录）" or not section:
         new_section = new_line
     else:
