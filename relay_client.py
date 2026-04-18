@@ -31,6 +31,7 @@ import time
 import uuid
 
 import websockets
+import chat_store
 from chat_handler import handle_chat
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -102,6 +103,11 @@ class RelayClient:
         self.running = False
         # Map of client_id -> Arcana ChatSession
         self.chat_sessions: dict = {}
+        # Map of client_id -> chat_store session_id (transcript persistence).
+        # Survives daemon restarts indirectly via the on-disk .chat_history.db;
+        # the in-memory mapping resets every (re)connect because the Arcana
+        # session resets too, so a fresh transcript row is the right default.
+        self._history_ids: dict[str, str] = {}
         # Heartbeat tracking (per-connection; reset on each _connect())
         self._last_pong_at: float = 0.0
         self._heartbeat_task: asyncio.Task | None = None
@@ -143,6 +149,7 @@ class RelayClient:
         self.chat_sessions.clear()
         self._ciphers.clear()
         self._sessions_subscribed.clear()
+        self._history_ids.clear()
         # Close existing WebSocket so the reconnect loop picks up new creds.
         # Grab a local reference to avoid races, then set self.ws = None so
         # _send_to_client() stops using the old socket immediately.
@@ -212,6 +219,7 @@ class RelayClient:
             self._ciphers.clear()
             self.chat_sessions.clear()
             self._sessions_subscribed.clear()
+            self._history_ids.clear()
             # Register with relay (plaintext -- daemon_hello isn't whitelisted
             # by the relay DO, so it's dropped; kept for backwards log clarity).
             await ws.send(
@@ -413,6 +421,7 @@ class RelayClient:
                 self.chat_sessions.pop(client_id, None)
                 self._ciphers.pop(client_id, None)
                 self._sessions_subscribed.discard(client_id)
+                self._history_ids.pop(client_id, None)
 
         except Exception as e:
             print(f"[relay] Error handling message: {e}")
@@ -422,6 +431,9 @@ class RelayClient:
         personality = self.build_personality()
         session = self.runtime.create_chat_session(system_prompt=personality)
         self.chat_sessions[client_id] = session
+        self._history_ids[client_id] = await chat_store.create_session(
+            source="remote", label=client_id
+        )
 
         name = self.get_name()
         await self._send_to_client(
@@ -443,6 +455,12 @@ class RelayClient:
             personality = self.build_personality()
             session = self.runtime.create_chat_session(system_prompt=personality)
             self.chat_sessions[client_id] = session
+        # Lazy-init history id: chat can arrive before client_hello if the
+        # client rushes straight to sending, and rotate_token clears the map.
+        history_id = self._history_ids.get(client_id)
+        if not history_id:
+            history_id = await chat_store.create_session(source="remote", label=client_id)
+            self._history_ids[client_id] = history_id
 
         async def send(frame: dict):
             await self._send_to_client(client_id, frame)
@@ -452,6 +470,7 @@ class RelayClient:
             user_text,
             send,
             include_sessions_on_done=client_id in self._sessions_subscribed,
+            history_session_id=history_id,
         )
 
     async def _on_get_sessions(self, client_id: str):

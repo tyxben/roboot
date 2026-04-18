@@ -119,6 +119,7 @@ async def session_page():
 
 from iterm_bridge import bridge
 from chat_handler import handle_chat
+import chat_store
 
 
 @app.get("/api/sessions")
@@ -372,6 +373,7 @@ async def websocket_endpoint(ws: WebSocket):
     # Build personality fresh from soul.md each session
     personality = build_personality()
     session = runtime.create_chat_session(system_prompt=personality)
+    history_session_id = await chat_store.create_session(source="local")
 
     name = get_name()
     await ws.send_json({"type": "response", "content": f"Hey，我是 {name}。有什么事？"})
@@ -384,7 +386,12 @@ async def websocket_endpoint(ws: WebSocket):
             if not user_text:
                 continue
 
-            await handle_chat(session, user_text, ws.send_json)
+            await handle_chat(
+                session,
+                user_text,
+                ws.send_json,
+                history_session_id=history_session_id,
+            )
 
         except WebSocketDisconnect:
             break

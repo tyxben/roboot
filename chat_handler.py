@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Awaitable, Callable
 
+import chat_store
+
 Send = Callable[[dict], Awaitable[None]]
 
 
@@ -29,16 +31,25 @@ async def handle_chat(
     send: Send,
     *,
     include_sessions_on_done: bool = True,
+    history_session_id: str | None = None,
 ) -> tuple[str, int]:
     """Run one chat turn, stream frames via `send`, return (full_text, tools_used).
 
     `include_sessions_on_done` — when True and tools were used, piggyback the
     iTerm2 session list on the final `done` frame. Local ws always wants this;
     the relay sets it False for clients that never opened the sidebar.
+
+    `history_session_id` — when set, the user prompt and assistant reply are
+    persisted via chat_store for later retrieval. Adapters pass the id they
+    got from chat_store.create_session() at connect time. None disables
+    persistence (used by tests / non-persisting code paths).
     """
     user_text = user_text.strip()
     if not user_text:
         return ("", 0)
+
+    if history_session_id:
+        await chat_store.record_user(history_session_id, user_text)
 
     await send({"type": "thinking"})
 
@@ -77,4 +88,8 @@ async def handle_chat(
             pass
 
     await send(resp)
+
+    if history_session_id:
+        await chat_store.record_assistant(history_session_id, full_text, tools_used)
+
     return full_text, tools_used

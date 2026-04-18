@@ -11,3 +11,6 @@ node_modules/
 relay/node_modules/
 relay/dist/
 .wrangler/
+.chat_history.db
+.chat_history.db-wal
+.chat_history.db-shm
