@@ -205,9 +205,13 @@ class RelayClient:
 
     async def _connect(self):
         """Establish WebSocket connection to relay and handle messages."""
-        # Auto-rotate expired tokens before connecting
-        if self.token_expired:
-            self.rotate_token()
+        # Token rotation is explicit-only (refresh/revoke API, or daemon
+        # restart). Previously we auto-rotated on every reconnect after TTL,
+        # but that invalidated the phone's pairing URL every time the
+        # daemon's WS dropped — even though the drop was unrelated to any
+        # compromise. Short-term protection against leaked QRs still holds:
+        # daemon restart invalidates, and the revoke button in the local
+        # console kicks everyone and rotates on demand.
         url = f"{self.relay_url}/ws/daemon/{self.session_id}?token={self.token}"
         # ping_interval=None disables the library's protocol-level ping; we
         # run our own app-level {"type":"ping"} heartbeat (see _heartbeat_loop)
