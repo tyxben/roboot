@@ -118,6 +118,7 @@ async def session_page():
 # --- Dashboard API (iTerm2 Python API) ---
 
 from iterm_bridge import bridge
+from chat_handler import handle_chat
 
 
 @app.get("/api/sessions")
@@ -383,57 +384,7 @@ async def websocket_endpoint(ws: WebSocket):
             if not user_text:
                 continue
 
-            await ws.send_json({"type": "thinking"})
-
-            full_text = ""
-            tools_used = 0
-
-            async for event in session.stream(user_text):
-                etype = str(event.event_type)
-
-                if "LLM_CHUNK" in etype and event.content:
-                    full_text += event.content
-                    await ws.send_json({
-                        "type": "delta",
-                        "text": event.content,
-                    })
-
-                elif "TOOL_START" in etype or "TOOL_CALL_START" in etype:
-                    tools_used += 1
-                    await ws.send_json({
-                        "type": "tool_start",
-                        "name": event.tool_name or "",
-                    })
-
-                elif "TOOL_END" in etype or "TOOL_RESULT" in etype:
-                    await ws.send_json({
-                        "type": "tool_end",
-                        "name": event.tool_name or "",
-                    })
-
-                elif "RUN_COMPLETE" in etype and event.content:
-                    # Final content from run_complete as fallback
-                    if not full_text:
-                        full_text = event.content
-
-            # Send final complete message
-            resp_data = {
-                "type": "done",
-                "content": full_text,
-                "tools_used": tools_used,
-            }
-
-            if tools_used > 0:
-                try:
-                    all_sessions = await bridge.list_sessions()
-                    resp_data["sessions"] = [
-                        {"id": s.session_id, "project": s.project, "name": s.name}
-                        for s in all_sessions
-                    ]
-                except Exception:
-                    pass
-
-            await ws.send_json(resp_data)
+            await handle_chat(session, user_text, ws.send_json)
 
         except WebSocketDisconnect:
             break

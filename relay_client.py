@@ -31,6 +31,7 @@ import time
 import uuid
 
 import websockets
+from chat_handler import handle_chat
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -443,60 +444,15 @@ class RelayClient:
             session = self.runtime.create_chat_session(system_prompt=personality)
             self.chat_sessions[client_id] = session
 
-        # Thinking indicator
-        await self._send_to_client(client_id, {"type": "thinking"})
+        async def send(frame: dict):
+            await self._send_to_client(client_id, frame)
 
-        # Stream response
-        full_text = ""
-        tools_used = 0
-
-        async for event in session.stream(user_text):
-            etype = str(event.event_type)
-
-            if "LLM_CHUNK" in etype and event.content:
-                full_text += event.content
-                await self._send_to_client(
-                    client_id, {"type": "delta", "text": event.content}
-                )
-            elif "TOOL_START" in etype or "TOOL_CALL_START" in etype:
-                tools_used += 1
-                await self._send_to_client(
-                    client_id,
-                    {"type": "tool_start", "name": event.tool_name or ""},
-                )
-            elif "TOOL_END" in etype or "TOOL_RESULT" in etype:
-                await self._send_to_client(
-                    client_id,
-                    {"type": "tool_end", "name": event.tool_name or ""},
-                )
-            elif "RUN_COMPLETE" in etype and event.content:
-                if not full_text:
-                    full_text = event.content
-
-        # Send done (include sessions after tool use, matching server.py)
-        resp_data = {
-            "type": "done",
-            "content": full_text,
-            "tools_used": tools_used,
-        }
-
-        # Only piggyback the session list to clients that have actually
-        # opened the sidebar (and thus called get_sessions). Saves one
-        # list_sessions iTerm2 round-trip per tool-using chat for mobile
-        # clients that never opened the drawer.
-        if tools_used > 0 and client_id in self._sessions_subscribed:
-            try:
-                from iterm_bridge import bridge
-
-                all_sessions = await bridge.list_sessions()
-                resp_data["sessions"] = [
-                    {"id": s.session_id, "project": s.project, "name": s.name}
-                    for s in all_sessions
-                ]
-            except Exception:
-                pass
-
-        await self._send_to_client(client_id, resp_data)
+        await handle_chat(
+            session,
+            user_text,
+            send,
+            include_sessions_on_done=client_id in self._sessions_subscribed,
+        )
 
     async def _on_get_sessions(self, client_id: str):
         """Return the list of iTerm2 Claude Code sessions."""
