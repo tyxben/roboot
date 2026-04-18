@@ -419,6 +419,16 @@ var CONFIRM_PATTERNS = [
 ];
 var ANSI_RE = /\\x1b\\[[0-9;?]*[ -\\/]*[@-~]|\\x1b\\].*?(?:\\x07|\\x1b\\\\)/g;
 function stripAnsi(s) { return s.replace(ANSI_RE, ''); }
+// True between chatSend() and the next done/response/error frame. Tracked
+// explicitly (not inferred from streamBubble) because streamBubble is null
+// before the first delta arrives, so "in-flight but nothing rendered yet"
+// would otherwise look idle.
+var chatPending = false;
+function updateSendBtn() {
+  var b = document.getElementById('chat-send-btn');
+  if (!b) return;
+  b.disabled = _revoked || chatPending || !ws || ws.readyState !== 1;
+}
 // Heartbeat: send ping every 30s; if no pong within 60s close + reconnect.
 var HEARTBEAT_INTERVAL_MS = 30000;
 var HEARTBEAT_TIMEOUT_MS = 60000;
@@ -670,7 +680,7 @@ function connectWS() {
       try {
         await completeHandshake(frame.pubkey);
         setConnStatus('Connected', true);
-        document.getElementById('chat-send-btn').disabled = false;
+        updateSendBtn();
       } catch (err) {
         setConnStatus('Handshake failed: ' + err.message, false);
         try { ws.close(4002, 'handshake_failed'); } catch(_) {}
@@ -749,6 +759,10 @@ function connectWS() {
       // continue
 
     } else if (data.type === 'done') {
+      // Flip first — if any of the rendering below throws, we still want
+      // the send button back to usable.
+      chatPending = false;
+      updateSendBtn();
       removeThinking();
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       if (streamBubble) {
@@ -772,17 +786,18 @@ function connectWS() {
       }
       streamBubble = null;
       streamText = '';
-      document.getElementById('chat-send-btn').disabled = false;
 
     } else if (data.type === 'response') {
+      chatPending = false;
+      updateSendBtn();
       removeThinking();
       addChatMsg('bot', data.content, data.tools_used);
-      document.getElementById('chat-send-btn').disabled = false;
 
     } else if (data.type === 'error') {
+      chatPending = false;
+      updateSendBtn();
       removeThinking();
       addChatMsg('bot', 'Error: ' + data.content);
-      document.getElementById('chat-send-btn').disabled = false;
 
     } else if (data.type === 'sessions_list') {
       sessions = data.sessions || [];
@@ -834,7 +849,11 @@ function connectWS() {
     ws = null;
     stopHeartbeat();
     resetE2EE();
-    document.getElementById('chat-send-btn').disabled = true;
+    // No response is coming if the socket just dropped — clear the pending
+    // flag so the button is usable immediately after reconnect+handshake
+    // instead of waiting for a never-arriving done.
+    chatPending = false;
+    updateSendBtn();
     if (_revoked) {
       setConnStatus('Access revoked', false);
       return;
@@ -897,7 +916,8 @@ function chatSend() {
   addChatMsg('user', text);
   secureSend({ type: 'chat', content: text });
   inp.value = ''; inp.style.height = 'auto';
-  document.getElementById('chat-send-btn').disabled = true;
+  chatPending = true;
+  updateSendBtn();
 }
 
 // === Toast ===
@@ -956,6 +976,10 @@ function showChat() {
   renderSessionList();
   document.getElementById('chat-tab').classList.add('active');
   showPanel('chat');
+  // Safety: if some earlier turn left the flag on but no frame is coming
+  // (e.g. the rendering code threw before this fix shipped), clear it
+  // when the user returns to the chat tab.
+  updateSendBtn();
   closeSidebar();
 }
 
