@@ -31,6 +31,8 @@ from telegram.ext import (
 
 import arcana
 
+import chat_store
+import memory
 from tools.shell import shell
 from tools.claude_code import (
     list_sessions,
@@ -68,6 +70,8 @@ LOCAL_SERVER = "https://localhost:8765"
 
 _runtime: arcana.Runtime | None = None
 _chat_sessions: dict[int, object] = {}  # telegram user_id → ChatSession
+# telegram user_id → chat_store session_id for transcript + replay + distill.
+_history_ids: dict[int, str] = {}
 
 # Per-user state for interactive session management
 # Maps user_id → {"session_id": str, "awaiting_command": bool}
@@ -566,25 +570,40 @@ async def handle_message(update: Update, context) -> None:
         return
 
     # Normal chat flow — route through Arcana agent
+    runtime = _get_runtime()
     if user_id not in _chat_sessions:
-        runtime = _get_runtime()
         personality = await _build_telegram_personality()
         _chat_sessions[user_id] = runtime.create_chat_session(
             system_prompt=personality
         )
+        # Layer A: first time we see this user in this process -- if there's
+        # a prior telegram history row we can't know its id, so we create a
+        # fresh one here. If callers persist user->session_id mapping
+        # (e.g. via a tiny shelve/json), they can set _history_ids[user_id]
+        # before the first message and replay_history will fire then.
+        _history_ids[user_id] = await chat_store.create_session(
+            source="telegram", label=str(user_id)
+        )
 
     session = _chat_sessions[user_id]
+    history_id = _history_ids.get(user_id)
 
     # Show typing
     await update.message.chat.send_action("typing")
 
     try:
+        if history_id:
+            await chat_store.record_user(history_id, text)
         response = await session.send(text)
         reply = response.content or "(无回复)"
+        if history_id:
+            await chat_store.record_assistant(history_id, reply, 0)
         # Telegram message limit is 4096 chars
         if len(reply) > 4000:
             reply = reply[:4000] + "\n\n...(截断)"
         await update.message.reply_text(reply)
+        # Layer B: count turns; fire distillation every K.
+        memory.record_turn_and_maybe_distill(history_id, runtime=runtime)
     except Exception as e:
         logger.error(f"Agent error: {e}")
         await update.message.reply_text(f"出错了: {e}")
