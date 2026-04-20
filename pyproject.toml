@@ -37,6 +37,20 @@ all = [
 [project.scripts]
 roboot = "run:main"
 
+[tool.setuptools]
+packages = ["adapters", "tools", "evolution"]
+py-modules = [
+    "app",
+    "chat_handler",
+    "chat_store",
+    "identity",
+    "iterm_bridge",
+    "network_utils",
+    "relay_client",
+    "run",
+    "server",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
