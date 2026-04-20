@@ -1,5 +1,7 @@
 # Roboot
 
+![CI](https://github.com/tyxben/roboot/actions/workflows/test.yml/badge.svg)
+
 A personal AI agent hub that lives on your Mac: chat, voice, camera, and hands-on control of your iTerm2 Claude Code sessions -- from a laptop, a phone on the same Wi-Fi, or anywhere in the world via an end-to-end encrypted relay.
 
 Built for people who already run a lot of Claude Code sessions and want one place to watch and talk to them.
