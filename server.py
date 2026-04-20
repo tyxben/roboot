@@ -29,7 +29,15 @@ from tools.claude_code import (
     create_claude_session,
 )
 from tools.vision import look, screenshot, enroll_face, list_faces, forget_face
-from tools.soul import update_self, remember_user, add_note, build_personality, get_name, get_voice
+from tools.soul import (
+    update_self,
+    remember_user,
+    add_note,
+    build_personality,
+    get_name,
+    get_voice,
+    summarize_sessions,
+)
 
 ALL_TOOLS = [
     shell,
@@ -371,7 +379,8 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     runtime = _get_runtime()
     # Build personality fresh from soul.md each session
-    personality = build_personality()
+    sessions_summary = await summarize_sessions()
+    personality = build_personality(channel="web", sessions_summary=sessions_summary)
     session = runtime.create_chat_session(system_prompt=personality)
     history_session_id = await chat_store.create_session(source="local")
 
@@ -482,7 +491,9 @@ if __name__ == "__main__":
         relay = RelayClient(
             relay_url=relay_url,
             runtime=_get_runtime(),
-            build_personality=build_personality,
+            # Remote clients reach the relay via the mobile web console, so
+            # "web" is still the right channel label here.
+            build_personality=lambda: build_personality(channel="web"),
             get_name=get_name,
         )
         _relay_client = relay
