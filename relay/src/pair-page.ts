@@ -862,8 +862,11 @@ function connectWS() {
       if (jarvisMode && (data.content || streamText)) {
         queueSpeak(data.content || streamText);
       }
-      // Update sessions list if included (after tool calls)
-      if (data.sessions && data.sessions.length > 0) {
+      // Update sessions list if included (after tool calls). Skip this
+      // piggyback until the user has actually opened the sidebar at least
+      // once — otherwise mobile pays the render + state cost for a list it
+      // never sees, and we'd defeat the lazy-load gate in ws.onopen.
+      if (sessionsWanted && data.sessions && data.sessions.length > 0) {
         sessions = data.sessions;
         renderSessionList();
       }
