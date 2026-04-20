@@ -120,6 +120,7 @@ async def session_page():
 from iterm_bridge import bridge
 from chat_handler import handle_chat
 import chat_store
+import memory
 
 
 @app.get("/api/sessions")
@@ -373,6 +374,10 @@ async def websocket_endpoint(ws: WebSocket):
     # Build personality fresh from soul.md each session
     personality = build_personality()
     session = runtime.create_chat_session(system_prompt=personality)
+    # Layer A: if this is a reconnect carrying a prior history_session_id,
+    # replay the last few turns so the agent doesn't greet the user as if
+    # they never met. New connections (no prior id) get a fresh row.
+    prior_history_id: str | None = None
     history_session_id = await chat_store.create_session(source="local")
 
     name = get_name()
@@ -382,6 +387,17 @@ async def websocket_endpoint(ws: WebSocket):
         try:
             data = await ws.receive_text()
             msg = json.loads(data)
+            # A client that wants to resume sends `resume_session_id` on its
+            # first payload. We replay once, then stick to the new
+            # history_session_id going forward so we don't double-record.
+            if prior_history_id is None:
+                rid = msg.get("resume_session_id")
+                if rid:
+                    prior_history_id = rid
+                    try:
+                        await memory.replay_history(session, rid)
+                    except Exception as e:
+                        print(f"[memory] replay_history failed: {e}")
             user_text = msg.get("content", "").strip()
             if not user_text:
                 continue
@@ -391,6 +407,11 @@ async def websocket_endpoint(ws: WebSocket):
                 user_text,
                 ws.send_json,
                 history_session_id=history_session_id,
+            )
+            # Layer B: count turns; when the window fills, schedule a
+            # background distillation pass.
+            memory.record_turn_and_maybe_distill(
+                history_session_id, runtime=runtime
             )
 
         except WebSocketDisconnect:

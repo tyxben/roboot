@@ -35,6 +35,7 @@ import hashlib
 import websockets
 import chat_store
 import identity
+import memory
 from chat_handler import handle_chat
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -457,7 +458,7 @@ class RelayClient:
             msg_type = msg.get("type")
 
             if msg_type == "client_hello":
-                await self._on_client_hello(client_id)
+                await self._on_client_hello(client_id, msg)
             elif msg_type == "chat":
                 await self._on_chat(client_id, msg)
             elif msg_type == "get_sessions":
@@ -475,11 +476,26 @@ class RelayClient:
         except Exception as e:
             print(f"[relay] Error handling message: {e}")
 
-    async def _on_client_hello(self, client_id: str):
-        """A new client connected -- create a chat session and send welcome."""
+    async def _on_client_hello(self, client_id: str, msg: dict | None = None):
+        """A new client connected -- create a chat session and send welcome.
+
+        If the client passes `resume_session_id` in its hello payload (kept
+        in browser localStorage across refreshes), seed the new Arcana
+        session with the last few turns from that prior chat_store session
+        so the agent doesn't feel amnesic after a browser refresh / Wi-Fi
+        drop / relay reconnect.
+        """
         personality = self.build_personality()
         session = self.runtime.create_chat_session(system_prompt=personality)
         self.chat_sessions[client_id] = session
+
+        resume_id = (msg or {}).get("resume_session_id")
+        if resume_id:
+            try:
+                await memory.replay_history(session, resume_id)
+            except Exception as e:
+                print(f"[relay] replay_history failed: {e}")
+
         self._history_ids[client_id] = await chat_store.create_session(
             source="remote", label=client_id
         )
@@ -521,6 +537,8 @@ class RelayClient:
             include_sessions_on_done=client_id in self._sessions_subscribed,
             history_session_id=history_id,
         )
+        # Layer B: every K turns, fire a background distillation pass.
+        memory.record_turn_and_maybe_distill(history_id, runtime=self.runtime)
 
     async def _on_get_sessions(self, client_id: str):
         """Return the list of iTerm2 Claude Code sessions."""
