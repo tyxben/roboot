@@ -26,6 +26,7 @@ from tools.claude_code import (
     create_claude_session,
 )
 from tools.vision import look, screenshot
+from tools.soul import build_personality, summarize_sessions
 
 ALL_TOOLS = [
     shell,
@@ -91,7 +92,13 @@ async def main() -> None:
 
     default_provider = config.get("default_provider", next(iter(providers)))
     budget_usd = config.get("daily_budget_usd", 5.0)
-    personality = config.get("personality", "你是 Roboot，一个友好简洁的 AI 助手。")
+    # Build the full dynamic personality (soul.md + current-context block).
+    # Channel depends on whether --voice was passed.
+    channel = "voice" if args.voice else "cli"
+    sessions_summary = await summarize_sessions()
+    personality = build_personality(
+        channel=channel, sessions_summary=sessions_summary
+    )
 
     # Build Arcana Runtime
     runtime = arcana.Runtime(

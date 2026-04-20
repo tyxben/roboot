@@ -69,8 +69,28 @@ def _replace_field(content: str, field: str, value: str) -> str:
     return re.sub(pattern, rf"\g<1>{value}", content)
 
 
-def build_personality() -> str:
-    """Build system prompt dynamically from soul.md."""
+_CHANNEL_LABELS = {
+    "web": "web console",
+    "telegram": "Telegram",
+    "voice": "voice (local mic + TTS)",
+    "cli": "CLI (keyboard)",
+    "unknown": "unknown",
+}
+
+
+def build_personality(
+    channel: str = "unknown",
+    sessions_summary: str | None = None,
+) -> str:
+    """Build system prompt dynamically from soul.md.
+
+    Args:
+        channel: which entrypoint the user is on. One of
+            "web", "telegram", "voice", "cli", or "unknown".
+        sessions_summary: optional pre-formatted multi-line string
+            describing currently-running Claude Code sessions.
+            Rendered only if non-empty.
+    """
     soul = _read_soul()
 
     name = _extract_field(soul, "Name") or "Ava"
@@ -144,7 +164,69 @@ def build_personality() -> str:
 - 用户让你做事直接调工具
 - 你可以也应该主动修改自己——用户让你改名就改，觉得自己哪里需要调整就调""")
 
+    # Current-context block: channel + (optional) sessions summary.
+    channel_label = _CHANNEL_LABELS.get(channel, channel or "unknown")
+    ctx_lines = ["\n## Current context", f"- Channel: {channel_label}"]
+    if sessions_summary and sessions_summary.strip():
+        ctx_lines.append("- Active Claude Code sessions:")
+        for line in sessions_summary.strip().splitlines():
+            line = line.rstrip()
+            if not line:
+                continue
+            ctx_lines.append(f"  - {line.lstrip('- ').lstrip()}")
+    parts.append("\n".join(ctx_lines))
+
     return "\n".join(parts)
+
+
+# --- Session summary helper -------------------------------------------------
+
+# Single regex that covers the most common Claude Code "waiting for approval"
+# tails. Ported from CONFIRM_PATTERNS in relay/src/pair-page.ts — we only keep
+# the cheapest catch-all so we don't duplicate the full browser-side set.
+_WAITING_RE = re.compile(
+    r"(Do you want to|\[Y/n\]|\[y/N\]|\(y/n\)|Allow|Deny|要继续吗|是否允许)",
+    re.IGNORECASE,
+)
+
+
+async def summarize_sessions() -> str | None:
+    """Return a short multi-line summary of running Claude Code sessions.
+
+    One line per session: "<project> (<name>)" plus " — waiting for confirmation"
+    if the tail of the session looks like a Claude Code approval prompt.
+
+    Returns None silently if iTerm2 isn't reachable so chat init never crashes.
+    """
+    try:
+        from iterm_bridge import bridge  # local import: avoids import-time cost
+    except Exception:
+        return None
+
+    try:
+        sessions = await bridge.list_sessions()
+    except Exception:
+        return None
+
+    if not sessions:
+        return None
+
+    lines: list[str] = []
+    for s in sessions:
+        label = s.project or s.name or s.session_id[:8]
+        suffix = ""
+        try:
+            tail = await bridge.read_session(s.session_id, num_lines=10)
+            if tail and _WAITING_RE.search(tail):
+                suffix = " — waiting for confirmation"
+        except Exception:
+            pass
+        if s.name and s.name != label:
+            lines.append(f"{label} ({s.name}){suffix}")
+        else:
+            lines.append(f"{label}{suffix}")
+
+    return "\n".join(lines) if lines else None
 
 
 def get_name() -> str:

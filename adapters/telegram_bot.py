@@ -39,6 +39,7 @@ from tools.claude_code import (
     create_claude_session,
 )
 from tools.vision import screenshot
+from tools.soul import build_personality, summarize_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,12 @@ def _get_runtime() -> arcana.Runtime:
 def _get_personality() -> str:
     base = CONFIG.get("personality", "你是 Roboot，一个简洁友好的 AI 助手。")
     return base + "\n\n你现在通过 Telegram 和用户远程交流。用户不在电脑前，可能在外面。回答要更简洁。"
+
+
+async def _build_telegram_personality() -> str:
+    """Full personality for Telegram sessions, with current-context block."""
+    summary = await summarize_sessions()
+    return build_personality(channel="telegram", sessions_summary=summary)
 
 
 def _is_allowed(user_id: int) -> bool:
@@ -561,8 +568,9 @@ async def handle_message(update: Update, context) -> None:
     # Normal chat flow — route through Arcana agent
     if user_id not in _chat_sessions:
         runtime = _get_runtime()
+        personality = await _build_telegram_personality()
         _chat_sessions[user_id] = runtime.create_chat_session(
-            system_prompt=_get_personality()
+            system_prompt=personality
         )
 
     session = _chat_sessions[user_id]
