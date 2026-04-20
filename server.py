@@ -119,7 +119,13 @@ async def session_page():
 
 from iterm_bridge import bridge
 from chat_handler import handle_chat
+from session_watcher import watcher as _session_watcher
 import chat_store
+
+# Active web-console WebSockets. The session watcher broadcasts
+# proactive "waiting for confirmation" notifications to every
+# connected console.
+_active_ws_clients: set[WebSocket] = set()
 
 
 @app.get("/api/sessions")
@@ -369,6 +375,7 @@ async def api_tts(body: dict):
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
+    _active_ws_clients.add(ws)
     runtime = _get_runtime()
     # Build personality fresh from soul.md each session
     personality = build_personality()
@@ -378,25 +385,80 @@ async def websocket_endpoint(ws: WebSocket):
     name = get_name()
     await ws.send_json({"type": "response", "content": f"Hey，我是 {name}。有什么事？"})
 
-    while True:
+    try:
+        while True:
+            try:
+                data = await ws.receive_text()
+                msg = json.loads(data)
+                user_text = msg.get("content", "").strip()
+                if not user_text:
+                    continue
+
+                await handle_chat(
+                    session,
+                    user_text,
+                    ws.send_json,
+                    history_session_id=history_session_id,
+                )
+
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                await ws.send_json({"type": "error", "content": str(e)})
+    finally:
+        _active_ws_clients.discard(ws)
+
+
+async def _broadcast_waiting_notification(payload: dict) -> None:
+    """Session-watcher subscriber: push a notify frame to every active console.
+
+    Also forwards to connected relay clients when the relay is running, so
+    remote consoles get the same proactive heads-up as local ones.
+    """
+    text = f"🔔 Session {payload.get('project', '?')}: {payload.get('prompt_line', '')}"
+    frame = {
+        "type": "notify",
+        "text": text,
+        "session_id": payload.get("session_id"),
+        "project": payload.get("project"),
+        "prompt_line": payload.get("prompt_line"),
+    }
+    # Local web console sockets.
+    dead: list[WebSocket] = []
+    for client_ws in list(_active_ws_clients):
         try:
-            data = await ws.receive_text()
-            msg = json.loads(data)
-            user_text = msg.get("content", "").strip()
-            if not user_text:
-                continue
+            await client_ws.send_json(frame)
+        except Exception:
+            dead.append(client_ws)
+    for client_ws in dead:
+        _active_ws_clients.discard(client_ws)
 
-            await handle_chat(
-                session,
-                user_text,
-                ws.send_json,
-                history_session_id=history_session_id,
+    # Relay-connected mobile clients. The relay client lives in a separate
+    # thread with its own event loop; hop the coroutine onto it.
+    global _relay_client
+    relay = _relay_client
+    if relay is not None and getattr(relay, "_loop", None) is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _relay_broadcast(relay, frame), relay._loop
             )
+        except Exception:
+            pass
 
-        except WebSocketDisconnect:
-            break
-        except Exception as e:
-            await ws.send_json({"type": "error", "content": str(e)})
+
+async def _relay_broadcast(relay, frame: dict) -> None:
+    """Encrypt and push `frame` to every paired relay client."""
+    for cid in list(getattr(relay, "_ciphers", {}).keys()):
+        try:
+            await relay._send_to_client(cid, frame)
+        except Exception:
+            pass
+
+
+@app.on_event("startup")
+async def _start_session_watcher():
+    _session_watcher.subscribe(_broadcast_waiting_notification)
+    _session_watcher.start()
 
 
 @app.on_event("shutdown")

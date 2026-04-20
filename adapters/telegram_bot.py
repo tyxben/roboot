@@ -643,6 +643,45 @@ async def handle_voice(update: Update, context) -> None:
                 pass
 
 
+async def _notify_allowed_users(tg_app, payload: dict) -> None:
+    """Session-watcher subscriber: DM every allowed user when a Claude Code
+    session enters a waiting-for-confirmation state.
+
+    Individual send failures (network, user never started the bot, etc.)
+    are swallowed so the watcher keeps firing for other subscribers.
+    """
+    allowed = CONFIG.get("telegram", {}).get("allowed_users", []) or []
+    if not allowed:
+        return
+    project = payload.get("project", "?")
+    prompt_line = payload.get("prompt_line", "")
+    text = f"🔔 Session {project}: {prompt_line}"
+    for uid in allowed:
+        try:
+            await tg_app.bot.send_message(chat_id=uid, text=text[:4000])
+        except Exception as e:  # pragma: no cover - network dependent
+            logger.warning("notify %s failed: %s", uid, e)
+
+
+def _register_session_watcher(tg_app) -> None:
+    """Start the session watcher inside the bot's event loop.
+
+    The telegram `Application` exposes `post_init`, which runs after the
+    bot's loop is up. Registering the subscriber there guarantees
+    `asyncio.create_task()` inside watcher.start() grabs the right loop.
+    """
+    from session_watcher import watcher
+
+    async def _post_init(_app):
+        async def _cb(payload):
+            await _notify_allowed_users(tg_app, payload)
+
+        watcher.subscribe(_cb)
+        watcher.start()
+
+    tg_app.post_init = _post_init
+
+
 def main():
     # Surface our own logs (and WARN+ from libs) so debugging the bot locally
     # — especially the session view / send-command flows — is painless.
@@ -676,6 +715,8 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    _register_session_watcher(app)
 
     print("Roboot Telegram Bot 已启动！")
     app.run_polling()
