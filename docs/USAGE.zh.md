@@ -37,6 +37,22 @@ python server.py                      # 打开 http://localhost:8765
 
 **`> ` 开头的朗读行。** 模型所有“该说出口”的句子都用 `> ` blockquote 前缀开头，剩下的是屏幕阅读内容（代码、表格、长列表）。开了语音后台时，服务器只读 `> ` 行。页面上 blockquote 依然会渲染成引用样式，不影响阅读。不理解 soul.md 里的说话风格提示时，这就是它在做什么。
 
+**语音输入（STT）后端。** Telegram 语音消息和 CLI `--voice` 模式共享同一套可插拔 STT 后端，通过 `voice.stt.backend` 三选一：
+
+- `mlx_whisper`（默认）— Apple Silicon 原生，首次下载模型后离线运行。`whisper-large-v3-mlx`（~3 GB）中文识别率约 96%。如果 RAM 或磁盘吃紧，可以把 `voice.stt.model` 换成 `whisper-medium-mlx`（~1.5 GB，约 93%）或 `whisper-small-mlx`（~500 MB，约 88%）。环境变量 `ROBOOT_WHISPER_MODEL`、`ROBOOT_WHISPER_LANGUAGE` 可以临时覆盖配置。
+- `google` — 使用 `speech_recognition` 调用 Google 的免费（非官方）Web Speech 接口。本地不吃 RAM、不占磁盘，需要联网，中文识别率约 85%–90%，有速率限制。适合 Intel Mac 或不想加载几 GB 模型的环境。
+- `none` — 关闭语音输入。Telegram 收到语音消息时会回复 "STT disabled"；如果你只想用文字聊，选这个。
+
+```yaml
+voice:
+  stt:
+    backend: mlx_whisper        # mlx_whisper | google | none
+    model: whisper-large-v3-mlx # 仅 mlx_whisper 后端生效
+    language: zh
+```
+
+整段 `voice.stt` 省略就等于保持 `mlx_whisper` 默认。
+
 ---
 
 ## 3. 配置

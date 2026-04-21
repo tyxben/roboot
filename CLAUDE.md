@@ -80,6 +80,15 @@ All LLM interaction goes through Arcana's `Runtime` and `ChatSession`. Tools are
 ### TTS: Spoken vs Displayed
 The model uses `> ` blockquote prefix to mark what should be spoken aloud. `_extract_spoken_text()` in server.py reads only `> ` lines for TTS. Everything else displays on screen only. If model omits `> `, falls back to first sentence.
 
+### STT Backends
+Speech-to-text is pluggable via the `adapters/stt/` package. The backend is chosen at runtime from `config.yaml` under `voice.stt.backend`:
+
+- `mlx_whisper` (default) -- Apple-Silicon native MLX Whisper. Offline after first model download. Model size configurable via `voice.stt.model` (large-v3 ~3 GB / ~96% zh, medium ~1.5 GB / ~93%, small ~500 MB / ~88%). Env vars `ROBOOT_WHISPER_MODEL` and `ROBOOT_WHISPER_LANGUAGE` override config.
+- `google` -- `speech_recognition` against Google's free Web Speech endpoint. No local RAM/disk, requires internet, rate-limited, ~85-90% Chinese accuracy. Intended for Intel Macs or low-RAM environments.
+- `none` -- Disables voice input. Telegram replies "STT disabled" when a voice message arrives.
+
+If the `voice.stt` block is absent, Roboot defaults to `mlx_whisper` to preserve pre-v0.4 behavior.
+
 ### Soul System
 `soul.md` is the assistant's self-modifiable identity file. The system prompt is built dynamically by `tools/soul.py:build_personality()` which reads soul.md on each new chat session. The assistant can modify its own name, personality, voice, and accumulate knowledge about the user -- all persisted to soul.md.
 
