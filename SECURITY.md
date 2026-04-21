@@ -62,7 +62,7 @@ Browser requirement: WebCrypto Ed25519 (Chrome 113+, Firefox 129+, Safari 17+). 
 
 ## 4. Session-waiting notifications
 
-`session_watcher.py` polls iTerm2 every 5 s, reads the last 20 tail lines of each Claude Code session, and pattern-matches for confirmation prompts. On an idle→waiting transition it fires a `notify` frame containing `project`, `prompt_line`, and `session_id`.
+`session_watcher.py` polls iTerm2 every 5 s, reads the last 10 tail lines of each Claude Code session, and pattern-matches for confirmation prompts. On an idle→waiting transition it fires a `notify` frame containing `project`, `prompt_line`, and `session_id`. The matched prompt line is ANSI-stripped, truncated to 200 chars, and HTML-escaped before being placed in the notify frame or shown to the user.
 
 The frame broadcasts to every connected local console and every paired relay client. Relay-side notify frames go through the **same E2EE envelope** as chat (`server._relay_broadcast` calls `relay._send_to_client`, which always encrypts), so the Worker sees only ciphertext.
 

@@ -40,9 +40,41 @@ CONFIRM_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 POLL_INTERVAL_SECONDS = 5
-TAIL_LINES = 20
+TAIL_LINES = 10
 
 Subscriber = Callable[[dict], Awaitable[None]]
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# Idempotent HTML escape: skips `&` when it already starts a known entity
+# so sanitize(sanitize(x)) == sanitize(x).
+_AMP_RE = re.compile(r"&(?!(?:amp|lt|gt);)")
+_PROMPT_LINE_MAX = 200
+
+
+# Prompt-injection mitigation: terminal tails are untrusted, so strip ANSI /
+# control chars, HTML-escape, collapse whitespace, and cap length.
+def _sanitize_prompt_line(line: str) -> str:
+    if not line:
+        return ""
+    cleaned = _ANSI_RE.sub("", line)
+    # Keep printables plus whitespace (\t, \n, \r) so the whitespace
+    # collapse below can squash them into single spaces.
+    cleaned = "".join(
+        ch
+        for ch in cleaned
+        if ch in ("\t", "\n", "\r") or (ord(ch) >= 32 and ord(ch) != 127)
+    )
+    cleaned = _AMP_RE.sub("&amp;", cleaned)
+    cleaned = cleaned.replace("<", "&lt;").replace(">", "&gt;")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > _PROMPT_LINE_MAX:
+        # Avoid cutting in the middle of an entity like `&amp;`.
+        truncated = cleaned[:_PROMPT_LINE_MAX]
+        m = re.search(r"&(?:amp|lt|gt)?;?$", truncated)
+        if m and ";" not in m.group(0):
+            truncated = truncated[: m.start()]
+        cleaned = truncated + "…"
+    return cleaned
 
 
 def _match_prompt_line(tail: str) -> str | None:
@@ -172,6 +204,10 @@ class SessionWatcher:
             self._states.pop(sid, None)
 
     async def _notify(self, payload: dict) -> None:
+        # Sanitize before fanning out — subscribers forward this into
+        # notify frames / toasts / LLM-visible memory.
+        if "prompt_line" in payload:
+            payload["prompt_line"] = _sanitize_prompt_line(payload.get("prompt_line") or "")
         for cb in list(self._subscribers):
             try:
                 await cb(payload)
