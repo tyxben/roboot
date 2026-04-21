@@ -37,6 +37,22 @@ You'll see the thinking bubble, a streaming reply, a small `1 tool call` badge u
 
 **The `> ` TTS convention.** Everything the model wants *spoken aloud* is prefixed with a `> ` blockquote. Everything else (code, tables, long lists) is on-screen only. When voice output is on, the server's `_extract_spoken_text()` reads just the `> ` lines. On the page those lines still render as normal blockquotes — nothing looks weird. That's what the speaking-style section in `soul.md` is enforcing.
 
+**Voice input (STT) backends.** Three interchangeable speech-to-text backends cover Telegram voice messages and the CLI `--voice` mode. Pick one under `voice.stt.backend`:
+
+- `mlx_whisper` (default) — Apple-Silicon native. Offline after the first model download, ~96% Chinese accuracy on `whisper-large-v3-mlx` (~3 GB). Switch to `whisper-medium-mlx` (~1.5 GB, ~93%) or `whisper-small-mlx` (~500 MB, ~88%) via `voice.stt.model` if you're tight on RAM or disk. Env vars `ROBOOT_WHISPER_MODEL` and `ROBOOT_WHISPER_LANGUAGE` override the config for one session.
+- `google` — Uses `speech_recognition` against Google's free (unofficial) Web Speech endpoint. No local RAM/disk footprint, requires internet, ~85–90% Chinese accuracy, rate-limited. Best fit for Intel Macs or containers where loading a multi-GB model is painful.
+- `none` — Disables voice input. Telegram replies "STT disabled" when a voice message arrives; use this if you only want text.
+
+```yaml
+voice:
+  stt:
+    backend: mlx_whisper        # mlx_whisper | google | none
+    model: whisper-large-v3-mlx # mlx_whisper backend only
+    language: zh
+```
+
+Omit the `voice.stt` block entirely to keep the `mlx_whisper` default.
+
 ---
 
 ## 3. Configuration

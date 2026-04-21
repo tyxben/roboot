@@ -27,6 +27,30 @@ voice:
   # Speech recognition language (used by CLI voice mode only).
   language: "zh-CN"
 
+  # Speech-to-text backend for voice input (Telegram voice messages, CLI --voice).
+  # If this block is omitted, Roboot defaults to `mlx_whisper`.
+  stt:
+    # One of: "mlx_whisper" | "google" | "none"
+    #   mlx_whisper -- Apple-Silicon native, offline after first download,
+    #                  ~96% Chinese accuracy with large-v3 (~3 GB).
+    #   google      -- speech_recognition against Google's free Web Speech
+    #                  endpoint. Zero local RAM/disk, requires internet,
+    #                  ~85-90% Chinese accuracy, rate-limited. Use on Intel
+    #                  Macs or in low-RAM environments.
+    #   none        -- Disable voice input entirely. Telegram replies
+    #                  "STT disabled" when a voice message arrives.
+    backend: "mlx_whisper"
+    # mlx_whisper only. Trade accuracy for RAM/disk:
+    #   whisper-large-v3-mlx  ~3 GB   ~96% zh  (default, best accuracy)
+    #   whisper-medium-mlx    ~1.5 GB ~93% zh
+    #   whisper-small-mlx     ~500 MB ~88% zh
+    #   whisper-base-mlx      ~150 MB
+    #   whisper-tiny-mlx      ~75 MB
+    # Override ad-hoc with env var ROBOOT_WHISPER_MODEL.
+    model: "whisper-large-v3-mlx"
+    # Transcription language hint. Override ad-hoc with ROBOOT_WHISPER_LANGUAGE.
+    language: "zh"
+
 # Assistant name. Also editable through chat -- the assistant can rename itself
 # by writing to soul.md via the `soul` tool.
 name: "Roboot"
