@@ -136,6 +136,31 @@ import memory
 # connected console.
 _active_ws_clients: set[WebSocket] = set()
 
+# Active web-console WebSockets. Used by the self-upgrade loop (and any
+# future broadcaster) to push `notify` frames to every connected console.
+_active_ws_clients: set[WebSocket] = set()
+
+# Number of chat turns currently mid-stream. Incremented just before
+# handle_chat() is awaited, decremented in finally. The self-upgrade loop
+# reads this via get_in_flight_count() and defers restarts while > 0 so it
+# never kills a user's in-progress response. Single-threaded in the event
+# loop, so plain int mutation is fine.
+_chat_in_flight: int = 0
+
+
+def get_in_flight_count() -> int:
+    """Number of chat turns currently executing in the /ws endpoint."""
+    return _chat_in_flight
+
+
+async def _relay_broadcast(relay, frame: dict) -> None:
+    """Encrypt and push `frame` to every paired relay client (best-effort)."""
+    for cid in list(getattr(relay, "_ciphers", {}).keys()):
+        try:
+            await relay._send_to_client(cid, frame)
+        except Exception:
+            pass
+
 
 @app.get("/api/sessions")
 async def api_list_sessions():
@@ -419,12 +444,17 @@ async def websocket_endpoint(ws: WebSocket):
                 if not user_text:
                     continue
 
-                await handle_chat(
-                    session,
-                    user_text,
-                    ws.send_json,
-                    history_session_id=history_session_id,
-                )
+                global _chat_in_flight
+                _chat_in_flight += 1
+                try:
+                    await handle_chat(
+                        session,
+                        user_text,
+                        ws.send_json,
+                        history_session_id=history_session_id,
+                    )
+                finally:
+                    _chat_in_flight -= 1
                 # Layer B: count turns; when the window fills, schedule a
                 # background distillation pass.
                 memory.record_turn_and_maybe_distill(
@@ -489,6 +519,20 @@ async def _relay_broadcast(relay, frame: dict) -> None:
 async def _start_session_watcher():
     _session_watcher.subscribe(_broadcast_waiting_notification)
     _session_watcher.start()
+
+
+@app.on_event("startup")
+async def _start_self_upgrade_loop():
+    """Opt-in code self-upgrade loop.
+
+    Gated on ``ROBOOT_AUTO_UPGRADE=1`` so dev checkouts and CI never
+    auto-pull. See ``self_upgrade.py`` for the full rationale and
+    failure-handling contract.
+    """
+    if os.environ.get("ROBOOT_AUTO_UPGRADE") == "1":
+        from self_upgrade import run_upgrade_loop
+
+        asyncio.create_task(run_upgrade_loop(app))
 
 
 @app.on_event("shutdown")
