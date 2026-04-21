@@ -39,7 +39,37 @@ to pair. Relay checks additionally need the Cloudflare Worker deployed
 - [ ] **Daemon survives WAN blip.** Toggle Wi-Fi off for 10s on the Mac, back on. Pass: daemon log shows `Connection error` then `Connected to relay` without requiring a restart. Existing phone page also reconnects on its own.
 - [ ] **No runaway token rotation.** After the blip, pairing URL (`curl -sk https://localhost:8765/api/relay-info`) should be the **same** token/session_id as before. Regression test for commit `fac7192`.
 
-## 5. Telegram (skip if not configured)
+## 5. Notifications
+
+Proactive daemon broadcasts — session-waiting heads-ups from `session_watcher`
+and the "upgrading to <sha>" notice from `self_upgrade`. Both go out as
+`{"type":"notify","text":"..."}` frames to every active console
+(local WebSocket) and every paired relay client (inside the E2EE envelope).
+
+- [ ] **Local toast fires.** Easiest way to fire one on demand: open devtools
+      on https://localhost:8765 and run
+      `handleNotify({text:'🔔 test notification'})` in the console. Pass: a
+      slide-in toast appears top-right, auto-dismisses after 5s. (For an
+      end-to-end check, let a Claude Code iTerm2 session hit a confirmation
+      prompt — the session-waiting watcher will broadcast for real.)
+- [ ] **Clicking toast dismisses it.** Click it before 5s. Pass: it slides out
+      immediately.
+- [ ] **Multiple stack vertically.** Quickly trigger two. Pass: both visible,
+      newer below older, neither overlapping.
+- [ ] **History drawer shows last 10.** Click the `🔔 通知` tab in the
+      sidebar. Pass: drawer slides in from right, lists recent notifications
+      with timestamps. Unread badge clears.
+- [ ] **Mobile toast pinned to bottom.** On the phone via relay, trigger a
+      notify (same session-waiting flow). Pass: toast appears at bottom of
+      screen (above input bar), auto-dismisses after 4s, device vibrates
+      briefly if supported.
+- [ ] **Mobile history bell.** Tap the floating 🔔 bell (bottom-right).
+      Pass: history pane slides in showing same 10 most recent items.
+- [ ] **Self-upgrade notice.** On the next actual upgrade, a frame of form
+      `⬆️ 升级到 <sha>，重启中...` should appear on both UIs a moment
+      before the daemon restarts.
+
+## 6. Telegram (skip if not configured)
 
 - [ ] `python -m adapters.telegram_bot` starts without crashing.
 - [ ] `/start` from an allowed user returns a welcome.

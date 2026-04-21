@@ -244,6 +244,99 @@ body {
 }
 .toast.show { opacity: 1; }
 
+/* Notify toasts (proactive daemon notifications). Stacked top-right,
+   separate from the general-purpose .toast because these persist longer
+   and multiples can pile up while the user is away. */
+.notify-stack {
+  position: fixed; top: 16px; right: 16px;
+  display: flex; flex-direction: column; gap: 8px;
+  z-index: 60; max-width: 340px;
+  pointer-events: none; /* children re-enable */
+}
+.notify-toast {
+  pointer-events: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  color: var(--text);
+  padding: 10px 14px; border-radius: 8px;
+  font-size: 14px; line-height: 1.4;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  cursor: pointer;
+  animation: notifySlideIn 0.22s ease;
+  word-break: break-word;
+}
+.notify-toast.closing { animation: notifySlideOut 0.18s ease forwards; }
+@keyframes notifySlideIn {
+  from { opacity: 0; transform: translateX(24px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes notifySlideOut {
+  from { opacity: 1; transform: translateX(0); }
+  to { opacity: 0; transform: translateX(24px); }
+}
+
+/* Notification history drawer */
+.notify-drawer {
+  position: fixed; top: 0; right: -360px;
+  width: 340px; max-width: 92vw;
+  height: 100vh; height: calc(var(--vh, 1vh) * 100);
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  z-index: 110;
+  transition: right 0.25s ease;
+  display: flex; flex-direction: column;
+}
+.notify-drawer.open { right: 0; }
+.notify-drawer-header {
+  padding: 14px 16px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px;
+  flex-shrink: 0;
+}
+.notify-drawer-header h3 {
+  font-size: 14px; font-weight: 600; flex: 1;
+}
+.notify-drawer-header button {
+  background: transparent; border: none; color: var(--text-dim);
+  font-size: 16px; cursor: pointer; padding: 4px 8px;
+  border-radius: 6px;
+}
+.notify-drawer-header button:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+.notify-drawer-list {
+  flex: 1; overflow-y: auto; padding: 8px;
+}
+.notify-drawer-item {
+  padding: 10px 12px; margin-bottom: 6px;
+  background: var(--surface2); border-radius: 8px;
+  font-size: 13px; line-height: 1.4;
+  border-left: 3px solid var(--accent);
+  word-break: break-word;
+}
+.notify-drawer-item .ts {
+  font-size: 11px; color: var(--text-dim); margin-top: 4px;
+}
+.notify-drawer-empty {
+  padding: 24px; text-align: center;
+  color: var(--text-dim); font-size: 13px;
+}
+.notify-drawer-backdrop {
+  display: none;
+  position: fixed; top: 0; left: 0;
+  width: 100%; height: 100%;
+  background: rgba(0,0,0,0.4); z-index: 109;
+}
+.notify-drawer-backdrop.open { display: block; }
+
+/* Unread badge on sidebar 🔔 tab */
+.chat-tab .badge {
+  margin-left: auto;
+  background: var(--accent); color: white;
+  font-size: 10px; font-weight: 600;
+  padding: 2px 6px; border-radius: 8px;
+  min-width: 18px; text-align: center;
+}
+.chat-tab .badge.hidden { display: none; }
+
 /* === MOBILE RESPONSIVE === */
 @media (max-width: 768px) {
   :root {
@@ -406,6 +499,10 @@ body {
     <div class="chat-tab" id="network-tab" onclick="showNetwork()">
       <span class="icon">📱</span> 移动访问
     </div>
+    <div class="chat-tab" id="notify-tab" onclick="openNotifyDrawer()">
+      <span class="icon">🔔</span> 通知
+      <span class="badge hidden" id="notify-badge">0</span>
+    </div>
   </div>
 </div>
 
@@ -514,6 +611,21 @@ body {
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- Proactive notifications (type:"notify" frames) -->
+<div class="notify-stack" id="notify-stack"></div>
+
+<div class="notify-drawer-backdrop" id="notify-drawer-backdrop" onclick="closeNotifyDrawer()"></div>
+<div class="notify-drawer" id="notify-drawer">
+  <div class="notify-drawer-header">
+    <h3>🔔 通知</h3>
+    <button onclick="clearNotifyHistory()" title="清空">清空</button>
+    <button onclick="closeNotifyDrawer()" title="关闭">✕</button>
+  </div>
+  <div class="notify-drawer-list" id="notify-drawer-list">
+    <div class="notify-drawer-empty">暂无通知</div>
+  </div>
+</div>
 
 <script>
 var sessions = [];
@@ -1014,6 +1126,10 @@ function connectWS() {
       addChatMsg('bot', '错误: ' + data.content);
       document.getElementById('chat-send-btn').disabled = false;
       if (jarvisMode) setTimeout(function() { startListening(true); }, 1000);
+
+    } else if (data.type === 'notify') {
+      // Proactive daemon notification (session-waiting, self-upgrade, etc.)
+      handleNotify(data);
     }
   };
   ws.onclose = function() { ws = null; };
@@ -1369,6 +1485,109 @@ function stopSpeaking() {
     currentAudio.pause();
     currentAudio = null;
   }
+}
+
+// ===== Proactive Notifications (type:"notify" frames) =====
+// Ring buffer of the last NOTIFY_HISTORY_MAX items, shown in the 🔔 drawer
+// so a user who glanced away can still see what they missed.
+var NOTIFY_HISTORY_MAX = 10;
+var NOTIFY_AUTO_DISMISS_MS = 5000;
+var notifyHistory = [];
+var notifyUnread = 0;
+
+function handleNotify(data) {
+  var text = (data && data.text) ? String(data.text) : '';
+  if (!text) return;
+  var entry = { text: text, ts: Date.now() };
+  notifyHistory.unshift(entry);
+  if (notifyHistory.length > NOTIFY_HISTORY_MAX) {
+    notifyHistory.length = NOTIFY_HISTORY_MAX;
+  }
+  // If the drawer is open, refresh it inline; otherwise bump the badge.
+  var drawer = document.getElementById('notify-drawer');
+  if (drawer && drawer.classList.contains('open')) {
+    renderNotifyHistory();
+  } else {
+    notifyUnread++;
+    updateNotifyBadge();
+  }
+  showNotifyToast(entry);
+}
+
+function showNotifyToast(entry) {
+  var stack = document.getElementById('notify-stack');
+  if (!stack) return;
+  var el = document.createElement('div');
+  el.className = 'notify-toast';
+  el.textContent = entry.text;
+  el.title = '点击关闭';
+  var dismissed = false;
+  var dismiss = function() {
+    if (dismissed) return;
+    dismissed = true;
+    el.classList.add('closing');
+    setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 220);
+  };
+  el.addEventListener('click', dismiss);
+  stack.appendChild(el);
+  setTimeout(dismiss, NOTIFY_AUTO_DISMISS_MS);
+}
+
+function renderNotifyHistory() {
+  var list = document.getElementById('notify-drawer-list');
+  if (!list) return;
+  if (notifyHistory.length === 0) {
+    list.innerHTML = '<div class="notify-drawer-empty">暂无通知</div>';
+    return;
+  }
+  list.innerHTML = notifyHistory.map(function(n) {
+    var d = new Date(n.ts);
+    var hh = String(d.getHours()).padStart(2, '0');
+    var mm = String(d.getMinutes()).padStart(2, '0');
+    var ss = String(d.getSeconds()).padStart(2, '0');
+    // Text-only, so escape minimally by using textContent -- build via DOM.
+    var item = document.createElement('div');
+    item.className = 'notify-drawer-item';
+    var body = document.createElement('div');
+    body.textContent = n.text;
+    var ts = document.createElement('div');
+    ts.className = 'ts';
+    ts.textContent = hh + ':' + mm + ':' + ss;
+    item.appendChild(body);
+    item.appendChild(ts);
+    return item.outerHTML;
+  }).join('');
+}
+
+function updateNotifyBadge() {
+  var badge = document.getElementById('notify-badge');
+  if (!badge) return;
+  if (notifyUnread > 0) {
+    badge.textContent = notifyUnread > 99 ? '99+' : String(notifyUnread);
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
+function openNotifyDrawer() {
+  notifyUnread = 0;
+  updateNotifyBadge();
+  renderNotifyHistory();
+  document.getElementById('notify-drawer').classList.add('open');
+  document.getElementById('notify-drawer-backdrop').classList.add('open');
+}
+
+function closeNotifyDrawer() {
+  document.getElementById('notify-drawer').classList.remove('open');
+  document.getElementById('notify-drawer-backdrop').classList.remove('open');
+}
+
+function clearNotifyHistory() {
+  notifyHistory = [];
+  notifyUnread = 0;
+  updateNotifyBadge();
+  renderNotifyHistory();
 }
 
 // Load sessions once on startup

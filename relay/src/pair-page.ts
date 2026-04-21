@@ -175,6 +175,98 @@ body {
 }
 .toast.show { opacity: 1; }
 
+/* Proactive notifications (type:"notify" frames). Mobile-first: pinned to
+   bottom, stacked upward, shorter auto-dismiss than desktop. */
+.notify-stack {
+  position: fixed; left: 12px; right: 12px;
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  display: flex; flex-direction: column-reverse; gap: 8px;
+  z-index: 70;
+  pointer-events: none;
+}
+.notify-toast {
+  pointer-events: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  color: var(--text);
+  padding: 10px 14px; border-radius: 10px;
+  font-size: 14px; line-height: 1.4;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+  cursor: pointer;
+  animation: notifySlideUp 0.22s ease;
+  word-break: break-word;
+}
+.notify-toast.closing { animation: notifySlideDown 0.18s ease forwards; }
+@keyframes notifySlideUp {
+  from { opacity: 0; transform: translateY(18px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes notifySlideDown {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(18px); }
+}
+
+/* Notification history pane */
+.notify-drawer {
+  position: fixed; top: 0; right: -360px;
+  width: 340px; max-width: 92vw;
+  height: 100vh; height: calc(var(--vh, 1vh) * 100);
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  z-index: 120;
+  transition: right 0.25s ease;
+  display: flex; flex-direction: column;
+}
+.notify-drawer.open { right: 0; }
+.notify-drawer-header {
+  padding: 14px 16px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+}
+.notify-drawer-header h3 { font-size: 14px; font-weight: 600; flex: 1; }
+.notify-drawer-header button {
+  background: transparent; border: none; color: var(--text-dim);
+  font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 6px;
+}
+.notify-drawer-header button:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+.notify-drawer-list { flex: 1; overflow-y: auto; padding: 8px; -webkit-overflow-scrolling: touch; }
+.notify-drawer-item {
+  padding: 10px 12px; margin-bottom: 6px;
+  background: var(--surface2); border-radius: 8px;
+  font-size: 13px; line-height: 1.4;
+  border-left: 3px solid var(--accent);
+  word-break: break-word;
+}
+.notify-drawer-item .ts { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+.notify-drawer-empty { padding: 24px; text-align: center; color: var(--text-dim); font-size: 13px; }
+.notify-drawer-backdrop {
+  display: none; position: fixed; top: 0; left: 0;
+  width: 100%; height: 100%;
+  background: rgba(0,0,0,0.4); z-index: 119;
+}
+.notify-drawer-backdrop.open { display: block; }
+
+/* Bell button pinned above input (floating, small). Tapping opens history. */
+.notify-bell {
+  position: fixed; right: 12px;
+  bottom: calc(72px + env(safe-area-inset-bottom));
+  width: 40px; height: 40px; border-radius: 50%;
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--text); font-size: 18px; cursor: pointer;
+  display: none; align-items: center; justify-content: center;
+  z-index: 55; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  padding: 0;
+}
+.notify-bell.has-items { display: flex; }
+.notify-bell .badge {
+  position: absolute; top: -4px; right: -4px;
+  background: var(--accent); color: white;
+  font-size: 10px; font-weight: 600;
+  padding: 2px 6px; border-radius: 10px;
+  min-width: 18px; text-align: center;
+}
+.notify-bell .badge.hidden { display: none; }
+
 /* Input bar */
 .input-bar {
   padding: 10px 14px; border-top: 1px solid var(--border);
@@ -387,6 +479,23 @@ body {
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- Proactive notifications (type:"notify" frames, post-decrypt) -->
+<div class="notify-stack" id="notify-stack"></div>
+<button class="notify-bell" id="notify-bell" onclick="openNotifyDrawer()" title="Notifications">
+  &#128276;<span class="badge hidden" id="notify-badge">0</span>
+</button>
+<div class="notify-drawer-backdrop" id="notify-drawer-backdrop" onclick="closeNotifyDrawer()"></div>
+<div class="notify-drawer" id="notify-drawer">
+  <div class="notify-drawer-header">
+    <h3>&#128276; 通知</h3>
+    <button onclick="clearNotifyHistory()" title="Clear">清空</button>
+    <button onclick="closeNotifyDrawer()" title="Close">&#10005;</button>
+  </div>
+  <div class="notify-drawer-list" id="notify-drawer-list">
+    <div class="notify-drawer-empty">暂无通知</div>
+  </div>
+</div>
 
 <script>
 var RELAY_WS_URL = "__RELAY_WS_URL__";
@@ -927,6 +1036,11 @@ function connectWS() {
     } else if (data.type === 'session_sent') {
       if (data.ok) showToast('Sent');
       else showToast('Failed: ' + (data.error || ''));
+
+    } else if (data.type === 'notify') {
+      // Proactive daemon notification (session-waiting, self-upgrade, etc.)
+      // Arrives inside the encrypted envelope; this branch runs after decrypt.
+      handleNotify(data);
     }
   };
 
@@ -1379,6 +1493,120 @@ function stopSpeaking() {
   speakQueue = [];
   isSpeaking = false;
   speechSynthesis.cancel();
+}
+
+// === Proactive Notifications (type:"notify" frames, post-decrypt) ===
+// Ring buffer of the last NOTIFY_HISTORY_MAX items surfaced via a floating
+// bell + slide-out pane. Shorter auto-dismiss on mobile, haptic pulse if
+// the platform advertises vibration.
+var NOTIFY_HISTORY_MAX = 10;
+var NOTIFY_AUTO_DISMISS_MS = 4000;
+var notifyHistory = [];
+var notifyUnread = 0;
+
+function handleNotify(data) {
+  var text = (data && data.text) ? String(data.text) : '';
+  if (!text) return;
+  var entry = { text: text, ts: Date.now() };
+  notifyHistory.unshift(entry);
+  if (notifyHistory.length > NOTIFY_HISTORY_MAX) {
+    notifyHistory.length = NOTIFY_HISTORY_MAX;
+  }
+  try {
+    if (navigator && typeof navigator.vibrate === 'function') {
+      navigator.vibrate(50);
+    }
+  } catch (_e) {}
+  var drawer = document.getElementById('notify-drawer');
+  if (drawer && drawer.classList.contains('open')) {
+    renderNotifyHistory();
+  } else {
+    notifyUnread++;
+    updateNotifyBadge();
+  }
+  showNotifyToast(entry);
+}
+
+function showNotifyToast(entry) {
+  var stack = document.getElementById('notify-stack');
+  if (!stack) return;
+  var el = document.createElement('div');
+  el.className = 'notify-toast';
+  el.textContent = entry.text;
+  var dismissed = false;
+  var dismiss = function() {
+    if (dismissed) return;
+    dismissed = true;
+    el.classList.add('closing');
+    setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 220);
+  };
+  el.addEventListener('click', dismiss);
+  stack.appendChild(el);
+  setTimeout(dismiss, NOTIFY_AUTO_DISMISS_MS);
+}
+
+function renderNotifyHistory() {
+  var list = document.getElementById('notify-drawer-list');
+  if (!list) return;
+  if (notifyHistory.length === 0) {
+    list.innerHTML = '<div class="notify-drawer-empty">暂无通知</div>';
+    return;
+  }
+  // Build DOM-side to avoid HTML-injection from daemon-supplied text.
+  list.innerHTML = '';
+  for (var i = 0; i < notifyHistory.length; i++) {
+    var n = notifyHistory[i];
+    var d = new Date(n.ts);
+    var hh = String(d.getHours()); if (hh.length < 2) hh = '0' + hh;
+    var mm = String(d.getMinutes()); if (mm.length < 2) mm = '0' + mm;
+    var ss = String(d.getSeconds()); if (ss.length < 2) ss = '0' + ss;
+    var item = document.createElement('div');
+    item.className = 'notify-drawer-item';
+    var body = document.createElement('div');
+    body.textContent = n.text;
+    var ts = document.createElement('div');
+    ts.className = 'ts';
+    ts.textContent = hh + ':' + mm + ':' + ss;
+    item.appendChild(body);
+    item.appendChild(ts);
+    list.appendChild(item);
+  }
+}
+
+function updateNotifyBadge() {
+  var bell = document.getElementById('notify-bell');
+  var badge = document.getElementById('notify-badge');
+  if (!bell || !badge) return;
+  // Show the bell once we've received at least one notification ever.
+  if (notifyHistory.length > 0) bell.classList.add('has-items');
+  if (notifyUnread > 0) {
+    badge.textContent = notifyUnread > 99 ? '99+' : String(notifyUnread);
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
+function openNotifyDrawer() {
+  notifyUnread = 0;
+  updateNotifyBadge();
+  renderNotifyHistory();
+  document.getElementById('notify-drawer').classList.add('open');
+  document.getElementById('notify-drawer-backdrop').classList.add('open');
+}
+
+function closeNotifyDrawer() {
+  document.getElementById('notify-drawer').classList.remove('open');
+  document.getElementById('notify-drawer-backdrop').classList.remove('open');
+}
+
+function clearNotifyHistory() {
+  notifyHistory = [];
+  notifyUnread = 0;
+  var bell = document.getElementById('notify-bell');
+  if (bell) bell.classList.remove('has-items');
+  updateNotifyBadge();
+  renderNotifyHistory();
 }
 
 // === Start ===
