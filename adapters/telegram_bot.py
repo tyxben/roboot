@@ -33,6 +33,13 @@ import arcana
 
 import chat_store
 import memory
+from text_utils import extract_spoken_text
+from adapters import stt_whisper
+from adapters.tts_streamer import (
+    DEFAULT_VOICE as TTS_DEFAULT_VOICE,
+    segment_for_tts,
+    synthesize_segments_parallel,
+)
 from tools.shell import shell
 from tools.claude_code import (
     list_sessions,
@@ -518,6 +525,70 @@ async def cmd_screenshot(update: Update, context) -> None:
         await update.message.reply_text("截屏失败")
 
 
+async def _agent_reply(user_id: int, text: str) -> str:
+    """Send `text` to the user's Arcana chat session and return the reply.
+
+    Creates the session + chat_store row on first call per user_id. Logs
+    turns to chat_store so Layer-A replay / Layer-B distillation stay in
+    sync. Caller is responsible for delivering the reply (text, voice, …).
+    """
+    runtime = _get_runtime()
+    if user_id not in _chat_sessions:
+        personality = await _build_telegram_personality()
+        _chat_sessions[user_id] = runtime.create_chat_session(
+            system_prompt=personality
+        )
+        _history_ids[user_id] = await chat_store.create_session(
+            source="telegram", label=str(user_id)
+        )
+
+    session = _chat_sessions[user_id]
+    history_id = _history_ids.get(user_id)
+
+    if history_id:
+        await chat_store.record_user(history_id, text)
+    response = await session.send(text)
+    reply = response.content or "(无回复)"
+    if history_id:
+        await chat_store.record_assistant(history_id, reply, 0)
+        memory.record_turn_and_maybe_distill(history_id, runtime=runtime)
+    return reply
+
+
+async def _send_voice_reply(update: Update, reply: str) -> None:
+    """Split the spoken portion of `reply` into chunks, synthesize in parallel,
+    and send as sequential Telegram voice notes. Falls back silently if
+    nothing is spoken-worthy or if TTS fails — the text reply is always sent
+    separately by the caller, so the user never gets nothing."""
+    spoken = extract_spoken_text(reply)
+    if not spoken:
+        return
+    segments = segment_for_tts(spoken, max_chunks=3)
+    if not segments:
+        return
+
+    tasks = synthesize_segments_parallel(segments, voice=TTS_DEFAULT_VOICE)
+    try:
+        for i, task in enumerate(tasks):
+            try:
+                await update.message.chat.send_action("record_voice")
+            except Exception:
+                pass
+            try:
+                ogg = await task
+            except Exception as e:
+                logger.warning("tts segment %d failed: %s", i, e)
+                continue
+            try:
+                await update.message.reply_voice(voice=ogg)
+            except Exception as e:
+                logger.warning("reply_voice %d failed: %s", i, e)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+
 async def handle_message(update: Update, context) -> None:
     """Handle text messages — route through Arcana agent or send to session."""
     user_id = update.effective_user.id
@@ -528,7 +599,6 @@ async def handle_message(update: Update, context) -> None:
     if not text:
         return
 
-    # Check if user is in "awaiting command" mode for a session
     state = _user_session_state.get(user_id, {})
     logger.info("[MSG] user=%s text=%r awaiting=%s", user_id, text[:60], state.get("awaiting_command"))
     if state.get("awaiting_command"):
@@ -550,17 +620,11 @@ async def handle_message(update: Update, context) -> None:
             await update.message.reply_text(f"发送失败: {result}")
             return
 
-        # Brief pause so the terminal can process the command before we read it.
         await asyncio.sleep(1)
 
-        # Send a short confirmation first (always delivers, even if rendering
-        # the terminal view fails).
         ack = f"✅ 已发送到 <b>{escape(project)}</b>:\n<code>{escape(text)}</code>"
         await _safe_reply(update.message, ack)
 
-        # Then send the refreshed session view as a separate message. This
-        # avoids any risk of the combined message exceeding 4096 chars and
-        # getting sliced mid-HTML-tag.
         try:
             content_text, keyboard = await _build_session_content(session_id, project)
             await _safe_reply(update.message, content_text, reply_markup=keyboard)
@@ -569,105 +633,93 @@ async def handle_message(update: Update, context) -> None:
             await update.message.reply_text(f"(无法刷新会话视图: {e})")
         return
 
-    # Normal chat flow — route through Arcana agent
-    runtime = _get_runtime()
-    if user_id not in _chat_sessions:
-        personality = await _build_telegram_personality()
-        _chat_sessions[user_id] = runtime.create_chat_session(
-            system_prompt=personality
-        )
-        # Layer A: first time we see this user in this process -- if there's
-        # a prior telegram history row we can't know its id, so we create a
-        # fresh one here. If callers persist user->session_id mapping
-        # (e.g. via a tiny shelve/json), they can set _history_ids[user_id]
-        # before the first message and replay_history will fire then.
-        _history_ids[user_id] = await chat_store.create_session(
-            source="telegram", label=str(user_id)
-        )
-
-    session = _chat_sessions[user_id]
-    history_id = _history_ids.get(user_id)
-
-    # Show typing
+    # Normal chat flow — text in, text out.
     await update.message.chat.send_action("typing")
-
     try:
-        if history_id:
-            await chat_store.record_user(history_id, text)
-        response = await session.send(text)
-        reply = response.content or "(无回复)"
-        if history_id:
-            await chat_store.record_assistant(history_id, reply, 0)
-        # Telegram message limit is 4096 chars
-        if len(reply) > 4000:
-            reply = reply[:4000] + "\n\n...(截断)"
-        await update.message.reply_text(reply)
-        # Layer B: count turns; fire distillation every K.
-        memory.record_turn_and_maybe_distill(history_id, runtime=runtime)
+        reply = await _agent_reply(user_id, text)
     except Exception as e:
         logger.error(f"Agent error: {e}")
         await update.message.reply_text(f"出错了: {e}")
+        return
+
+    if len(reply) > 4000:
+        reply = reply[:4000] + "\n\n...(截断)"
+    await update.message.reply_text(reply)
 
 
 async def handle_voice(update: Update, context) -> None:
-    """Handle voice messages — download, transcribe, then process as text."""
+    """Handle voice messages: download → whisper transcribe → agent → voice reply.
+
+    The user hears a spoken answer (Edge TTS, 1-3 OGG/Opus chunks, parallel-
+    synthesized for low first-bubble latency) plus the full text reply for
+    reference. Awaiting-command mode still branches to send the transcribed
+    text into the targeted iTerm2 session instead of the agent."""
     user_id = update.effective_user.id
     if not _is_allowed(user_id):
         return
 
     await update.message.chat.send_action("typing")
 
-    # Download voice file
     voice = update.message.voice or update.message.audio
     if not voice:
         return
 
     file = await voice.get_file()
     ogg_path = f"/tmp/roboot_voice_{user_id}.ogg"
-    wav_path = f"/tmp/roboot_voice_{user_id}.wav"
     await file.download_to_drive(ogg_path)
 
-    # Convert to wav and transcribe
     try:
-        proc = await asyncio.create_subprocess_shell(
-            f"ffmpeg -y -i {ogg_path} -ar 16000 -ac 1 {wav_path}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
+        if not stt_whisper.is_available():
+            await update.message.reply_text(
+                "语音识别不可用。请安装:\n  pip install mlx-whisper\n"
+                f"({stt_whisper.unavailable_reason()})"
+            )
+            return
 
-        # Try whisper for transcription
         try:
-            import speech_recognition as sr
-
-            recognizer = sr.Recognizer()
-            with sr.AudioFile(wav_path) as source:
-                audio = recognizer.record(source)
-            text = recognizer.recognize_google(audio, language="zh-CN")
-        except ImportError:
-            # Fallback: use Google's API via a simpler method
-            await update.message.reply_text("语音识别需要安装 SpeechRecognition: pip install SpeechRecognition")
+            text = await stt_whisper.transcribe(ogg_path)
+        except Exception as e:
+            logger.exception("whisper transcribe failed")
+            await update.message.reply_text(f"转写失败: {e}")
             return
 
         if not text:
             await update.message.reply_text("没听清，再说一次？")
             return
 
-        await update.message.reply_text(f"🎤 识别: {text}")
+        await update.message.reply_text(f"🎤 {text}")
 
-        # Process as text message
-        update.message.text = text
-        await handle_message(update, context)
+        # Awaiting-command: treat the transcript as terminal input for the
+        # currently-selected session, same as a typed command.
+        if _user_session_state.get(user_id, {}).get("awaiting_command"):
+            update.message.text = text
+            await handle_message(update, context)
+            return
 
-    except Exception as e:
-        logger.error(f"Voice error: {e}")
-        await update.message.reply_text(f"语音处理失败: {e}")
+        try:
+            reply = await _agent_reply(user_id, text)
+        except Exception as e:
+            logger.error(f"Agent error: {e}")
+            await update.message.reply_text(f"出错了: {e}")
+            return
+
+        # Fire voice synthesis in parallel with sending the text reply so the
+        # text lands quickly and the voice bubbles fill in as they're ready.
+        voice_task = asyncio.create_task(_send_voice_reply(update, reply))
+
+        text_reply = reply if len(reply) <= 4000 else reply[:4000] + "\n\n...(截断)"
+        try:
+            await update.message.reply_text(text_reply)
+        except Exception as e:
+            logger.warning("text reply failed: %s", e)
+
+        await voice_task
+
     finally:
-        for p in [ogg_path, wav_path]:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+        try:
+            os.unlink(ogg_path)
+        except OSError:
+            pass
 
 
 async def _notify_allowed_users(tg_app, payload: dict) -> None:

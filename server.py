@@ -24,6 +24,7 @@ from auth import (
     require_lan_token_ws,
 )
 from network_utils import get_primary_ip, get_local_ip_addresses, generate_qr_code, generate_qr_ascii
+from text_utils import extract_spoken_text
 
 import arcana
 
@@ -329,59 +330,6 @@ async def api_send_to_session(session_id: str, body: dict):
 TTS_VOICE_DEFAULT = "zh-CN-YunxiNeural"
 
 
-def _extract_spoken_text(text: str) -> str:
-    """Extract lines marked with > (blockquote) — the model's chosen spoken words.
-
-    The model is prompted to use > for what should be said aloud.
-    If no > lines found, fall back to first few sentences (up to 300 chars).
-    """
-    import re
-
-    if not text:
-        return ""
-
-    # Primary: extract > blockquote lines (the model's spoken output)
-    spoken_lines = []
-    for line in text.split("\n"):
-        if line.startswith("> "):
-            spoken_lines.append(line[2:].strip())
-
-    if spoken_lines:
-        result = " ".join(spoken_lines)
-        # Strip any remaining markdown
-        result = re.sub(r"\*\*(.+?)\*\*", r"\1", result)
-        result = re.sub(r"`([^`]+)`", r"\1", result)
-        return result.strip()
-
-    # Fallback: no > markers, take first few sentences (up to 300 chars)
-    clean = re.sub(r"```[\s\S]*?```", "", text)
-    clean = re.sub(r"\*\*(.+?)\*\*", r"\1", clean)
-    lines = [l.strip() for l in clean.split("\n") if l.strip() and not l.strip().startswith(("-", "*", "|", "#", "1.", "2.", "3."))]
-    if not lines:
-        return ""
-
-    # Collect multiple sentences up to 300 chars
-    spoken_text = ""
-    for line in lines:
-        if len(spoken_text) + len(line) > 300:
-            break
-        spoken_text += line + " "
-        # Stop at natural paragraph break
-        if line.endswith(("。", "！", "？", ".", "!", "?")):
-            continue
-
-    # Trim to reasonable length
-    spoken_text = spoken_text.strip()
-    if len(spoken_text) > 300:
-        # Cut at last sentence boundary within 300 chars
-        spoken_text = spoken_text[:300]
-        m = re.search(r".*[。！？.!?]", spoken_text)
-        if m:
-            spoken_text = m.group()
-
-    return spoken_text
-
-
 @app.get("/static/cert.pem")
 async def download_cert():
     """Download SSL certificate for manual trust (optional)."""
@@ -399,7 +347,7 @@ async def download_cert():
 async def api_tts(body: dict):
     """Convert text to speech. Extracts spoken part automatically."""
     raw = body.get("text", "")
-    text = _extract_spoken_text(raw)
+    text = extract_spoken_text(raw)
     if not text:
         return Response(content=b"", media_type="audio/mpeg")
 

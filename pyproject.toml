@@ -26,6 +26,9 @@ vision = [
 ]
 telegram = [
     "python-telegram-bot>=21.0",
+    # Apple-Silicon-native Whisper ASR for voice input. On Intel Macs /
+    # Linux, swap for `faster-whisper` and update adapters/stt_whisper.py.
+    "mlx-whisper>=0.4; platform_machine=='arm64' and sys_platform=='darwin'",
 ]
 desktop = [
     "pywebview>=5.0",
