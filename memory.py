@@ -358,6 +358,115 @@ async def distill_and_record(
     return reply
 
 
+# -----------------------------------------------------------------------------
+# Layer B' -- self-feedback distillation (sibling of user-knowledge distill)
+# -----------------------------------------------------------------------------
+
+# Prompt intentionally demands specificity. The user has been burned by
+# vague self-help slop ("I should be more helpful") and sycophantic
+# no-ops ("everything went great!") — reject both explicitly.
+_SELF_FEEDBACK_PROMPT = (
+    "回顾下面最近 20 轮对话。找出**我**（助手）做过让用户纠正、反感、"
+    "不得不重复要求、或者明显不满的具体时刻。输出一段话，不超过 60 字，"
+    "写给未来的自己看，要**具体**——指出做错的那件事和应该怎么改。"
+    "不要说空话如“我应该更有帮助”或“我要更主动”。"
+    "不要自夸如“整体表现不错”或“用户很满意”。"
+    "如果这 20 轮里没有用户的纠正或不满，只输出 NOTHING 四个大写字母，"
+    "别的什么都不要写。"
+)
+
+
+def _build_self_feedback_prompt_user_text(transcript: str) -> str:
+    """User-side payload for the self-feedback distiller.
+
+    Kept as a function (not inline) so tests can assert the transcript is
+    present in the prompt context.
+    """
+    return f"最近 20 轮对话：\n\n{transcript}"
+
+
+async def distill_self_feedback(
+    history_session_id: str,
+    *,
+    runtime: Any,
+    append_fn: Callable[[str], None] | None = None,
+    runner: DistillRunner | None = None,
+    k: int = DISTILL_EVERY_K,
+) -> str | None:
+    """Run one self-feedback distillation pass.
+
+    Mirrors `distill_and_record` but writes to soul.md's `## 自我反馈` via
+    `tools.soul.append_self_feedback` instead of the About-User section.
+
+    Returns the feedback line that was recorded, or None if the model
+    produced NOTHING / short output / errored.
+    """
+    if append_fn is None:
+        from tools.soul import append_self_feedback as _append  # lazy import
+
+        def append_fn_impl(text: str) -> None:
+            _append(text)
+
+        append_fn = append_fn_impl
+
+    try:
+        messages = await chat_store.list_messages(history_session_id, limit=k)
+    except Exception as e:
+        logger.warning("self-feedback: fetch messages failed: %s", e)
+        return None
+    if not messages:
+        return None
+
+    transcript = _format_transcript(messages)
+    if not transcript.strip():
+        return None
+
+    user_text = _build_self_feedback_prompt_user_text(transcript)
+    run = runner or (lambda sp, ut: _default_distill_runner(runtime, sp, ut))
+
+    try:
+        reply = await run(_SELF_FEEDBACK_PROMPT, user_text)
+    except Exception as e:
+        logger.warning("self-feedback: runner failed: %s", e)
+        return None
+
+    reply = (reply or "").strip()
+    reply = re.sub(r"^[`'\"]+|[`'\"]+$", "", reply).strip()
+
+    if (
+        not reply
+        or len(reply) < DISTILL_MIN_LEN
+        or DISTILL_NOTHING_SENTINEL in reply.upper()
+    ):
+        logger.info("self-feedback: nothing substantive this window")
+        return None
+
+    try:
+        append_fn(reply)
+    except Exception as e:
+        logger.warning("self-feedback: append failed: %s", e)
+        return None
+
+    logger.info("self-feedback: appended note to soul.md (%d chars)", len(reply))
+    return reply
+
+
+async def _run_both_distillations(
+    history_session_id: str, *, runtime: Any, k: int
+) -> None:
+    """Fire user-knowledge and self-feedback distillations concurrently.
+
+    Best-effort: each coroutine already swallows its own exceptions, but we
+    wrap with `return_exceptions=True` defensively so a surprise bubble-up
+    from one never aborts the other.
+    """
+    await asyncio.gather(
+        distill_and_record(history_session_id, runtime=runtime, k=k),
+        distill_self_feedback(history_session_id, runtime=runtime, k=k),
+        return_exceptions=True,
+    )
+
+
 def record_turn_and_maybe_distill(
     history_session_id: str | None,
     *,
@@ -365,9 +474,13 @@ def record_turn_and_maybe_distill(
     counter: TurnCounter | None = None,
     every_k: int | None = None,
 ) -> asyncio.Task | None:
-    """Increment the turn counter and fire a distillation task if it hit K.
+    """Increment the turn counter and fire distillation tasks if it hit K.
 
-    Returns the asyncio.Task if a distillation was scheduled, else None.
+    Schedules both the user-knowledge distillation and the self-feedback
+    distillation in a single task group. Both are best-effort; one failing
+    must not block the other.
+
+    Returns the asyncio.Task if distillations were scheduled, else None.
     Non-blocking: the caller can call this at the end of each chat turn
     and proceed without awaiting.
     """
@@ -383,7 +496,7 @@ def record_turn_and_maybe_distill(
     c.reset(history_session_id)
     try:
         return asyncio.create_task(
-            distill_and_record(
+            _run_both_distillations(
                 history_session_id, runtime=runtime, k=c.every_k
             )
         )

@@ -286,6 +286,84 @@ async def remember_user(fact: str) -> str:
     return f"记住了: {fact}"
 
 
+# --- Self-feedback append (internal, not an @arcana.tool) -------------------
+
+SELF_FEEDBACK_HEADING = "自我反馈"
+# When the section grows past this many bullet lines, prune the oldest half.
+# Kept deterministic (no LLM) so the distiller path stays cheap and testable.
+SELF_FEEDBACK_MAX_LINES = 50
+
+
+def _split_section(content: str, heading: str) -> tuple[str, str, str] | None:
+    """Return (before, section_body, after) for `## heading`, or None if absent.
+
+    `section_body` does not include the heading line itself. `after` starts at
+    the next `## ` heading (or the end of file).
+    """
+    pattern = rf"(## {re.escape(heading)}\s*\n)(.*?)(?=\n## |\Z)"
+    m = re.search(pattern, content, re.DOTALL)
+    if not m:
+        return None
+    before = content[: m.start()]
+    body = m.group(2)
+    after = content[m.end():]
+    return before, body, after
+
+
+def append_self_feedback(line: str) -> None:
+    """Append a dated self-feedback bullet to soul.md's `## 自我反馈` section.
+
+    Behavior:
+    - Creates the section at end of file if missing (after existing sections).
+    - Prefixes the entry with `- [YYYY-MM-DD]`.
+    - If the section already holds more than SELF_FEEDBACK_MAX_LINES bullets,
+      keeps only the most recent half before appending the new line.
+    - Atomic: reads full soul.md once, edits in memory, writes once.
+
+    Called internally by the distiller; not exposed as an @arcana.tool.
+    """
+    line = (line or "").strip()
+    if not line:
+        return
+
+    dated = f"- [{_today()}] {line}"
+
+    soul = _read_soul()
+    split = _split_section(soul, SELF_FEEDBACK_HEADING)
+
+    if split is None:
+        # Append section at the very end. Normalize trailing newline.
+        tail = soul.rstrip() + "\n\n" + f"## {SELF_FEEDBACK_HEADING}\n\n{dated}\n"
+        _write_soul(tail)
+        return
+
+    before, body, after = split
+
+    # Existing bullet lines in this section (preserve order, skip blanks).
+    existing = [ln for ln in body.splitlines() if ln.strip().startswith("- ")]
+
+    if len(existing) >= SELF_FEEDBACK_MAX_LINES:
+        # Keep only the most recent half (rounded down), then append.
+        keep = len(existing) // 2
+        existing = existing[-keep:] if keep > 0 else []
+
+    existing.append(dated)
+    new_body = "\n".join(existing) + "\n"
+
+    # Rebuild the file, preserving content before/after.
+    # `before` already ends right before the heading; the heading itself
+    # is re-emitted here to stay consistent.
+    new_content = (
+        before
+        + f"## {SELF_FEEDBACK_HEADING}\n\n"
+        + new_body
+        + (after if after.startswith("\n") else ("\n" + after if after else ""))
+    )
+    # Avoid trailing blank-line bloat on files that already end cleanly.
+    new_content = new_content.rstrip() + "\n"
+    _write_soul(new_content)
+
+
 @arcana.tool(
     when_to_use="当你想给自己写笔记、记录发现、或者想在以后的对话中记住某件事时。",
     what_to_expect="笔记已记录",
