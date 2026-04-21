@@ -17,3 +17,4 @@ relay/dist/
 .soul/
 .identity/
 .auth/
+.voice_prefs/

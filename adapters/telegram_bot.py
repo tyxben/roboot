@@ -38,13 +38,37 @@ from adapters.stt import get_backend as _get_stt_backend
 from adapters.tts_streamer import (
     DEFAULT_VOICE as TTS_DEFAULT_VOICE,
     segment_for_tts,
+    synthesize_ogg,
     synthesize_segments_parallel,
 )
+from adapters import voice_prefs
 
 
-def _resolve_tts_voice() -> str:
-    """Honor `voice.tts_voice` from config.yaml so the user can pick a voice
-    without editing code. Falls back to the package default (male Yunxi)."""
+# Curated voice picker menu. Keep this short — Telegram keyboards get
+# cluttered past ~10 buttons. Each entry is (voice_name, display_label).
+VOICE_CHOICES: list[tuple[str, str]] = [
+    ("zh-CN-YunxiNeural", "云希 · 男声沉稳"),
+    ("zh-CN-YunjianNeural", "云健 · 男声深沉"),
+    ("zh-CN-YunyangNeural", "云扬 · 男声新闻"),
+    ("zh-CN-YunxiaNeural", "云夏 · 男童声"),
+    ("zh-CN-XiaoxiaoNeural", "晓晓 · 女声温暖"),
+    ("zh-CN-XiaoyiNeural", "晓伊 · 女声活泼"),
+    ("zh-CN-liaoning-XiaobeiNeural", "晓贝 · 东北话"),
+    ("zh-CN-shaanxi-XiaoniNeural", "晓妮 · 陕西话"),
+    ("en-US-JennyNeural", "Jenny · EN female"),
+    ("en-US-GuyNeural", "Guy · EN male"),
+]
+_VALID_VOICES: set[str] = {v for v, _ in VOICE_CHOICES}
+
+
+def _resolve_tts_voice(user_id: int | None = None) -> str:
+    """Pick the voice for a reply. Per-user override (`/voice` picker) wins
+    over config.yaml's `voice.tts_voice`, which wins over the tts_streamer
+    default."""
+    if user_id is not None:
+        pref = voice_prefs.get_voice(user_id)
+        if pref:
+            return pref
     v = (CONFIG.get("voice") or {}).get("tts_voice") or ""
     v = v.strip()
     return v or TTS_DEFAULT_VOICE
@@ -242,10 +266,82 @@ async def cmd_start(update: Update, context) -> None:
         "直接发消息跟我聊天，我可以帮你：\n"
         "- /sessions — 查看并管理 iTerm2 会话\n"
         "- /screenshot — 截屏查看桌面\n"
+        "- /voice — 切换我朗读时用的声音\n"
         "- /remote — 获取远程访问链接\n"
         "- /refresh — 刷新远程访问 token\n\n"
         "或直接发文字让 AI 帮你操作"
     )
+
+
+async def cmd_voice(update: Update, context) -> None:
+    """`/voice` picker — show current voice and let the user switch.
+
+    Accepts optional inline arg (`/voice zh-CN-XiaoxiaoNeural`) for power
+    users who know exactly what they want. No arg → inline keyboard."""
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
+        return
+
+    args = (context.args or []) if hasattr(context, "args") else []
+    if args:
+        requested = args[0].strip()
+        if requested not in _VALID_VOICES and not _looks_like_edge_voice(requested):
+            await update.message.reply_text(
+                f"不认识这个声音名: {requested}\n"
+                "用 /voice 打开选择菜单，或给个完整的 edge-tts 名(如 zh-CN-XiaoxiaoNeural)。"
+            )
+            return
+        voice_prefs.set_voice(user_id, requested)
+        await _send_voice_sample(update, requested, label=requested)
+        return
+
+    current = _resolve_tts_voice(user_id)
+    buttons = []
+    row: list[InlineKeyboardButton] = []
+    for name, label in VOICE_CHOICES:
+        marker = "✓ " if name == current else ""
+        row.append(InlineKeyboardButton(
+            f"{marker}{label}",
+            callback_data=f"voice:{name}",
+        ))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    await update.message.reply_text(
+        f"当前声音: <code>{escape(current)}</code>\n选一个切换:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML",
+    )
+
+
+def _looks_like_edge_voice(name: str) -> bool:
+    """Cheap sanity check — `xx-XX-<Something>Neural`. We don't hit the
+    edge-tts voice list endpoint on every command to avoid extra latency."""
+    return bool(name) and name.endswith("Neural") and "-" in name
+
+
+async def _send_voice_sample(target, voice: str, label: str) -> None:
+    """After switching, synthesize a short sample in the new voice so the
+    user hears the change immediately. `target` can be an `Update` (when
+    called from `/voice <name>`) or a `CallbackQuery` (when called from an
+    inline-button pick) — both expose `.message.reply_voice/reply_text`.
+    Falls back to a text confirmation if synthesis fails (e.g. edge-tts blip)."""
+    message = getattr(target, "message", None) or target
+    sample_text = f"你好，我现在是 {label}。"
+    try:
+        ogg = await synthesize_ogg(sample_text, voice=voice)
+    except Exception as e:
+        logger.warning("voice sample synth failed: %s", e)
+        await message.reply_text(f"已切换到 {voice}，但试听合成失败: {e}")
+        return
+    try:
+        await message.reply_voice(voice=ogg, caption=f"✓ 已切换为 {label}")
+    except Exception as e:
+        logger.warning("voice sample send failed: %s", e)
+        await message.reply_text(f"已切换为 {voice}(试听发送失败: {e})")
 
 
 async def cmd_sessions(update: Update, context) -> None:
@@ -445,6 +541,23 @@ async def callback_handler(update: Update, context) -> None:
                 reply_markup=keyboard,
             )
 
+    # --- Voice picker selection ---
+    elif data.startswith("voice:"):
+        voice = data[len("voice:"):]
+        if voice not in _VALID_VOICES:
+            await _safe_reply(query, f"未知声音: {escape(voice)}", edit=True)
+            return
+        voice_prefs.set_voice(user_id, voice)
+        label = next((l for v, l in VOICE_CHOICES if v == voice), voice)
+        try:
+            await query.edit_message_text(
+                f"✓ 已切换为 <b>{escape(label)}</b>\n<code>{escape(voice)}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        await _send_voice_sample(query, voice, label=label)
+
 
 async def cmd_remote(update: Update, context) -> None:
     """Get remote access link from the local server's relay info."""
@@ -575,7 +688,10 @@ async def _send_voice_reply(update: Update, reply: str) -> None:
     if not segments:
         return
 
-    tasks = synthesize_segments_parallel(segments, voice=_resolve_tts_voice())
+    user_id = update.effective_user.id if update.effective_user else None
+    tasks = synthesize_segments_parallel(
+        segments, voice=_resolve_tts_voice(user_id)
+    )
     try:
         for i, task in enumerate(tasks):
             try:
@@ -815,6 +931,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("screenshot", cmd_screenshot))
+    app.add_handler(CommandHandler("voice", cmd_voice))
     app.add_handler(CommandHandler("remote", cmd_remote))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CallbackQueryHandler(callback_handler))
