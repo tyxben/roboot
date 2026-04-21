@@ -81,6 +81,7 @@ from tools.claude_code import (
 )
 from tools.vision import screenshot
 from tools.soul import build_personality, summarize_sessions
+from tools.voice_switch import current_tg_user, switch_tts_voice
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,7 @@ ALL_TOOLS = [
     send_to_session,
     create_claude_session,
     screenshot,
+    switch_tts_voice,
 ]
 
 
@@ -257,20 +259,34 @@ async def _build_session_content(session_id: str, project: str) -> tuple[str, In
 # --- Handlers ---
 
 
+_HELP_TEXT = (
+    "📋 <b>Roboot 命令</b>\n\n"
+    "- /sessions — 查看并管理 iTerm2 会话\n"
+    "- /screenshot — 截屏查看桌面\n"
+    "- /voice — 切换 AI 朗读时用的声音\n"
+    "- /remote — 获取远程访问链接\n"
+    "- /refresh — 刷新远程访问 token\n"
+    "- /help — 显示这份命令清单\n\n"
+    "不想记命令也行 —— 直接发文字或语音，"
+    "比如\"帮我截个屏\"、\"换成女声\"、\"看看正在跑的 session\""
+    "，AI 会自动调用对应工具。"
+)
+
+
 async def cmd_start(update: Update, context) -> None:
     if not _is_allowed(update.effective_user.id):
         await update.message.reply_text("未授权。")
         return
-    await update.message.reply_text(
-        "你好，我是 Roboot。\n\n"
-        "直接发消息跟我聊天，我可以帮你：\n"
-        "- /sessions — 查看并管理 iTerm2 会话\n"
-        "- /screenshot — 截屏查看桌面\n"
-        "- /voice — 切换我朗读时用的声音\n"
-        "- /remote — 获取远程访问链接\n"
-        "- /refresh — 刷新远程访问 token\n\n"
-        "或直接发文字让 AI 帮你操作"
+    await _safe_reply(
+        update.message,
+        "你好，我是 Roboot。\n\n" + _HELP_TEXT,
     )
+
+
+async def cmd_help(update: Update, context) -> None:
+    if not _is_allowed(update.effective_user.id):
+        return
+    await _safe_reply(update.message, _HELP_TEXT)
 
 
 async def cmd_voice(update: Update, context) -> None:
@@ -652,6 +668,10 @@ async def _agent_reply(user_id: int, text: str) -> str:
     Creates the session + chat_store row on first call per user_id. Logs
     turns to chat_store so Layer-A replay / Layer-B distillation stay in
     sync. Caller is responsible for delivering the reply (text, voice, …).
+
+    Sets the `current_tg_user` contextvar so Telegram-scoped tools (e.g.
+    `switch_tts_voice`) can identify the caller without us threading
+    user_id through every tool signature.
     """
     runtime = _get_runtime()
     if user_id not in _chat_sessions:
@@ -666,14 +686,18 @@ async def _agent_reply(user_id: int, text: str) -> str:
     session = _chat_sessions[user_id]
     history_id = _history_ids.get(user_id)
 
-    if history_id:
-        await chat_store.record_user(history_id, text)
-    response = await session.send(text)
-    reply = response.content or "(无回复)"
-    if history_id:
-        await chat_store.record_assistant(history_id, reply, 0)
-        memory.record_turn_and_maybe_distill(history_id, runtime=runtime)
-    return reply
+    token = current_tg_user.set(user_id)
+    try:
+        if history_id:
+            await chat_store.record_user(history_id, text)
+        response = await session.send(text)
+        reply = response.content or "(无回复)"
+        if history_id:
+            await chat_store.record_assistant(history_id, reply, 0)
+            memory.record_turn_and_maybe_distill(history_id, runtime=runtime)
+        return reply
+    finally:
+        current_tg_user.reset(token)
 
 
 async def _send_voice_reply(update: Update, reply: str) -> None:
@@ -929,6 +953,7 @@ def main():
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("screenshot", cmd_screenshot))
     app.add_handler(CommandHandler("voice", cmd_voice))
