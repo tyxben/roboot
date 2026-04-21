@@ -2,6 +2,8 @@
 
 ![CI](https://github.com/tyxben/roboot/actions/workflows/test.yml/badge.svg)
 
+> 中文版: [README.zh.md](README.zh.md)
+
 A personal AI agent hub that lives on your Mac: chat, voice, camera, and hands-on control of your iTerm2 Claude Code sessions -- from a laptop, a phone on the same Wi-Fi, or anywhere in the world via an end-to-end encrypted relay.
 
 Built for people who already run a lot of Claude Code sessions and want one place to watch and talk to them.
@@ -91,6 +93,13 @@ Arcana handles registration; no other wiring is needed. See the "Adding a New To
 ## Configuration
 
 Every option is documented inline in [`config.example.yaml`](config.example.yaml). The assistant can also rewrite parts of its own identity by editing `soul.md` through the `soul` tool.
+
+## Documentation
+
+- [docs/USAGE.md](docs/USAGE.md) -- end-user guide: quickstart, config, interfaces, Claude Code integration, memory, auto-upgrade, troubleshooting ([中文版](docs/USAGE.zh.md))
+- [docs/REMOTE_VS_LOCAL.md](docs/REMOTE_VS_LOCAL.md) -- capability matrix for local / LAN / Telegram / relay, plus a comparison with Claude Code's built-in remote (bilingual in one file)
+- [SECURITY.md](SECURITY.md) -- threat model, E2EE trust chain, new-feature risks, pairing-leak recovery
+- [CLAUDE.md](CLAUDE.md) -- contributor notes: architecture, streaming protocol, soul system, adding tools
 
 ## Security
 
