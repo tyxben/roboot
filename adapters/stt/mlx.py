@@ -71,3 +71,36 @@ class MlxWhisperBackend:
         text = await asyncio.to_thread(self._transcribe_sync, path)
         logger.info("whisper transcribe done (%d chars)", len(text))
         return text
+
+    async def prewarm(self) -> None:
+        """Ensure the model weights are cached on disk without loading them
+        into RAM. Idempotent: HuggingFace Hub resumes partial downloads and
+        skips files that are already fully present.
+
+        We call `snapshot_download` directly rather than doing a dummy
+        `transcribe()` so idle RAM stays flat until a real voice message
+        arrives — otherwise a bot that nobody's talking to would sit on
+        ~2 GB of model weights forever."""
+        if not self.is_available():
+            logger.info(
+                "skipping whisper prewarm: %s", self.unavailable_reason()
+            )
+            return
+        try:
+            from huggingface_hub import snapshot_download  # type: ignore
+        except Exception as e:
+            logger.warning("huggingface_hub unavailable; cannot prewarm: %s", e)
+            return
+
+        logger.info("whisper prewarm: caching %s to disk", self.model)
+
+        def _download() -> None:
+            snapshot_download(repo_id=self.model)
+
+        try:
+            await asyncio.to_thread(_download)
+            logger.info("whisper prewarm done: %s", self.model)
+        except Exception as e:
+            # Network down during setup shouldn't kill the bot; the user
+            # will see a clear error on their first voice message instead.
+            logger.warning("whisper prewarm failed (%s): %s", self.model, e)

@@ -40,6 +40,14 @@ from adapters.tts_streamer import (
     segment_for_tts,
     synthesize_segments_parallel,
 )
+
+
+def _resolve_tts_voice() -> str:
+    """Honor `voice.tts_voice` from config.yaml so the user can pick a voice
+    without editing code. Falls back to the package default (male Yunxi)."""
+    v = (CONFIG.get("voice") or {}).get("tts_voice") or ""
+    v = v.strip()
+    return v or TTS_DEFAULT_VOICE
 from tools.shell import shell
 from tools.claude_code import (
     list_sessions,
@@ -567,7 +575,7 @@ async def _send_voice_reply(update: Update, reply: str) -> None:
     if not segments:
         return
 
-    tasks = synthesize_segments_parallel(segments, voice=TTS_DEFAULT_VOICE)
+    tasks = synthesize_segments_parallel(segments, voice=_resolve_tts_voice())
     try:
         for i, task in enumerate(tasks):
             try:
@@ -688,7 +696,11 @@ async def handle_voice(update: Update, context) -> None:
             await update.message.reply_text("没听清，再说一次？")
             return
 
-        await update.message.reply_text(f"🎤 {text}")
+        # Don't echo the transcript back as a text bubble — it clutters the
+        # chat and the user already knows what they said. If the ASR was
+        # wrong, the agent's reply will feel off-topic and they can re-ask.
+        # Keep a log line for debugging.
+        logger.info("voice transcript (user=%s): %s", user_id, text)
 
         # Awaiting-command: treat the transcript as terminal input for the
         # currently-selected session, same as a typed command.
@@ -744,11 +756,14 @@ async def _notify_allowed_users(tg_app, payload: dict) -> None:
 
 
 def _register_session_watcher(tg_app) -> None:
-    """Start the session watcher inside the bot's event loop.
+    """Wire post_init for the bot: subscribe the session watcher AND kick
+    off STT model prewarm in the background.
 
     The telegram `Application` exposes `post_init`, which runs after the
     bot's loop is up. Registering the subscriber there guarantees
     `asyncio.create_task()` inside watcher.start() grabs the right loop.
+    The prewarm is fire-and-forget — a first voice message that races
+    the download just waits on the same HF cache slot, no duplicate work.
     """
     from session_watcher import watcher
 
@@ -758,6 +773,16 @@ def _register_session_watcher(tg_app) -> None:
 
         watcher.subscribe(_cb)
         watcher.start()
+
+        async def _prewarm_stt():
+            try:
+                backend = _get_stt_backend()
+                logger.info("prewarming STT backend: %s", type(backend).__name__)
+                await backend.prewarm()
+            except Exception as e:
+                logger.warning("STT prewarm failed: %s", e)
+
+        asyncio.create_task(_prewarm_stt())
 
     tg_app.post_init = _post_init
 

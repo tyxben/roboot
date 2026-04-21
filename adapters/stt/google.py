@@ -56,6 +56,12 @@ class GoogleSTTBackend:
             return "ffmpeg not found on PATH (required to decode voice notes)"
         return ""
 
+    async def prewarm(self) -> None:
+        """No local model to warm; just surface install gaps up front so
+        setup scripts fail fast instead of at first voice message."""
+        if not self.is_available():
+            logger.info("google backend not ready: %s", self.unavailable_reason())
+
     async def transcribe(self, audio_path: str) -> str:
         try:
             import speech_recognition as sr  # type: ignore

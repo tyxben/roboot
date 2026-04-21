@@ -22,3 +22,6 @@ class NoopBackend:
 
     async def transcribe(self, audio_path: str) -> str:
         raise RuntimeError(_REASON)
+
+    async def prewarm(self) -> None:
+        return None

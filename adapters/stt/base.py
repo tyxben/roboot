@@ -16,3 +16,11 @@ class STTBackend(Protocol):
     def is_available(self) -> bool: ...
 
     def unavailable_reason(self) -> str: ...
+
+    async def prewarm(self) -> None:
+        """Do any expensive one-time setup (e.g. pre-cache model weights to
+        disk) so the first real `transcribe()` call isn't a six-minute
+        download. Safe to call repeatedly; no-op on backends that don't
+        need warming. Callers should catch/log failures — prewarm must
+        never prevent the bot from starting."""
+        return None
