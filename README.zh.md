@@ -21,19 +21,44 @@
 
 ```bash
 git clone https://github.com/tyxben/roboot.git && cd roboot
-pip install "arcana-agent[all-providers]>=0.4.0" pyyaml fastapi "uvicorn[standard]" edge-tts iterm2 "qrcode[pil]" cryptography
+pip install -e .                      # 核心：Web 控制台 + 局域网 + relay
 cp config.example.yaml config.yaml    # 编辑并填入你的 API key
 python server.py                      # 打开 http://localhost:8765
 ```
 
 WebSocket 连上后会收到欢迎消息。
 
+### 可选 extras
+
+`pyproject.toml` 里定义了四个可选包组，用 `pip install -e '.[<名字>,<名字>]'` 随意组合：
+
+- `telegram` —— Telegram 机器人 + 语音输入（mlx-whisper）+ 语音输出（Edge TTS → OGG/Opus）
+- `voice` —— 本地麦克风 STT + macOS `say` TTS（CLI `--voice` 模式；需要先 `brew install portaudio`）
+- `vision` —— 摄像头 + 人脸识别（`look` / `enroll_face` 工具）
+- `desktop` —— pywebview 独立桌面应用
+- `all` —— 以上全部一次装好
+
+### 启用 Telegram 语音
+
+```bash
+pip install -e '.[telegram]'           # 拉 mlx-whisper + SpeechRecognition
+brew install ffmpeg                    # 语音回复编码成 OGG/Opus 要用
+python -m adapters.stt prewarm         # 预先下载 ASR 模型（~3 GB，一次）
+python -m adapters.telegram_bot        # 启动 bot
+```
+
+预热那一步可选但强烈推荐 —— 不跑的话你**第一条** Telegram 语音要等约 6 分钟等模型下完。装的时候跑一次，以后每次发语音都秒级响应。
+
+Telegram 里能干什么:
+- 发语音 → bot 用 Whisper 转写（`large-v3` 中文准确率约 96%）→ Agent 处理 → 3~4 秒回一条语音气泡
+- `/voice` —— 从 10 个精选声音里选一个（中文男女声 + 东北话 + 陕西话 + 英文）
+- 直接说 "换成女声" / "帮我截个屏" —— Agent 可以主动调用 `switch_tts_voice` / `screenshot` / `list_sessions` / `shell` 等工具，不用记斜杠命令
+
 ### 其他入口
 
 ```bash
 python run.py                     # 纯键盘 CLI
-python run.py --voice             # 本地麦克风 + macOS `say` TTS
-python -m adapters.telegram_bot   # Telegram 机器人（需要 telegram.bot_token）
+python run.py --voice             # 本地麦克风 + macOS `say` TTS（需要 `.[voice]`）
 chainlit run chainlit_app.py -w   # 备选 Chainlit UI
 ```
 
@@ -61,17 +86,26 @@ iterm_bridge.py                  <- 持久 iTerm2 Python API 连接
 soul.md                          <- 可自改写的助手身份
 config.yaml                      <- API keys + 供应商配置（gitignored）
 
+text_utils.py                    <- 共享小工具（extract_spoken_text…）
+
 tools/
 ├── shell.py                     <- 终端命令执行
 ├── claude_code.py               <- iTerm2 session 列表/读取/发送/创建
 ├── vision.py                    <- 摄像头 + 截屏 + 人脸识别
 ├── face_db.py                   <- 人脸编码存储（.faces/）
-└── soul.py                      <- 自我修改 + 用户记忆
+├── soul.py                      <- 自我修改 + 用户记忆
+└── voice_switch.py              <- Agent 工具：切换 Telegram TTS 声音
 
 adapters/
-├── telegram_bot.py              <- 通过 Telegram 远程控制
-├── voice.py                     <- 本地麦克风 STT + macOS TTS
-└── keyboard.py                  <- 终端文字输入
+├── telegram_bot.py              <- 通过 Telegram 远程控制（含语音 I/O）
+├── voice.py                     <- 本地麦克风 STT + macOS TTS（CLI --voice）
+├── voice_prefs.py               <- 每个 Telegram 用户的 TTS 声音偏好
+├── tts_streamer.py              <- Edge TTS 并行合成 OGG/Opus 语音条
+├── keyboard.py                  <- 终端文字输入
+└── stt/                         <- 可插拔语音识别后端
+    ├── mlx.py                   <- mlx-whisper（Apple Silicon 默认）
+    ├── google.py                <- speech_recognition → Google Web Speech
+    └── noop.py                  <- backend: none
 
 relay/                           <- Cloudflare Worker relay
 ├── src/index.ts                 <- Worker 入口、路由、限流

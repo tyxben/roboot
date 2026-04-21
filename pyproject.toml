@@ -26,12 +26,14 @@ vision = [
 ]
 telegram = [
     "python-telegram-bot>=21.0",
-    # Default STT backend: Apple-Silicon-native Whisper. On Intel Macs /
-    # Linux, set `voice.stt.backend: google` in config.yaml — that backend
-    # uses `SpeechRecognition` from the `voice` extra (install with
-    # `pip install roboot[voice,telegram]`).
+    # Default STT backend: Apple-Silicon-native Whisper. ~3 GB model,
+    # offline after first prewarm. Intel Mac / Linux users flip
+    # `voice.stt.backend: google` in config.yaml instead.
     "mlx-whisper>=0.4; platform_machine=='arm64' and sys_platform=='darwin'",
-    "roboot[voice]",
+    # Google STT fallback — needed for `voice.stt.backend: google`. We only
+    # use `sr.AudioFile` + recognize_google, so pyaudio (portaudio system
+    # dep) is NOT required; it lives in the `voice` extra for CLI mic mode.
+    "SpeechRecognition>=3.10.0",
 ]
 desktop = [
     "pywebview>=5.0",

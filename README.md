@@ -21,19 +21,44 @@ Built for people who already run a lot of Claude Code sessions and want one plac
 
 ```bash
 git clone https://github.com/tyxben/roboot.git && cd roboot
-pip install "arcana-agent[all-providers]>=0.4.0" pyyaml fastapi "uvicorn[standard]" edge-tts iterm2 "qrcode[pil]" cryptography
+pip install -e .                      # core: web console + LAN + relay
 cp config.example.yaml config.yaml    # then edit and add your API key
 python server.py                      # open http://localhost:8765
 ```
 
 That's it. The welcome message will appear when the WebSocket connects.
 
+### Optional extras
+
+`pyproject.toml` defines four extras you can mix and match — pull them with `pip install -e '.[<name>,<name>]'`:
+
+- `telegram` — Telegram bot with voice input (mlx-whisper) + voice output (Edge TTS → OGG/Opus)
+- `voice` — local mic STT + macOS `say` TTS for CLI `--voice` mode (needs `brew install portaudio` first)
+- `vision` — camera + face recognition (`look` tool, `enroll_face` tool)
+- `desktop` — pywebview standalone app wrapper
+- `all` — everything above in one shot
+
+### Enabling Telegram voice
+
+```bash
+pip install -e '.[telegram]'           # pulls mlx-whisper + SpeechRecognition
+brew install ffmpeg                    # encodes voice replies to OGG/Opus
+python -m adapters.stt prewarm         # pre-cache the ASR model (~3 GB, one-time)
+python -m adapters.telegram_bot        # start the bot
+```
+
+The prewarm step is optional but recommended — without it, the **first** Telegram voice message you send waits ~6 minutes on the model download. Run it once during setup and all future voice messages feel instant.
+
+Inside Telegram you can:
+- Send voice → the bot transcribes with Whisper (`~96%` Chinese accuracy on `large-v3`), the agent replies, and you hear the reply back as a voice bubble in ~3–4s.
+- `/voice` — pick from 10 curated voices (male/female Mandarin + two dialects + English).
+- Just say "换成女声" / "screenshot please" — the agent owns tools like `switch_tts_voice`, `screenshot`, `list_sessions`, `shell`, so slash commands are optional.
+
 ### Other entry points
 
 ```bash
 python run.py                     # Keyboard-only CLI
-python run.py --voice             # Local mic + macOS `say` TTS
-python -m adapters.telegram_bot   # Telegram bot (requires telegram.bot_token)
+python run.py --voice             # Local mic + macOS `say` TTS (needs `.[voice]`)
 chainlit run chainlit_app.py -w   # Alternative Chainlit UI
 ```
 
@@ -61,17 +86,26 @@ iterm_bridge.py                  <- Persistent iTerm2 Python API connection
 soul.md                          <- Self-modifiable assistant identity
 config.yaml                      <- API keys + provider config (gitignored)
 
+text_utils.py                    <- Shared helpers (extract_spoken_text, …)
+
 tools/
 ├── shell.py                     <- Terminal command execution
 ├── claude_code.py               <- iTerm2 session list/read/send/create
 ├── vision.py                    <- Camera + screenshot + face recognition
 ├── face_db.py                   <- Face encoding storage (.faces/)
-└── soul.py                      <- Self-modification + user memory
+├── soul.py                      <- Self-modification + user memory
+└── voice_switch.py              <- Agent tool: change Telegram TTS voice
 
 adapters/
-├── telegram_bot.py              <- Remote control via Telegram
-├── voice.py                     <- Local mic STT + macOS TTS
-└── keyboard.py                  <- Terminal text input
+├── telegram_bot.py              <- Remote control via Telegram (voice I/O)
+├── voice.py                     <- Local mic STT + macOS TTS (CLI --voice)
+├── voice_prefs.py               <- Per-Telegram-user TTS voice store
+├── tts_streamer.py              <- Edge TTS → parallel OGG/Opus synthesis
+├── keyboard.py                  <- Terminal text input
+└── stt/                         <- Pluggable speech-to-text backends
+    ├── mlx.py                   <- mlx-whisper (Apple Silicon, default)
+    ├── google.py                <- speech_recognition → Google Web Speech
+    └── noop.py                  <- backend: none
 
 relay/                           <- Cloudflare Worker relay
 ├── src/index.ts                 <- Worker entry, routing, rate limiting
