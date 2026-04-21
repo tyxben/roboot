@@ -97,7 +97,7 @@ Restarting the daemon is *weaker*: it rotates ephemeral ECDH state and the token
 - `.chat_history.db` has no at-rest encryption (planned: argon2id + XChaCha20-Poly1305).
 - LAN WebSocket uses self-signed TLS with trust-on-first-use; no cert pinning (planned via PWA service worker).
 - **Local HTTP API has no authentication.** Anything reachable at `http(s)://<mac>:8765` on the LAN can hit `/ws`, `/api/sessions/*`, `/api/tts`, `/api/relay-revoke`. Guarded only by network reach + TLS trust.
-- Signed release tags / signed commits are **not implemented**, so `ROBOOT_AUTO_UPGRADE=1` trusts the git remote wholesale.
+- Signed release tags are opt-in: set `ROBOOT_UPGRADE_REQUIRE_SIGNED_TAG=1` alongside `ROBOOT_AUTO_UPGRADE=1` and the loop will only pull when `origin/main` is at a commit pointed to by a `v*` tag that `git verify-tag` accepts. For this to actually gate anything, release cuts must run `git tag -s vX.Y.Z` (GPG) or the SSH-signing equivalent and `git push --tags`; otherwise no tag points at HEAD of `main` and every tick is a no-op. Without the env var, the upgrade loop still trusts the git remote wholesale.
 - No review gate on `soul.md` self-writes.
 - No application-layer replay counter on E2EE frames. AES-GCM random IV makes plaintext replay unproductive, but no sequence numbers are tracked.
 - Losing `.identity/daemon.ed25519.key` is permanent — every old pairing URL's `#fp=` fails forever. Back it up.

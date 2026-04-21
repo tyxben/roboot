@@ -141,6 +141,8 @@ ROBOOT_AUTO_UPGRADE=1 python server.py
 
 开启后会：每小时 `git fetch origin main` → 有新 commit 且工作区干净 → `git pull --ff-only` → 跑 `python -m pytest tests/ -x`（60 秒内）→ 通过则写 `.upgrade_pending` sentinel、向所有连接的控制台广播 `⬆️ 升级到 <sha>，重启中…` → `os.execv` 自重启。任何一步失败（网络、测试超时、测试不过）都会回滚到升级前的 SHA 并继续正常运行。正在流式回复时自动推迟到下一轮。
 
+再加一个 `ROBOOT_UPGRADE_REQUIRE_SIGNED_TAG=1` 可以要求 `origin/main` 的 HEAD 必须被一个 `git verify-tag` 验证通过的 `v*` 标签指向才会拉取（GPG 或 SSH 签名皆可，取决于你的 git 配置）。这样你得每次发版都 `git tag -s vX.Y.Z && git push --tags`，否则循环每次都静默跳过。
+
 **什么时候想开：** 长期跑在家里/服务器上、你不会日常动代码的部署。
 **什么时候不想开：** 你本地正在开发、工作区经常有未提交改动、或者你不信任 main 分支的每一个 HEAD。
 

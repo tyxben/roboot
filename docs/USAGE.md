@@ -141,6 +141,8 @@ ROBOOT_AUTO_UPGRADE=1 python server.py
 
 When on, every hour: `git fetch origin main` → if there are new commits and the working tree is clean → `git pull --ff-only` → run `python -m pytest tests/ -x` (60s budget) → on success, write `.upgrade_pending`, broadcast `⬆️ 升级到 <sha>，重启中…` to every connected console, and `os.execv` to re-exec. Any failure (network, test timeout, test failure) rolls back to the pre-upgrade SHA and keeps running. If a chat turn is streaming, the upgrade defers to the next tick.
 
+Set `ROBOOT_UPGRADE_REQUIRE_SIGNED_TAG=1` alongside `ROBOOT_AUTO_UPGRADE=1` to additionally require that `origin/main`'s HEAD be pointed to by a `v*` tag that `git verify-tag` accepts (GPG or SSH signing, per your local config). Ticks where no verified tag is present are silently skipped — so release cuts must push a signed tag (`git tag -s vX.Y.Z && git push --tags`) for the loop to move.
+
 **Turn it on for:** long-lived deployments where you don't actively touch the code.
 **Leave it off for:** active development, repos with uncommitted local edits, or any setup where you don't want `main` to auto-apply.
 

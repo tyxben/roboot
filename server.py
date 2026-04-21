@@ -13,10 +13,16 @@ import tempfile
 
 import edge_tts
 import yaml
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from auth import (
+    attach_token_to_url,
+    load_or_generate_token,
+    require_lan_token,
+    require_lan_token_ws,
+)
 from network_utils import get_primary_ip, get_local_ip_addresses, generate_qr_code, generate_qr_ascii
 
 import arcana
@@ -162,7 +168,7 @@ async def _relay_broadcast(relay, frame: dict) -> None:
             pass
 
 
-@app.get("/api/sessions")
+@app.get("/api/sessions", dependencies=[Depends(require_lan_token)])
 async def api_list_sessions():
     """List all iTerm2 sessions."""
     sessions = await bridge.list_sessions()
@@ -181,7 +187,7 @@ async def api_list_sessions():
     }
 
 
-@app.get("/api/sessions/{session_id}/read")
+@app.get("/api/sessions/{session_id}/read", dependencies=[Depends(require_lan_token)])
 async def api_read_session(session_id: str, color: bool = False, after: int | None = None):
     """Read lines from a session via iTerm2 Python API.
 
@@ -215,7 +221,7 @@ async def api_read_session(session_id: str, color: bool = False, after: int | No
     }
 
 
-@app.get("/api/network-info")
+@app.get("/api/network-info", dependencies=[Depends(require_lan_token)])
 async def api_network_info():
     """Get network information including local IPs and QR code for mobile access."""
     primary_ip = get_primary_ip()
@@ -233,14 +239,14 @@ async def api_network_info():
     }
 
     if primary_ip:
-        url = f"{protocol}://{primary_ip}:8765"
+        url = attach_token_to_url(f"{protocol}://{primary_ip}:8765")
         result["urls"].append(url)
         result["qr_url"] = url
 
     return result
 
 
-@app.get("/api/relay-info")
+@app.get("/api/relay-info", dependencies=[Depends(require_lan_token)])
 async def api_relay_info():
     """Get relay pairing URL if relay is enabled."""
     global _relay_client
@@ -253,7 +259,7 @@ async def api_relay_info():
     return {"enabled": False, "pairing_url": None}
 
 
-@app.post("/api/relay-refresh")
+@app.post("/api/relay-refresh", dependencies=[Depends(require_lan_token)])
 async def api_relay_refresh():
     """Rotate relay pairing token and return new pairing URL."""
     global _relay_client
@@ -267,7 +273,7 @@ async def api_relay_refresh():
     return {"enabled": False}
 
 
-@app.post("/api/relay-revoke")
+@app.post("/api/relay-revoke", dependencies=[Depends(require_lan_token)])
 async def api_relay_revoke():
     """Revoke all remote access: broadcast to clients, close their sockets,
     invalidate the current pairing token, and rotate to a fresh link."""
@@ -283,21 +289,27 @@ async def api_relay_revoke():
     return {"enabled": False, "revoked": False}
 
 
-@app.get("/api/qr-code")
+@app.get("/api/qr-code", dependencies=[Depends(require_lan_token)])
 async def api_qr_code():
-    """Generate QR code PNG for the primary network URL."""
+    """Generate QR code PNG for the primary network URL.
+
+    The QR encodes the URL WITH the LAN bearer token so a fresh phone
+    scan can complete pairing in one tap. Because the token is embedded,
+    this endpoint itself is gated — callers must already possess the
+    token (e.g. the console loaded from the startup URL).
+    """
     primary_ip = get_primary_ip()
     if not primary_ip:
         return Response(content=b"", media_type="image/png")
 
     cert_file = Path(__file__).parent / "certs" / "cert.pem"
     protocol = "https" if cert_file.exists() else "http"
-    url = f"{protocol}://{primary_ip}:8765"
+    url = attach_token_to_url(f"{protocol}://{primary_ip}:8765")
     qr_bytes = generate_qr_code(url, size=8)
     return Response(content=qr_bytes, media_type="image/png")
 
 
-@app.get("/api/relay-qr")
+@app.get("/api/relay-qr", dependencies=[Depends(require_lan_token)])
 async def api_relay_qr():
     """Generate QR code PNG for the relay pairing URL."""
     global _relay_client
@@ -307,7 +319,7 @@ async def api_relay_qr():
     return Response(content=qr_bytes, media_type="image/png")
 
 
-@app.post("/api/sessions/{session_id}/send")
+@app.post("/api/sessions/{session_id}/send", dependencies=[Depends(require_lan_token)])
 async def api_send_to_session(session_id: str, body: dict):
     """Send text to a session via iTerm2 Python API."""
     text = body.get("text", "")
@@ -388,7 +400,7 @@ async def download_cert():
     return {"error": "Certificate not found"}
 
 
-@app.post("/api/tts")
+@app.post("/api/tts", dependencies=[Depends(require_lan_token)])
 async def api_tts(body: dict):
     """Convert text to speech. Extracts spoken part automatically."""
     raw = body.get("text", "")
@@ -408,7 +420,19 @@ async def api_tts(body: dict):
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
+    # Auth happens before accept() so unauthenticated connections are
+    # rejected at handshake time without the server ever echoing a
+    # subprotocol. A valid token produces a "bearer.<token>"
+    # subprotocol that we must echo back, or browsers will close with
+    # "failed to execute 'WebSocket'".
+    try:
+        subprotocol = await require_lan_token_ws(ws)
+    except WebSocketDisconnect:
+        return
+    if subprotocol:
+        await ws.accept(subprotocol=subprotocol)
+    else:
+        await ws.accept()
     _active_ws_clients.add(ws)
     runtime = _get_runtime()
     # Build personality fresh from soul.md each session
@@ -568,12 +592,15 @@ if __name__ == "__main__":
 
     # Local access
     print(f"\n📍 Local access:")
-    print(f"   {protocol}://localhost:8765")
+    print(f"   {attach_token_to_url(f'{protocol}://localhost:8765')}")
+
+    # Pre-warm the LAN token so the banner URL + QR carry it.
+    load_or_generate_token()
 
     # Network access with QR code
     primary_ip = get_primary_ip()
     if primary_ip:
-        network_url = f"{protocol}://{primary_ip}:8765"
+        network_url = attach_token_to_url(f"{protocol}://{primary_ip}:8765")
         print(f"\n📱 Mobile access (scan QR code):")
         print(f"   {network_url}")
 
@@ -595,7 +622,7 @@ if __name__ == "__main__":
             print("\n🌐 Other network interfaces:")
             for ip in all_ips:
                 if ip != primary_ip:
-                    print(f"   {protocol}://{ip}:8765")
+                    print(f"   {attach_token_to_url(f'{protocol}://{ip}:8765')}")
     else:
         print("\n⚠️  No network interface detected (localhost only)")
 

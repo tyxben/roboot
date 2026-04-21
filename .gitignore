@@ -16,3 +16,4 @@ relay/dist/
 .chat_history.db-shm
 .soul/
 .identity/
+.auth/

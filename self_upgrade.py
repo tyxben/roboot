@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -122,6 +123,18 @@ async def _current_head() -> Optional[str]:
     return sha or None
 
 
+async def _rev_parse(ref: str) -> Optional[str]:
+    """Resolve an arbitrary ref (e.g. ``origin/main``) to a full SHA."""
+    r = await _run("git", "rev-parse", ref, cwd=REPO_ROOT)
+    if r.returncode != 0:
+        log.warning(
+            "[self_upgrade] rev-parse %s failed: %s", ref, r.stderr.strip()
+        )
+        return None
+    sha = r.stdout.strip()
+    return sha or None
+
+
 async def _fetch_origin() -> bool:
     r = await _run(
         "git", "fetch", "origin", "main", cwd=REPO_ROOT, timeout=FETCH_TIMEOUT
@@ -185,6 +198,50 @@ async def _reset_hard(sha: str) -> bool:
         return False
     log.warning("[self_upgrade] rolled back to %s", sha[:12])
     return True
+
+
+# Matches release-style tags: v0, v1.2, v0.3.0, v1.2.3-rc1, etc.
+_RELEASE_TAG_RE = re.compile(r"^v[0-9][0-9A-Za-z.\-_+]*$")
+
+
+async def _find_verified_tag_at(commit_sha: str) -> Optional[str]:
+    """Return a release-style tag name whose signature verifies and which
+    points at ``commit_sha``. Returns ``None`` if no such tag exists.
+
+    Isolated as a module-level helper so tests can monkeypatch it without
+    scripting both ``git tag`` and ``git verify-tag`` via ``_run``.
+    """
+    if not commit_sha:
+        return None
+
+    r = await _run("git", "tag", "--points-at", commit_sha, cwd=REPO_ROOT)
+    if r.returncode != 0:
+        log.warning(
+            "[self_upgrade] git tag --points-at failed: %s", r.stderr.strip()
+        )
+        return None
+
+    candidates = [
+        line.strip()
+        for line in r.stdout.splitlines()
+        if line.strip() and _RELEASE_TAG_RE.match(line.strip())
+    ]
+    if not candidates:
+        return None
+
+    for tag in candidates:
+        # git verify-tag exits 0 iff the tag has a GPG/SSH signature and it
+        # validates against the caller's configured keyring / allowed_signers.
+        vr = await _run("git", "verify-tag", tag, cwd=REPO_ROOT)
+        if vr.returncode == 0:
+            return tag
+        log.info(
+            "[self_upgrade] tag %s failed verification: %s",
+            tag,
+            (vr.stderr or vr.stdout).strip(),
+        )
+
+    return None
 
 
 async def _run_smoke_tests() -> bool:
@@ -336,6 +393,26 @@ async def _tick(app) -> None:
             "[self_upgrade] %d chat turn(s) in flight, deferring", in_flight
         )
         return
+
+    # 5b. Optional gate: require a verified signed tag at origin/main.
+    if os.environ.get("ROBOOT_UPGRADE_REQUIRE_SIGNED_TAG") == "1":
+        remote_head = await _rev_parse("origin/main")
+        if not remote_head:
+            log.info(
+                "[self_upgrade] skipping: cannot resolve origin/main"
+            )
+            return
+        verified = await _find_verified_tag_at(remote_head)
+        if not verified:
+            log.info(
+                "[upgrade] skipping: HEAD of origin/main not at a verified "
+                "signed tag"
+            )
+            return
+        log.info(
+            "[self_upgrade] origin/main at verified tag %s, proceeding",
+            verified,
+        )
 
     # 6. pull
     if not await _pull_ff_only():
