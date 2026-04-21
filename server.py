@@ -137,13 +137,8 @@ from session_watcher import watcher as _session_watcher
 import chat_store
 import memory
 
-# Active web-console WebSockets. The session watcher broadcasts
-# proactive "waiting for confirmation" notifications to every
-# connected console.
-_active_ws_clients: set[WebSocket] = set()
-
-# Active web-console WebSockets. Used by the self-upgrade loop (and any
-# future broadcaster) to push `notify` frames to every connected console.
+# Active web-console WebSockets. The session watcher, self-upgrade loop,
+# and any future broadcaster push `notify` frames through here.
 _active_ws_clients: set[WebSocket] = set()
 
 # Number of chat turns currently mid-stream. Incremented just before
