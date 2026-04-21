@@ -26,9 +26,12 @@ vision = [
 ]
 telegram = [
     "python-telegram-bot>=21.0",
-    # Apple-Silicon-native Whisper ASR for voice input. On Intel Macs /
-    # Linux, swap for `faster-whisper` and update adapters/stt_whisper.py.
+    # Default STT backend: Apple-Silicon-native Whisper. On Intel Macs /
+    # Linux, set `voice.stt.backend: google` in config.yaml — that backend
+    # uses `SpeechRecognition` from the `voice` extra (install with
+    # `pip install roboot[voice,telegram]`).
     "mlx-whisper>=0.4; platform_machine=='arm64' and sys_platform=='darwin'",
+    "roboot[voice]",
 ]
 desktop = [
     "pywebview>=5.0",

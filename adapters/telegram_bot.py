@@ -34,7 +34,7 @@ import arcana
 import chat_store
 import memory
 from text_utils import extract_spoken_text
-from adapters import stt_whisper
+from adapters.stt import get_backend as _get_stt_backend
 from adapters.tts_streamer import (
     DEFAULT_VOICE as TTS_DEFAULT_VOICE,
     segment_for_tts,
@@ -669,17 +669,18 @@ async def handle_voice(update: Update, context) -> None:
     await file.download_to_drive(ogg_path)
 
     try:
-        if not stt_whisper.is_available():
+        stt = _get_stt_backend()
+        if not stt.is_available():
             await update.message.reply_text(
-                "语音识别不可用。请安装:\n  pip install mlx-whisper\n"
-                f"({stt_whisper.unavailable_reason()})"
+                "语音识别不可用。\n"
+                f"({stt.unavailable_reason()})"
             )
             return
 
         try:
-            text = await stt_whisper.transcribe(ogg_path)
+            text = await stt.transcribe(ogg_path)
         except Exception as e:
-            logger.exception("whisper transcribe failed")
+            logger.exception("stt transcribe failed")
             await update.message.reply_text(f"转写失败: {e}")
             return
 
