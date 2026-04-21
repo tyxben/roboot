@@ -19,8 +19,20 @@ Built for people who already run a lot of Claude Code sessions and want one plac
 
 ## Quickstart
 
+One command for most people:
+
 ```bash
 git clone https://github.com/tyxben/roboot.git && cd roboot
+./scripts/setup.sh                    # installs deps + ffmpeg + prewarms Whisper
+# edit config.yaml: add providers.deepseek key, optional telegram.bot_token
+python server.py                      # open http://localhost:8765
+```
+
+The script checks your Python version, installs the `telegram` extras (bot + voice I/O), `brew install`s ffmpeg if missing, copies `config.example.yaml` → `config.yaml`, and pre-caches the Whisper model so the first voice message is instant. It's idempotent — safe to re-run. Flags: `--with=core|telegram|voice|vision|all`, `--no-prewarm`.
+
+Prefer to install manually:
+
+```bash
 pip install -e .                      # core: web console + LAN + relay
 cp config.example.yaml config.yaml    # then edit and add your API key
 python server.py                      # open http://localhost:8765

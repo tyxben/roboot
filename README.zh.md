@@ -19,8 +19,20 @@
 
 ## 快速开始
 
+一条命令大多数人就够了:
+
 ```bash
 git clone https://github.com/tyxben/roboot.git && cd roboot
+./scripts/setup.sh                    # 装依赖 + ffmpeg + 预热 Whisper
+# 编辑 config.yaml: 填 providers.deepseek，可选 telegram.bot_token
+python server.py                      # 打开 http://localhost:8765
+```
+
+脚本会检查 Python 版本、装 `telegram` extras（含语音 I/O）、`brew install` ffmpeg（如果没装）、把 `config.example.yaml` 拷成 `config.yaml`、预下载 Whisper 模型(这样首条语音秒响应)。幂等,重跑安全。参数: `--with=core|telegram|voice|vision|all`、`--no-prewarm`。
+
+想手动装:
+
+```bash
 pip install -e .                      # 核心：Web 控制台 + 局域网 + relay
 cp config.example.yaml config.yaml    # 编辑并填入你的 API key
 python server.py                      # 打开 http://localhost:8765
