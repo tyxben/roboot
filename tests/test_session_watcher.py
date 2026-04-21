@@ -13,7 +13,12 @@ from dataclasses import dataclass
 
 import pytest
 
-from session_watcher import SessionWatcher, _match_prompt_line
+from session_watcher import (
+    TAIL_LINES,
+    SessionWatcher,
+    _match_prompt_line,
+    _sanitize_prompt_line,
+)
 
 
 @dataclass
@@ -179,3 +184,66 @@ async def test_stale_sessions_get_forgotten(fake_bridge):
     fake_bridge.sessions.clear()
     await watcher.poll_once()
     assert "sess-1" not in watcher._states
+
+
+def test_tail_lines_is_ten():
+    """Tail window matches the spec — 10 is enough for the prompt regex
+    and keeps the per-poll footprint small across many sessions."""
+    assert TAIL_LINES == 10
+
+
+def test_sanitize_prompt_line_strips_ansi_escapes_html_and_controls():
+    raw = "\x1b[31mHello <script>alert(1)</script>\x1b[0m"
+    assert (
+        _sanitize_prompt_line(raw)
+        == "Hello &lt;script&gt;alert(1)&lt;/script&gt;"
+    )
+
+    # Control characters (other than \t) are stripped.
+    assert _sanitize_prompt_line("a\x00b\x07c\x1fd") == "abcd"
+
+    # Tabs and runs of whitespace collapse to single spaces.
+    assert _sanitize_prompt_line("  foo\t\tbar\n\nbaz  ") == "foo bar baz"
+
+    # Ampersand is escaped too (not just < and >).
+    assert _sanitize_prompt_line("A & B") == "A &amp; B"
+
+    # Empty / None-ish inputs are safe.
+    assert _sanitize_prompt_line("") == ""
+
+
+def test_sanitize_prompt_line_truncates_and_is_idempotent():
+    # Truncation: 201 A's -> 200 A's + ellipsis.
+    long = "A" * 300
+    got = _sanitize_prompt_line(long)
+    assert got == ("A" * 200) + "…"
+    assert len(got) == 201  # 200 chars + single-char ellipsis
+
+    # Idempotent: running sanitize twice yields the same result.
+    raw = "\x1b[31m<b>hi</b>\x1b[0m\t\ta & b"
+    once = _sanitize_prompt_line(raw)
+    twice = _sanitize_prompt_line(once)
+    assert once == twice
+
+
+async def test_notify_sanitizes_prompt_line_before_subscribers(fake_bridge):
+    """Subscribers must receive a sanitized prompt_line, not the raw
+    terminal bytes — prompt-injection + XSS defense-in-depth."""
+    watcher = SessionWatcher()
+    cb, calls = _collect_subscriber()
+    watcher.subscribe(cb)
+
+    # ANSI-wrapped prompt with HTML-ish payload embedded in the matched line.
+    fake_bridge.tails["sess-1"] = (
+        "warm up\n"
+        "\x1b[31m<script>x</script> Do you want to proceed? [y/n]\x1b[0m"
+    )
+    await watcher.poll_once()
+
+    assert len(calls) == 1
+    line = calls[0]["prompt_line"]
+    # No raw ANSI escape, no raw angle brackets.
+    assert "\x1b" not in line
+    assert "<script>" not in line
+    assert "&lt;script&gt;" in line
+    assert "Do you want to proceed" in line
