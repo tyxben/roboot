@@ -12,9 +12,18 @@ You'll need macOS, Python 3.11+, [iTerm2](https://iterm2.com/), and at least one
 
 ```bash
 git clone https://github.com/tyxben/roboot.git && cd roboot
-pip install "arcana-agent[all-providers]>=0.4.0" pyyaml fastapi "uvicorn[standard]" edge-tts iterm2 "qrcode[pil]" cryptography
-cp config.example.yaml config.yaml    # then edit and add your API key
+./scripts/setup.sh                    # installs deps (+ ffmpeg, + Whisper prewarm)
+# edit config.yaml to add providers.deepseek (and optional telegram.bot_token)
 python server.py                      # open http://localhost:8765
+```
+
+`setup.sh` defaults to the `telegram` extras (Telegram bot + voice I/O). If you only want the web console, use `./scripts/setup.sh --with=core`. `--with=all` pulls vision + CLI voice + desktop. The script auto-uses [`uv`](https://docs.astral.sh/uv/) if it's on your PATH for a faster, more conflict-resistant resolve.
+
+Prefer to install manually:
+
+```bash
+pip install -e '.[telegram]'          # or '.[core]' / '.[all]'
+python -m adapters.stt prewarm        # pre-download the ASR model (~3 GB)
 ```
 
 The startup banner prints your local IP, a QR code, and (if enabled) the relay pairing URL. Once you see `🤖 Roboot - Personal AI Agent Hub` the process is up; open the web page and a `Hey，我是 <name>。有什么事？` welcome bubble appears as soon as the WebSocket connects.
@@ -35,7 +44,7 @@ list my Claude Code sessions
 
 You'll see the thinking bubble, a streaming reply, a small `1 tool call` badge underneath (that's `list_sessions`), and the right sidebar populating with one card per session. Click any card to read its terminal output and send it commands directly from the browser.
 
-**The `> ` TTS convention.** Everything the model wants *spoken aloud* is prefixed with a `> ` blockquote. Everything else (code, tables, long lists) is on-screen only. When voice output is on, the server's `_extract_spoken_text()` reads just the `> ` lines. On the page those lines still render as normal blockquotes — nothing looks weird. That's what the speaking-style section in `soul.md` is enforcing.
+**The `> ` TTS convention.** Everything the model wants *spoken aloud* is prefixed with a `> ` blockquote. Everything else (code, tables, long lists) is on-screen only. When voice output is on, `text_utils.extract_spoken_text()` reads just the `> ` lines (shared between the web server and the Telegram bot). On the page those lines still render as normal blockquotes — nothing looks weird. That's what the speaking-style section in `soul.md` is enforcing.
 
 **Voice input (STT) backends.** Three interchangeable speech-to-text backends cover Telegram voice messages and the CLI `--voice` mode. Pick one under `voice.stt.backend`:
 
@@ -103,7 +112,15 @@ Useful for quick one-liners from a terminal without opening a browser.
 python -m adapters.telegram_bot
 ```
 
-Requires `telegram.bot_token` in `config.yaml`; you should also set `allowed_users`. Supports `/start`, `/sessions` (interactive iTerm2 session management), `/screenshot`, `/remote`, `/refresh`. Plain messages go straight to the assistant.
+Requires `telegram.bot_token` in `config.yaml`; you should also set `allowed_users`. Slash commands:
+
+- `/help` — show this list
+- `/sessions` — interactive iTerm2 session management
+- `/screenshot` — send the current desktop
+- `/voice` — pick the AI's TTS voice (10 curated options; per-user pref)
+- `/remote`, `/refresh` — get / rotate the relay pairing URL
+
+Plain text just talks to the assistant. **Voice also works**: send a Telegram voice note and the bot transcribes it with mlx-whisper (~96% zh accuracy on `large-v3`), replies in text, and synthesizes the spoken part (the `> ` lines) into 1-3 OGG/Opus voice bubbles via Edge TTS. Say "换成女声" / "帮我截个屏" in plain language and the agent calls the matching tool (`switch_tts_voice` / `screenshot`) — slash commands are optional.
 
 ### Remote via relay
 

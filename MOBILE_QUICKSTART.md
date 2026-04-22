@@ -65,6 +65,30 @@ For a native app experience:
 
 ---
 
+## Option B: Telegram (works from anywhere, even off your WiFi)
+
+For mobile access when you're not on the home network, Telegram is often the simplest path — no QR, no cert trust, no port forwarding.
+
+```bash
+pip install -e '.[telegram]'           # or ./scripts/setup.sh
+brew install ffmpeg                    # for voice replies
+python -m adapters.stt prewarm         # one-time Whisper model download (~3 GB)
+# Edit config.yaml: set telegram.bot_token (from @BotFather) and telegram.allowed_users
+python -m adapters.telegram_bot
+```
+
+In the Telegram chat with your bot:
+
+- Send **text** → agent replies in text
+- Send a **voice message** → mlx-whisper transcribes (~96% Chinese accuracy offline), agent replies, and you hear the answer back as 1–3 OGG voice bubbles via Edge TTS
+- `/help` — list all commands (`/sessions`, `/screenshot`, `/voice`, `/remote`, `/refresh`)
+- `/voice` — pick the AI's TTS voice (10 curated options, per-user)
+- Or just say it in plain language: *"帮我截个屏"*, *"换成女声"*, *"看看 claude code 在跑什么"* — the agent calls the matching tool automatically
+
+Security note: Telegram traffic is protected by Telegram's TLS but is **not** end-to-end encrypted (Secret Chats don't work with bots). Use the relay option in the full docs if E2EE matters for your use case.
+
+---
+
 ## Full Documentation
 
 See [docs/mobile-access.md](docs/mobile-access.md) for:

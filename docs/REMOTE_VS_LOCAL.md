@@ -9,8 +9,8 @@
 | 能力 | 本地 Web 控制台 | LAN 其他设备 | Telegram Bot | Relay 远程 Web |
 |---|---|---|---|---|
 | 与 Agent 文字聊天 | ✅ | ✅ | ✅ | ✅ |
-| 语音输入（麦克风） | ✅[^1] | ⚠️[^2] | ⚠️[^3] | ⚠️[^2] |
-| TTS 语音播报 | ✅[^4] | ✅[^4] | ❌[^5] | ⚠️[^6] |
+| 语音输入（麦克风） | ✅[^1] | ⚠️[^2] | ✅[^3] | ⚠️[^2] |
+| TTS 语音播报 | ✅[^4] | ✅[^4] | ✅[^5] | ⚠️[^6] |
 | 列出 Claude Code 会话 | ✅ | ✅ | ✅ | ✅ |
 | 查看会话终端内容 | ✅ | ✅ | ✅ | ✅ |
 | 向会话发送按键 | ✅ | ✅ | ✅[^7] | ✅ |
@@ -24,9 +24,9 @@
 
 [^1]: localhost 是安全上下文，Web Speech API 可用。
 [^2]: 浏览器 Web Speech API 需要 HTTPS；LAN 要先生成证书并信任（见 `docs/ssl-trust-guide.md`），Relay 永远走 HTTPS 所以可用，但都受浏览器支持度限制（主要是 Chrome）。
-[^3]: Telegram 支持语音消息上传，Bot 调 `ffmpeg` + `speech_recognition` 转文字（需要安装 `SpeechRecognition`），不是实时麦克风。
+[^3]: Telegram 发语音消息，Bot 默认用 mlx-whisper (`large-v3`, ~96% 中文准确率) 离线转写；Intel Mac / Linux 可在 config.yaml 切 `voice.stt.backend: google` 走 speech_recognition。不是实时麦克风但体验接近。
 [^4]: 浏览器调用服务器 `/api/tts`（Edge TTS），高质量中文语音。
-[^5]: Telegram 目前只回文字，没有 TTS 回传。
+[^5]: Bot 抽取模型回复的 `> ` 朗读行,经 `adapters/tts_streamer.py` 分段并行合成(Edge TTS → ffmpeg → OGG/Opus),回 1-3 条 Telegram 原生语音气泡。`/voice` 命令切声音。
 [^6]: pair-page 用浏览器自带的 `speechSynthesis`（本机 OS 声音），而不是服务器的 Edge TTS —— pair-page 尚未代理 `/api/tts`。
 [^7]: 通过 inline keyboard 上 "✏️ 发送命令" 按钮弹出命令输入态，下一条消息作为命令发到会话。
 [^8]: 所有通道都只能通过对 Agent 发话触发（例如"在 ~/proj 开一个新的 Claude Code 会话"），任何前端都没有显式的"新建会话"按钮。
@@ -42,7 +42,7 @@
 
 **沙盒隔离**。iTerm2 控制、摄像头采集、本地 shell 这些都必须在守护进程所在的 Mac 上执行；远程前端无法直接驱动本地硬件。所有"远程能做"的都必须绕回 Agent 的工具调用（由守护进程来跑），这是个特性不是缺陷 —— 远程客户端被拖库也拿不到本地 shell 控制权。
 
-**UI 表面刻意精简**。pair-page 是个刻意精简的子集 —— 按"Relay Load Optimization"计划，会话列表懒加载、隐藏标签页时暂停轮询、不跑本机没必要的面板。这样才能在 4G/手机电池下保持可用。Telegram 走 Bot API，界面受限于 inline keyboard 和消息，天生不适合承载 JARVIS 或前端 TTS 这种交互。
+**UI 表面刻意精简**。pair-page 是个刻意精简的子集 —— 按"Relay Load Optimization"计划，会话列表懒加载、隐藏标签页时暂停轮询、不跑本机没必要的面板。这样才能在 4G/手机电池下保持可用。Telegram 走 Bot API，界面受限于 inline keyboard 和消息。实时 JARVIS 模式用不上(语音条是 OGG 文件,不是流式),但转写 + 分段合成的体验已经接近。
 
 ### 已知远程缺口（待修）
 
@@ -82,8 +82,8 @@ What do you actually want to do from your phone? Sitting at the Mac and being ou
 | Capability | Local Web | LAN device | Telegram Bot | Remote Web (Relay) |
 |---|---|---|---|---|
 | Text chat with agent | ✅ | ✅ | ✅ | ✅ |
-| Voice input (mic) | ✅[^e1] | ⚠️[^e2] | ⚠️[^e3] | ⚠️[^e2] |
-| TTS audio playback | ✅[^e4] | ✅[^e4] | ❌[^e5] | ⚠️[^e6] |
+| Voice input (mic) | ✅[^e1] | ⚠️[^e2] | ✅[^e3] | ⚠️[^e2] |
+| TTS audio playback | ✅[^e4] | ✅[^e4] | ✅[^e5] | ⚠️[^e6] |
 | List Claude Code sessions | ✅ | ✅ | ✅ | ✅ |
 | Read session terminal contents | ✅ | ✅ | ✅ | ✅ |
 | Send keystrokes to a session | ✅ | ✅ | ✅[^e7] | ✅ |
@@ -97,9 +97,9 @@ What do you actually want to do from your phone? Sitting at the Mac and being ou
 
 [^e1]: localhost is a secure context; Web Speech API works.
 [^e2]: Browser Web Speech API requires HTTPS. LAN needs a generated+trusted cert (see `docs/ssl-trust-guide.md`); relay is always HTTPS so it works — but browser support is uneven (mostly Chrome).
-[^e3]: Telegram supports voice-message upload; the bot runs `ffmpeg` + `speech_recognition` (requires `SpeechRecognition`) to transcribe. Not a realtime mic.
+[^e3]: Telegram supports voice-message upload; the bot uses mlx-whisper (`large-v3`, ~96% Chinese accuracy) offline by default. Intel Mac / Linux users can flip `voice.stt.backend: google` in config.yaml for the `speech_recognition` fallback. Not a realtime mic but close to it.
 [^e4]: Browser calls server `/api/tts` (Edge TTS) for high-quality Chinese voices.
-[^e5]: Telegram bot only replies in text; no TTS audio is sent back.
+[^e5]: Bot extracts the `> ` blockquote "spoken" lines and synthesizes them in parallel via `adapters/tts_streamer.py` (Edge TTS → ffmpeg → OGG/Opus), replying as 1-3 native Telegram voice bubbles. `/voice` switches voice per-user.
 [^e6]: pair-page uses the browser's built-in `speechSynthesis` (local OS voice), not server Edge TTS — pair-page does not proxy `/api/tts` yet.
 [^e7]: Via the "✏️ 发送命令" inline-keyboard button, which puts the user into command-input mode; the next message is sent to the session.
 [^e8]: Only invocable by talking to the agent (e.g., "open a new Claude Code session in ~/proj"). No frontend exposes an explicit "new session" button on any channel.
@@ -115,7 +115,7 @@ Two structural reasons, not laziness:
 
 **Sandboxing.** iTerm2 control, camera capture, and local shell all have to run on the Mac where the daemon lives. The remote frontend cannot directly drive local hardware — everything "remote can do" routes back through an agent tool call the daemon gates. That's a feature, not a bug: a compromised remote client still can't grab a local shell handle.
 
-**Deliberately-trimmed UI surface.** The pair-page is an intentional subset per the "Relay Load Optimization" plan — lazy-load the session list, pause polling when hidden, skip panels that don't apply remotely. That's what keeps it usable over 4G on battery. Telegram goes through the Bot API and is naturally limited to inline keyboards and messages; JARVIS-style interactive voice doesn't fit.
+**Deliberately-trimmed UI surface.** The pair-page is an intentional subset per the "Relay Load Optimization" plan — lazy-load the session list, pause polling when hidden, skip panels that don't apply remotely. That's what keeps it usable over 4G on battery. Telegram goes through the Bot API and is naturally limited to inline keyboards and messages. Real-time JARVIS-style streaming voice doesn't fit (voice notes are complete OGG files), but transcription + parallel synthesis gets close.
 
 ### Known remote gaps (fixes pending)
 

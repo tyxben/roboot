@@ -121,7 +121,7 @@ In the web console, click "移动访问" (Mobile Access) in the sidebar to see:
 
 ## Remote Access (Advanced)
 
-For accessing Roboot from anywhere (not just local network), see the [Remote Access Guide](./remote-access.md).
+For accessing Roboot from anywhere (not just local network), see the [Remote Access Guide](./REMOTE_VS_LOCAL.md).
 
 Quick options:
 - **Tailscale** (recommended): Secure VPN, zero-config
@@ -147,13 +147,9 @@ By default, Roboot has **no authentication**. Anyone on your WiFi can access it.
 - Shared networks (dorms, offices)
 - Remote access
 
-### Enabling Authentication (Coming Soon)
+### Authentication (Shipped)
 
-For enhanced security, see [Security Configuration](./security.md) to enable:
-- JWT authentication
-- Permission levels
-- Session timeouts
-- Audit logging
+LAN WebSocket + REST now require a bearer token (auto-generated at `.auth/lan_token`, baked into the QR URL, stored in the browser's localStorage). See [`../SECURITY.md`](../SECURITY.md) for the full threat model, E2EE relay trust chain, and pairing-leak recovery steps.
 
 ---
 
@@ -181,7 +177,7 @@ A: Yes! The Web Speech API works on mobile browsers (best on Chrome).
 A: Local network traffic is unencrypted HTTP. For remote access with encryption, use Tailscale or set up HTTPS.
 
 **Q: Can I use a custom domain?**  
-A: Yes, with Cloudflare Tunnel or reverse proxy. See [Remote Access Guide](./remote-access.md).
+A: Yes, with Cloudflare Tunnel or reverse proxy. See [Remote Access Guide](./REMOTE_VS_LOCAL.md).
 
 **Q: Does this work on tablets?**  
 A: Yes! The responsive design works on all screen sizes.
@@ -190,7 +186,7 @@ A: Yes! The responsive design works on all screen sizes.
 
 ## Related Documentation
 
-- [Remote Access Guide](./remote-access.md) - Access from anywhere
-- [Security Configuration](./security.md) - Enable authentication
-- [PWA Features](./pwa.md) - Progressive Web App capabilities
+- [REMOTE_VS_LOCAL.md](./REMOTE_VS_LOCAL.md) - Capability matrix: local / LAN / Telegram / relay
+- [SECURITY.md](../SECURITY.md) - Threat model, E2EE trust chain, auth
+- [USAGE.md](./USAGE.md) - End-user guide
 - [CLAUDE.md](../CLAUDE.md) - Architecture overview

@@ -27,17 +27,29 @@ network_utils.py                 <- IP detection, QR code generation
 soul.md                          <- Assistant's self-modifiable identity
 config.yaml                      <- API keys + provider config (gitignored)
 
+text_utils.py                    <- Shared helpers (extract_spoken_text, ...)
+
 tools/                           <- Arcana tools (agent's capabilities)
 +-- shell.py                     <- Terminal command execution
 +-- claude_code.py               <- iTerm2 session list/read/send/create
 +-- vision.py                    <- Camera capture + screenshot + face recognition
 +-- face_db.py                   <- Face encoding storage and matching (.faces/)
 +-- soul.py                      <- Self-modification + user memory
++-- voice_switch.py              <- Agent tool: change Telegram TTS voice
 
 adapters/                        <- I/O adapters
-+-- telegram_bot.py              <- Remote control via Telegram
-+-- voice.py                     <- Local mic STT + macOS TTS
++-- telegram_bot.py              <- Remote control via Telegram (voice I/O)
++-- voice.py                     <- Local mic STT + macOS TTS (CLI --voice)
++-- voice_prefs.py               <- Per-Telegram-user TTS voice store
++-- tts_streamer.py              <- Edge TTS -> parallel OGG/Opus synthesis
 +-- keyboard.py                  <- Terminal text input
++-- stt/                         <- Pluggable speech-to-text backends
+    +-- mlx.py                   <- mlx-whisper (Apple Silicon, default)
+    +-- google.py                <- speech_recognition -> Google Web Speech
+    +-- noop.py                  <- backend: none
+
+scripts/
++-- setup.sh                     <- One-command installer (auto-uses uv)
 
 relay/                           <- Cloudflare Worker relay server
 +-- src/index.ts                 <- Worker entry point, routing, rate limiting
@@ -62,8 +74,16 @@ python -m adapters.telegram_bot
 # Chainlit UI (alternative frontend)
 chainlit run chainlit_app.py -w
 
-# Install dependencies
-pip install "arcana-agent[all-providers]>=0.4.0" pyyaml fastapi "uvicorn[standard]" edge-tts iterm2 "qrcode[pil]"
+# Install (recommended: scripts/setup.sh handles deps + ffmpeg + Whisper prewarm)
+./scripts/setup.sh                                       # default: telegram extras
+./scripts/setup.sh --with=core                           # minimal (no voice)
+./scripts/setup.sh --with=all                            # everything
+
+# Manual install (if you don't want setup.sh)
+pip install -e .                                         # core
+pip install -e '.[telegram]'                             # + Telegram voice I/O
+pip install -e '.[all]'                                  # + vision + CLI voice + desktop
+python -m adapters.stt prewarm                           # pre-cache Whisper model (~3 GB)
 
 # Deploy relay (requires wrangler CLI + Cloudflare account)
 cd relay && npm install && npx wrangler deploy
@@ -78,7 +98,9 @@ All LLM interaction goes through Arcana's `Runtime` and `ChatSession`. Tools are
 `iterm_bridge.py` maintains a persistent websocket to iTerm2's Python API. This replaced an earlier AppleScript approach. Requires iTerm2 -> Settings -> General -> Magic -> Enable Python API.
 
 ### TTS: Spoken vs Displayed
-The model uses `> ` blockquote prefix to mark what should be spoken aloud. `_extract_spoken_text()` in server.py reads only `> ` lines for TTS. Everything else displays on screen only. If model omits `> `, falls back to first sentence.
+The model uses `> ` blockquote prefix to mark what should be spoken aloud. `text_utils.extract_spoken_text()` reads only `> ` lines for TTS (shared between `server.py` and the Telegram bot). Everything else displays on screen only. If the model omits `> `, falls back to first sentence.
+
+For Telegram, `adapters/tts_streamer.py` splits the spoken text into up to 3 chunks (Chinese-aware sentence segmenter in `segment_for_tts`), synthesizes them in parallel via Edge TTS, and converts mp3 -> OGG/Opus through ffmpeg so the reply lands as native Telegram voice bubbles. Per-user voice preference via `adapters/voice_prefs.py` — `/voice` picker or `switch_tts_voice` agent tool writes to `.voice_prefs/prefs.json`.
 
 ### STT Backends
 Speech-to-text is pluggable via the `adapters/stt/` package. The backend is chosen at runtime from `config.yaml` under `voice.stt.backend`:
@@ -101,7 +123,7 @@ Three methods, configured in `config.yaml` under `remote_access`:
 
 1. **LAN** (zero config): server binds `0.0.0.0:8765`, QR code displayed at startup. Works on same Wi-Fi.
 
-2. **Telegram Bot** (`adapters/telegram_bot.py`): Standalone process, connects to Telegram Bot API. Supports chat, session management, `/allow` and `/reject` commands. Access controlled by `telegram.allowed_users` list.
+2. **Telegram Bot** (`adapters/telegram_bot.py`): Standalone process, connects to Telegram Bot API. Supports text + voice chat (mlx-whisper STT + Edge TTS), session management, and slash commands `/help`, `/sessions`, `/screenshot`, `/voice`, `/remote`, `/refresh`. The agent can also call tools directly on plain-language requests ("截个屏", "换成女声" → `screenshot` / `switch_tts_voice`). Access controlled by `telegram.allowed_users` list.
 
 3. **Relay** (`relay_client.py` + `relay/`): The local server connects to a Cloudflare Worker relay via WebSocket. Mobile clients connect to the same relay and messages are forwarded bidirectionally. The relay is a Durable Object (`RelaySession`) that manages daemon-to-client routing.
 
@@ -169,7 +191,10 @@ WebSocket messages from server to frontend:
 - `providers`: API keys for deepseek, anthropic, glm, etc.
 - `default_provider` / `default_model`: which LLM to use
 - `daily_budget_usd`: spending cap
-- `voice.tts_voice`: Edge TTS voice name
+- `voice.tts_voice`: Edge TTS voice name (global default; per-user Telegram prefs override via `/voice`)
+- `voice.stt.backend`: `mlx_whisper` (default) | `google` | `none`
+- `voice.stt.model`: mlx-only, e.g. `whisper-large-v3-mlx` / `whisper-medium-mlx` / `whisper-small-mlx`
+- `voice.stt.language`: transcription language hint (default `zh`). Env overrides: `ROBOOT_WHISPER_MODEL`, `ROBOOT_WHISPER_LANGUAGE`.
 - `name`, `personality`: assistant identity (also editable via soul.md)
 - `telegram.bot_token`, `telegram.allowed_users`: Telegram remote access
 - `remote_access.method`: "none" | "official_relay" | "custom_relay"

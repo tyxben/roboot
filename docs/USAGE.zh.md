@@ -12,9 +12,18 @@
 
 ```bash
 git clone https://github.com/tyxben/roboot.git && cd roboot
-pip install "arcana-agent[all-providers]>=0.4.0" pyyaml fastapi "uvicorn[standard]" edge-tts iterm2 "qrcode[pil]" cryptography
-cp config.example.yaml config.yaml    # 然后编辑它，填入你的 API key
+./scripts/setup.sh                    # 装依赖 + ffmpeg + 预热 Whisper 模型
+# 编辑 config.yaml 填 providers.deepseek（可选 telegram.bot_token）
 python server.py                      # 打开 http://localhost:8765
+```
+
+`setup.sh` 默认装 `telegram` extras（Telegram bot + 语音 I/O）。只要 Web 控制台用 `./scripts/setup.sh --with=core`；全家桶用 `--with=all`。PATH 上有 [`uv`](https://docs.astral.sh/uv/) 会自动使用(快得多、依赖冲突更聪明)。
+
+想手动装:
+
+```bash
+pip install -e '.[telegram]'          # 或 '.[core]' / '.[all]'
+python -m adapters.stt prewarm        # 预下载 ASR 模型（~3 GB）
 ```
 
 启动 banner 会显示本机 IP、二维码和（如果启用了）relay 配对地址。看到 `🤖 Roboot - Personal AI Agent Hub` 就说明进程起来了；浏览器打开页面后 WebSocket 一连上，就会出现 `Hey，我是 <名字>。有什么事？` 的欢迎气泡。
@@ -35,7 +44,7 @@ python server.py                      # 打开 http://localhost:8765
 
 你会看到：思考气泡 → 流式回复 → 消息下方一个 `1 tool call` 的小徽章（对应 `list_sessions`）→ 右边侧栏填出每个 session 的卡片。点任意一张卡可以直接查看终端输出，从 Web 里给那个会话发指令。
 
-**`> ` 开头的朗读行。** 模型所有“该说出口”的句子都用 `> ` blockquote 前缀开头，剩下的是屏幕阅读内容（代码、表格、长列表）。开了语音后台时，服务器只读 `> ` 行。页面上 blockquote 依然会渲染成引用样式，不影响阅读。不理解 soul.md 里的说话风格提示时，这就是它在做什么。
+**`> ` 开头的朗读行。** 模型所有"该说出口"的句子都用 `> ` blockquote 前缀开头，剩下的是屏幕阅读内容（代码、表格、长列表）。开了语音后台时，`text_utils.extract_spoken_text()` 只读 `> ` 行（Web 服务器和 Telegram bot 共用）。页面上 blockquote 依然会渲染成引用样式，不影响阅读。不理解 soul.md 里的说话风格提示时，这就是它在做什么。
 
 **语音输入（STT）后端。** Telegram 语音消息和 CLI `--voice` 模式共享同一套可插拔 STT 后端，通过 `voice.stt.backend` 三选一：
 
@@ -103,7 +112,15 @@ python run.py --voice    # 本地麦克风 + macOS `say` TTS
 python -m adapters.telegram_bot
 ```
 
-前提：`config.yaml` 里填好 `telegram.bot_token`。强烈建议同时设置 `allowed_users`。支持 `/start`、`/sessions`（互动管理 iTerm2 会话）、`/screenshot`、`/remote`、`/refresh`。直接发消息就是和助手聊天。
+前提：`config.yaml` 里填好 `telegram.bot_token`。强烈建议同时设置 `allowed_users`。斜杠命令:
+
+- `/help` —— 显示命令清单
+- `/sessions` —— 互动管理 iTerm2 会话
+- `/screenshot` —— 发送当前桌面截图
+- `/voice` —— 选 AI 的朗读声音（10 个精选声音；每个 Telegram 用户独立偏好）
+- `/remote`、`/refresh` —— 获取 / 轮换 relay 配对 URL
+
+直接发文字就是和助手聊天。**语音也支持**:发一条 Telegram 语音消息,bot 用 mlx-whisper 转写（`large-v3` 中文准确率约 96%）、Agent 回复文字、再把朗读部分(`>` 开头的行)通过 Edge TTS 合成 1-3 条 OGG/Opus 语音气泡发回来。直接说"换成女声"或"帮我截个屏",Agent 会自动调用对应工具（`switch_tts_voice` / `screenshot`）—— 斜杠命令可选,不记也行。
 
 ### 通过 Relay 远程访问
 
