@@ -5,7 +5,8 @@
  * - WebSocket connects to relay instead of local server
  * - Sends {type:"client_hello"} on connect, {type:"chat",content:...} for messages
  * - Sidebar sessions disabled (no local iTerm2 access)
- * - TTS/JARVIS disabled (no local /api/tts)
+ * - TTS: daemon-side Edge TTS over encrypted WS (tts_request/tts_audio);
+ *   speechSynthesis is the fallback when the daemon is unreachable
  * - Network panel disabled (no local /api/network-info)
  * - PWA service worker removed
  */
@@ -1041,6 +1042,10 @@ function connectWS() {
       // Proactive daemon notification (session-waiting, self-upgrade, etc.)
       // Arrives inside the encrypted envelope; this branch runs after decrypt.
       handleNotify(data);
+    } else if (data.type === 'tts_audio') {
+      // Edge-TTS MP3 reply for a prior tts_request. Decoded and played via
+      // HTMLAudioElement; falls back to speechSynthesis if it didn't make it.
+      handleTtsAudio(data);
     }
   };
 
@@ -1310,6 +1315,17 @@ var jarvisMode = false;
 var isSpeaking = false;
 var speakQueue = [];
 
+// Daemon-side Edge TTS path (matches local console voice). queueSpeak() first
+// tries to fetch MP3 from the daemon over the encrypted WS; speechSynthesis is
+// the fallback used only if the daemon errors or doesn't respond within
+// TTS_FALLBACK_MS. audioQueue holds ObjectURLs to sequential MP3 clips.
+var TTS_FALLBACK_MS = 4000;
+var ttsReqCounter = 0;
+var ttsPendingFallback = {}; // req_id -> {timer, spoken}
+var audioQueue = [];
+var audioPlaying = false;
+var currentAudio = null;
+
 function toggleMic() {
   if (!window.isSecureContext && window.location.hostname !== 'localhost') {
     showToast('Voice requires HTTPS');
@@ -1447,24 +1463,104 @@ function setJarvisState(state) {
   }
 }
 
-// === Browser TTS (speechSynthesis) ===
-function queueSpeak(text) {
-  if (!text) return;
-  // Extract spoken part: lines starting with "> " or first sentence
+// === TTS: daemon-side Edge TTS (preferred) + speechSynthesis fallback ===
+//
+// queueSpeak() tries the daemon's Edge TTS (matches local console voice) over
+// the encrypted WS and only falls back to browser speechSynthesis if the
+// daemon errors or is silent past TTS_FALLBACK_MS. Daemon path is serialized
+// through audioQueue; fallback path uses speakQueue. Only one path emits
+// JARVIS state transitions per utterance so they don't race.
+
+function extractSpoken(text) {
+  // Mirrors text_utils.extract_spoken_text: "> "-prefixed lines first, then
+  // strip markdown syntax + truncate as a fallback for un-annotated replies.
   var lines = text.split('\\n');
   var spoken = '';
   for (var i = 0; i < lines.length; i++) {
-    if (lines[i].startsWith('> ')) {
+    if (lines[i].indexOf('> ') === 0) {
       spoken += lines[i].substring(2) + ' ';
     }
   }
   if (!spoken) {
-    // Fallback: first 200 chars
     spoken = text.replace(/[#*\`\\[\\]()]/g, '').substring(0, 200);
   }
-  spoken = spoken.trim();
+  return spoken.trim();
+}
+
+function queueSpeak(rawText) {
+  if (!rawText) return;
+  var spoken = extractSpoken(rawText);
   if (!spoken) return;
 
+  // If connected + handshake done, ask the daemon to synthesize. We pass raw
+  // text so the daemon's extract_spoken_text (authoritative) runs there.
+  if (ws && ws.readyState === 1 && e2eeReady) {
+    var reqId = ++ttsReqCounter;
+    ttsPendingFallback[reqId] = {
+      spoken: spoken,
+      timer: setTimeout(function() {
+        if (ttsPendingFallback[reqId]) {
+          delete ttsPendingFallback[reqId];
+          speakLocalFallback(spoken);
+        }
+      }, TTS_FALLBACK_MS),
+    };
+    secureSend({ type: 'tts_request', req_id: reqId, text: rawText });
+    return;
+  }
+  // No connection / no key — speak locally immediately so JARVIS stays alive.
+  speakLocalFallback(spoken);
+}
+
+function handleTtsAudio(data) {
+  var reqId = data.req_id;
+  var pending = ttsPendingFallback[reqId];
+  if (pending) {
+    clearTimeout(pending.timer);
+    delete ttsPendingFallback[reqId];
+  }
+  if (data.error || !data.mp3_b64) {
+    if (pending) speakLocalFallback(pending.spoken);
+    return;
+  }
+  try {
+    var bin = atob(data.mp3_b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    var blob = new Blob([bytes], { type: 'audio/mpeg' });
+    var url = URL.createObjectURL(blob);
+    audioQueue.push(url);
+    if (!audioPlaying) drainAudioQueue();
+  } catch (_e) {
+    if (pending) speakLocalFallback(pending.spoken);
+  }
+}
+
+function drainAudioQueue() {
+  if (audioQueue.length === 0) {
+    audioPlaying = false;
+    if (jarvisMode) {
+      setTimeout(function() { if (jarvisMode && !micActive) startListening(true); }, 300);
+    }
+    return;
+  }
+  audioPlaying = true;
+  if (jarvisMode) setJarvisState('speaking');
+  var url = audioQueue.shift();
+  var a = new Audio(url);
+  currentAudio = a;
+  var cleanup = function() {
+    URL.revokeObjectURL(url);
+    currentAudio = null;
+    drainAudioQueue();
+  };
+  a.onended = cleanup;
+  a.onerror = cleanup;
+  var p = a.play();
+  if (p && p.catch) { p.catch(cleanup); }
+}
+
+function speakLocalFallback(spoken) {
   speakQueue.push(spoken);
   if (!isSpeaking) drainSpeakQueue();
 }
@@ -1490,6 +1586,16 @@ function drainSpeakQueue() {
 }
 
 function stopSpeaking() {
+  // Daemon-path cleanup
+  audioQueue.forEach(function(u) { URL.revokeObjectURL(u); });
+  audioQueue = [];
+  audioPlaying = false;
+  if (currentAudio) { try { currentAudio.pause(); } catch (_e) {} currentAudio = null; }
+  Object.keys(ttsPendingFallback).forEach(function(k) {
+    clearTimeout(ttsPendingFallback[k].timer);
+    delete ttsPendingFallback[k];
+  });
+  // Fallback-path cleanup
   speakQueue = [];
   isSpeaking = false;
   speechSynthesis.cancel();

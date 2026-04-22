@@ -28,6 +28,7 @@ soul.md                          <- Assistant's self-modifiable identity
 config.yaml                      <- API keys + provider config (gitignored)
 
 text_utils.py                    <- Shared helpers (extract_spoken_text, ...)
+tts_synth.py                     <- Edge TTS helper shared by /api/tts + mobile relay
 
 tools/                           <- Arcana tools (agent's capabilities)
 +-- shell.py                     <- Terminal command execution
@@ -101,6 +102,8 @@ All LLM interaction goes through Arcana's `Runtime` and `ChatSession`. Tools are
 The model uses `> ` blockquote prefix to mark what should be spoken aloud. `text_utils.extract_spoken_text()` reads only `> ` lines for TTS (shared between `server.py` and the Telegram bot). Everything else displays on screen only. If the model omits `> `, falls back to first sentence.
 
 For Telegram, `adapters/tts_streamer.py` splits the spoken text into up to 3 chunks (Chinese-aware sentence segmenter in `segment_for_tts`), synthesizes them in parallel via Edge TTS, and converts mp3 -> OGG/Opus through ffmpeg so the reply lands as native Telegram voice bubbles. Per-user voice preference via `adapters/voice_prefs.py` — `/voice` picker or `switch_tts_voice` agent tool writes to `.voice_prefs/prefs.json`.
+
+For the mobile relay pair-page, TTS also runs server-side Edge TTS (matches the local console voice). The browser sends `{"type":"tts_request","req_id":N,"text":"..."}` over the encrypted WS; the daemon responds with `{"type":"tts_audio","req_id":N,"mp3_b64":"..."}` which the browser decodes and plays via `HTMLAudioElement`. If the daemon errors or doesn't respond within 4s, the browser falls back to `speechSynthesis`. Both sides share `tts_synth.synthesize_spoken()` so voice selection and spoken-text extraction stay consistent between `/api/tts` and the relay path.
 
 ### STT Backends
 Speech-to-text is pluggable via the `adapters/stt/` package. The backend is chosen at runtime from `config.yaml` under `voice.stt.backend`:
@@ -184,6 +187,8 @@ WebSocket messages from server to frontend:
 - `{"type": "done", "content": "...", "tools_used": N, "sessions": [...]}` -- stream complete
 - `{"type": "response", "content": "..."}` -- non-streaming message (welcome)
 - `{"type": "error", "content": "..."}` -- error
+- `{"type": "tts_request", "req_id": N, "text": "..."}` -- client→daemon: synthesize spoken text (mobile relay path only)
+- `{"type": "tts_audio", "req_id": N, "mp3_b64": "..." | "error": "..."}` -- daemon→client: Edge TTS MP3 response
 
 ## Configuration
 

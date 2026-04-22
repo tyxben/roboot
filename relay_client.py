@@ -467,6 +467,8 @@ class RelayClient:
                 await self._on_read_session(client_id, msg)
             elif msg_type == "send_session":
                 await self._on_send_session(client_id, msg)
+            elif msg_type == "tts_request":
+                await self._on_tts_request(client_id, msg)
             elif msg_type == "client_disconnect":
                 self.chat_sessions.pop(client_id, None)
                 self._ciphers.pop(client_id, None)
@@ -633,6 +635,42 @@ class RelayClient:
         except Exception as e:
             await self._send_to_client(
                 client_id, {"type": "session_sent", "session_id": session_id, "ok": False, "error": str(e)}
+            )
+
+    async def _on_tts_request(self, client_id: str, msg: dict):
+        """Synthesize spoken text via Edge TTS and return base64 MP3.
+
+        Mobile pair-page uses this when JARVIS mode is on so the voice
+        matches the local console (server-side Edge TTS, same
+        zh-CN-YunxiNeural default) instead of browser `speechSynthesis`
+        whose quality varies wildly across devices. The browser falls
+        back to speechSynthesis on timeout or explicit error so the user
+        still hears SOMETHING even if Edge TTS is unreachable.
+        """
+        req_id = msg.get("req_id")
+        raw_text = msg.get("text", "")
+        try:
+            from tts_synth import synthesize_spoken
+
+            audio = await synthesize_spoken(raw_text)
+            if not audio:
+                await self._send_to_client(
+                    client_id,
+                    {"type": "tts_audio", "req_id": req_id, "error": "no_spoken_text"},
+                )
+                return
+            await self._send_to_client(
+                client_id,
+                {
+                    "type": "tts_audio",
+                    "req_id": req_id,
+                    "mp3_b64": base64.b64encode(audio).decode("ascii"),
+                },
+            )
+        except Exception as e:
+            await self._send_to_client(
+                client_id,
+                {"type": "tts_audio", "req_id": req_id, "error": str(e)[:200]},
             )
 
     # -------------------------------------------------------------------------

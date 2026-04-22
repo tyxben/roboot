@@ -11,7 +11,6 @@ import subprocess
 
 import tempfile
 
-import edge_tts
 import yaml
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
@@ -24,7 +23,7 @@ from auth import (
     require_lan_token_ws,
 )
 from network_utils import get_primary_ip, get_local_ip_addresses, generate_qr_code, generate_qr_ascii
-from text_utils import extract_spoken_text
+from tts_synth import synthesize_spoken
 
 import arcana
 
@@ -42,7 +41,6 @@ from tools.soul import (
     add_note,
     build_personality,
     get_name,
-    get_voice,
     summarize_sessions,
 )
 
@@ -327,9 +325,6 @@ async def api_send_to_session(session_id: str, body: dict):
     return {"result": result}
 
 
-TTS_VOICE_DEFAULT = "zh-CN-YunxiNeural"
-
-
 @app.get("/static/cert.pem")
 async def download_cert():
     """Download SSL certificate for manual trust (optional)."""
@@ -346,19 +341,8 @@ async def download_cert():
 @app.post("/api/tts", dependencies=[Depends(require_lan_token)])
 async def api_tts(body: dict):
     """Convert text to speech. Extracts spoken part automatically."""
-    raw = body.get("text", "")
-    text = extract_spoken_text(raw)
-    if not text:
-        return Response(content=b"", media_type="audio/mpeg")
-
-    voice = get_voice() or TTS_VOICE_DEFAULT
-    comm = edge_tts.Communicate(text, voice=voice, rate="+10%")
-    audio_bytes = b""
-    async for chunk in comm.stream():
-        if chunk["type"] == "audio":
-            audio_bytes += chunk["data"]
-
-    return Response(content=audio_bytes, media_type="audio/mpeg")
+    audio = await synthesize_spoken(body.get("text", ""))
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 @app.websocket("/ws")
