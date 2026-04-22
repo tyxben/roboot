@@ -1,0 +1,4 @@
+# git SSH signature allowed_signers
+# Format: <principal> <key-type> <base64-key>
+# Verify a tag with: git verify-tag v0.4.0
+15245012960@163.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJTU+6xmu5M2Ya1ZA+jVuQiE6xNw77ScjwEkZSmkFV4Z
