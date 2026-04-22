@@ -30,6 +30,12 @@ python server.py                      # 打开 http://localhost:8765
 
 脚本会检查 Python 版本、装 `telegram` extras（含语音 I/O）、`brew install` ffmpeg（如果没装）、把 `config.example.yaml` 拷成 `config.yaml`、预下载 Whisper 模型(这样首条语音秒响应)。幂等,重跑安全。参数: `--with=core|telegram|voice|vision|all`、`--no-prewarm`。
 
+如果 PATH 上有 [`uv`](https://docs.astral.sh/uv/)，脚本会自动用它（解析依赖快 10 倍，处理 numpy 2 vs numba 这类冲突比 pip 聪明）。没有的话先装:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
 想手动装:
 
 ```bash

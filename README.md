@@ -30,6 +30,12 @@ python server.py                      # open http://localhost:8765
 
 The script checks your Python version, installs the `telegram` extras (bot + voice I/O), `brew install`s ffmpeg if missing, copies `config.example.yaml` → `config.yaml`, and pre-caches the Whisper model so the first voice message is instant. It's idempotent — safe to re-run. Flags: `--with=core|telegram|voice|vision|all`, `--no-prewarm`.
 
+If [`uv`](https://docs.astral.sh/uv/) is on your PATH the script uses it automatically (much faster resolver, handles numpy-2-vs-numba collisions better than pip). To install uv first:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
 Prefer to install manually:
 
 ```bash

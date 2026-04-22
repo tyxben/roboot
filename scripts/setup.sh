@@ -62,22 +62,39 @@ if [ "${CONDA_DEFAULT_ENV:-}" = "base" ]; then
     warn "then re-run this script from the new env. (Continuing anyway.)"
 fi
 
-# ----- 2. pip install with extras ---------------------------------------
+# ----- 2. install deps (prefer uv — 10x faster resolver, better conflict
+#         handling than pip on numpy-2-vs-numba-style collisions) --------
 
 msg "installing python deps (extras: $EXTRAS)…"
 
 case "$EXTRAS" in
-    core)       PIP_TARGET="-e ." ;;
+    core)       EXTRAS_SPEC="" ;;
     telegram|voice|vision|desktop|all)
-                PIP_TARGET="-e .[$EXTRAS]" ;;
+                EXTRAS_SPEC="[$EXTRAS]" ;;
     *)          die "unknown --with=$EXTRAS (use: core|telegram|voice|vision|desktop|all)" ;;
 esac
 
-# shellcheck disable=SC2086
-python3 -m pip install --quiet --upgrade pip
-# shellcheck disable=SC2086
-python3 -m pip install --quiet $PIP_TARGET
-msg "  pip install ✓"
+if command -v uv >/dev/null 2>&1; then
+    msg "  using uv $(uv --version 2>&1 | awk '{print $2}')"
+    # `uv pip install -e` respects whatever interpreter is currently active
+    # (venv / conda env / system python3) via the ambient VIRTUAL_ENV.
+    if [ -f uv.lock ] && [ "$EXTRAS" = "all" ]; then
+        uv sync --all-extras
+    elif [ -f uv.lock ] && [ "$EXTRAS" != "core" ]; then
+        uv sync --extra "$EXTRAS"
+    elif [ -f uv.lock ]; then
+        uv sync
+    else
+        uv pip install -e ".$EXTRAS_SPEC"
+    fi
+else
+    msg "  uv not found — falling back to pip (consider installing uv for 10x speed)"
+    msg "    curl -LsSf https://astral.sh/uv/install.sh | sh"
+    python3 -m pip install --quiet --upgrade pip
+    # shellcheck disable=SC2086
+    python3 -m pip install --quiet -e ".$EXTRAS_SPEC"
+fi
+msg "  deps installed ✓"
 
 # ----- 3. system deps (ffmpeg for Telegram voice) -----------------------
 
