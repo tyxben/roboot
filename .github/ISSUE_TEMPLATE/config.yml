@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/tyxben/roboot/blob/main/SECURITY.md
+    about: "Don't file publicly. See SECURITY.md for the disclosure path."
+  - name: Usage questions
+    url: https://github.com/tyxben/roboot/blob/main/docs/USAGE.md
+    about: "Setup, configuration, and interface docs — try here before opening an issue."

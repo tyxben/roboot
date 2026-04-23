@@ -152,6 +152,7 @@ Every option is documented inline in [`config.example.yaml`](config.example.yaml
 - [docs/REMOTE_VS_LOCAL.md](docs/REMOTE_VS_LOCAL.md) -- capability matrix for local / LAN / Telegram / relay, plus a comparison with Claude Code's built-in remote (bilingual in one file)
 - [SECURITY.md](SECURITY.md) -- threat model, E2EE trust chain, new-feature risks, pairing-leak recovery
 - [CHANGELOG.md](CHANGELOG.md) -- release notes ([中文版](CHANGELOG.zh.md))
+- [CONTRIBUTING.md](CONTRIBUTING.md) -- scope, dev setup, PR workflow ([中文版](CONTRIBUTING.zh.md))
 - [CLAUDE.md](CLAUDE.md) -- contributor notes: architecture, streaming protocol, soul system, adding tools
 
 ## Security

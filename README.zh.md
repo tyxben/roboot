@@ -152,6 +152,7 @@ Arcana 负责注册，其他不用改。约定见 [CLAUDE.md](CLAUDE.md) 的 "Ad
 - [docs/REMOTE_VS_LOCAL.md](docs/REMOTE_VS_LOCAL.md) —— 本地 / LAN / Telegram / relay 的能力矩阵，以及和 Claude Code 自带远程的对比（中英文在同一文件）
 - [SECURITY.md](SECURITY.md) —— 威胁模型、E2EE 信任链、新功能风险、pairing URL 泄露时的撤销流程
 - [CHANGELOG.zh.md](CHANGELOG.zh.md) —— 更新日志（[English](CHANGELOG.md)）
+- [CONTRIBUTING.zh.md](CONTRIBUTING.zh.md) —— 贡献范围、开发环境、PR 流程（[English](CONTRIBUTING.md)）
 - [CLAUDE.md](CLAUDE.md) —— 贡献者说明：架构、流式协议、soul 系统、如何加工具
 
 ## 安全
