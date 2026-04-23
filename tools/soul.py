@@ -15,6 +15,8 @@ from pathlib import Path
 
 import arcana
 
+from soul_review import Decision, review_write, review_write_sync
+
 SOUL_PATH = Path(__file__).parent.parent / "soul.md"
 SOUL_HISTORY_DIR = Path(__file__).parent.parent / ".soul" / "history"
 
@@ -35,6 +37,51 @@ def _write_soul(content: str):
             ts = time.strftime("%Y%m%d-%H%M%S")
             (SOUL_HISTORY_DIR / f"{ts}.md").write_text(prior)
     SOUL_PATH.write_text(content)
+
+
+_WRITE_OK = {Decision.AUTO, Decision.APPROVED, Decision.LOGGED}
+
+
+async def _gated_write(
+    new_content: str, *, origin: str, automated: bool = False
+) -> Decision:
+    """Async gate wrapping _write_soul for the interactive tool paths.
+
+    `automated=True` forces CONFIRM mode to degrade to LOG so background
+    writers (distiller, periodic self-feedback) never pop a modal at the
+    user every K turns. Returns the gate's Decision so callers can craft
+    a user-facing message ("已拒绝" / timed out) without re-deriving state.
+    """
+    before = _read_soul()
+    decision = await review_write(
+        before, new_content, origin=origin, automated=automated
+    )
+    if decision in _WRITE_OK:
+        _write_soul(new_content)
+    return decision
+
+
+def _gated_write_sync(new_content: str, *, origin: str) -> Decision:
+    """Sync gate wrapping _write_soul for the distiller/self-feedback path.
+
+    CONFIRM mode degrades to LOG here (no broadcast from sync context); the
+    user still gets the diff in .soul/pending/ for audit.
+    """
+    before = _read_soul()
+    decision = review_write_sync(before, new_content, origin=origin)
+    if decision in _WRITE_OK:
+        _write_soul(new_content)
+    return decision
+
+
+def _rejection_message(decision: Decision, origin: str) -> str:
+    """User-facing string when the review gate blocks a write."""
+    if decision == Decision.REJECTED:
+        return (
+            f"soul.md 写入被拒绝（{origin}）—— 可能是用户点了拒绝、"
+            "审查超时，或 diff 超过 2KB。原 diff 已留在 .soul/pending/ 可查。"
+        )
+    return f"soul.md 写入被阻断（{origin}, decision={decision.value}）"
 
 
 def _today() -> str:
@@ -262,16 +309,13 @@ async def update_self(field: str, value: str) -> str:
     else:
         return f"不认识 {field}。可改: name, voice, personality, style"
 
-    _write_soul(soul)
+    decision = await _gated_write(soul, origin="update_self")
+    if decision not in _WRITE_OK:
+        return _rejection_message(decision, "update_self")
     return f"好的，已经把 {field} 改成了: {value}"
 
 
-@arcana.tool(
-    when_to_use="当你从对话中了解到用户的新信息时。比如名字、职业、偏好、习惯、项目信息等。主动使用。",
-    what_to_expect="信息已记录到 soul.md",
-)
-async def remember_user(fact: str) -> str:
-    """记住关于用户的一个事实。"""
+async def _remember_user_body(fact: str, *, automated: bool) -> str:
     soul = _read_soul()
     section = _extract_section(soul, "About User")
     if fact in section:
@@ -282,8 +326,26 @@ async def remember_user(fact: str) -> str:
     else:
         new_section = section + "\n" + new_line
     soul = _replace_section(soul, "About User", new_section)
-    _write_soul(soul)
+    decision = await _gated_write(soul, origin="remember_user", automated=automated)
+    if decision not in _WRITE_OK:
+        return _rejection_message(decision, "remember_user")
     return f"记住了: {fact}"
+
+
+@arcana.tool(
+    when_to_use="当你从对话中了解到用户的新信息时。比如名字、职业、偏好、习惯、项目信息等。主动使用。",
+    what_to_expect="信息已记录到 soul.md",
+)
+async def remember_user(fact: str) -> str:
+    """记住关于用户的一个事实。"""
+    return await _remember_user_body(fact, automated=False)
+
+
+# Same behavior, flagged as automated (CONFIRM mode degrades to LOG). Used by
+# the periodic distiller in memory.py so the user isn't modal-spammed every
+# K turns — the diff still lands in .soul/pending/ for after-the-fact audit.
+async def remember_user_automated(fact: str) -> str:
+    return await _remember_user_body(fact, automated=True)
 
 
 # --- Self-feedback append (internal, not an @arcana.tool) -------------------
@@ -334,7 +396,7 @@ def append_self_feedback(line: str) -> None:
     if split is None:
         # Append section at the very end. Normalize trailing newline.
         tail = soul.rstrip() + "\n\n" + f"## {SELF_FEEDBACK_HEADING}\n\n{dated}\n"
-        _write_soul(tail)
+        _gated_write_sync(tail, origin="self_feedback")
         return
 
     before, body, after = split
@@ -361,7 +423,7 @@ def append_self_feedback(line: str) -> None:
     )
     # Avoid trailing blank-line bloat on files that already end cleanly.
     new_content = new_content.rstrip() + "\n"
-    _write_soul(new_content)
+    _gated_write_sync(new_content, origin="self_feedback")
 
 
 @arcana.tool(
@@ -378,5 +440,7 @@ async def add_note(note: str) -> str:
     else:
         new_section = section + "\n" + new_line
     soul = _replace_section(soul, "Notes", new_section)
-    _write_soul(soul)
+    decision = await _gated_write(soul, origin="add_note")
+    if decision not in _WRITE_OK:
+        return _rejection_message(decision, "add_note")
     return f"记下了: {note}"

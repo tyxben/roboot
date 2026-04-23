@@ -305,13 +305,14 @@ async def distill_and_record(
     `asyncio.create_task(distill_and_record(...))`.
     """
     if remember_user_fn is None:
-        from tools.soul import remember_user as _rem  # lazy to keep tests cheap
+        # Distillation is automated (fires every K turns with no user prompt),
+        # so route through remember_user_automated — that flag tells the
+        # review gate to degrade CONFIRM mode to LOG. Otherwise the user
+        # would see a modal every distillation cycle.
+        from tools.soul import remember_user_automated as _rem_auto  # lazy
 
         async def remember_user_fn_impl(fact: str) -> str:
-            # remember_user is an @arcana.tool; calling the wrapped function
-            # directly gets the underlying coroutine.
-            inner = getattr(_rem, "__wrapped__", _rem)
-            return await inner(fact)
+            return await _rem_auto(fact)
 
         remember_user_fn = remember_user_fn_impl
 
