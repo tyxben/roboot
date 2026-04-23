@@ -29,6 +29,7 @@ config.yaml                      <- API keys + provider config (gitignored)
 
 text_utils.py                    <- Shared helpers (extract_spoken_text, ...)
 tts_synth.py                     <- Edge TTS helper shared by /api/tts + mobile relay
+soul_review.py                   <- Review gate for soul.md overwrites (off/log/confirm)
 
 tools/                           <- Arcana tools (agent's capabilities)
 +-- shell.py                     <- Terminal command execution
@@ -117,6 +118,14 @@ If the `voice.stt` block is absent, Roboot defaults to `mlx_whisper` to preserve
 ### Soul System
 `soul.md` is the assistant's self-modifiable identity file. The system prompt is built dynamically by `tools/soul.py:build_personality()` which reads soul.md on each new chat session. The assistant can modify its own name, personality, voice, and accumulate knowledge about the user -- all persisted to soul.md.
 
+### Soul Review Gate
+Every overwrite of `soul.md` (from `update_self` / `remember_user` / `add_note` / the distiller's `append_self_feedback`) goes through `soul_review.review_write()` first, to block prompt-injected agents from silently persisting malicious content. Mode is controlled by `ROBOOT_SOUL_REVIEW`:
+- `off` (default) — write proceeds unreviewed, preserving prior behavior.
+- `log` — write proceeds, but the unified diff also lands in `.soul/pending/<ts>-<origin>.diff` for after-the-fact audit.
+- `confirm` — daemon broadcasts a `{"type":"soul_review","req_id":...,"origin":...,"diff":...}` frame to every connected console (local + paired mobile); modal shows the diff + a countdown + 允许/拒绝 buttons. The user's choice comes back as `{"type":"soul_review_decision","req_id":...,"approved":true|false}`; no reply within `timeout_s` (default 30) counts as REJECTED.
+
+Diffs over 2 KB are always REJECTED (too large to eyeball on a phone). Automated origins (the periodic distiller via `remember_user_automated`, and `append_self_feedback` on its sync path) degrade CONFIRM to LOG so the user isn't modal-spammed every K turns — the diff still gets audited.
+
 ### Face Recognition
 `tools/vision.py` captures camera frames and runs face detection via `face_recognition` library. Known faces are stored in `.faces/faces.json` (encoding vectors) with reference photos in `.faces/photos/`. The `look` tool auto-recognizes faces; `enroll_face` registers new ones. Threshold 0.6 (standard), confidence = 1 - distance/threshold.
 
@@ -189,6 +198,8 @@ WebSocket messages from server to frontend:
 - `{"type": "error", "content": "..."}` -- error
 - `{"type": "tts_request", "req_id": N, "text": "..."}` -- client→daemon: synthesize spoken text (mobile relay path only)
 - `{"type": "tts_audio", "req_id": N, "mp3_b64": "..." | "error": "..."}` -- daemon→client: Edge TTS MP3 response
+- `{"type": "soul_review", "req_id": H, "origin": "...", "diff": "...", "timeout_s": 30}` -- daemon→clients: requires user approve/reject on a proposed soul.md overwrite
+- `{"type": "soul_review_decision", "req_id": H, "approved": bool}` -- client→daemon: user's choice; resolves the waiting review_write future
 
 ## Configuration
 

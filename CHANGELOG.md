@@ -6,6 +6,11 @@ All notable changes to Roboot. Format follows [Keep a Changelog](https://keepach
 
 ## [Unreleased]
 
+### Added
+- **Soul review gate** (`soul_review.py`) — every write to `soul.md` from `update_self` / `remember_user` / `add_note` / the self-feedback distiller goes through a review gate. Mode selected by `ROBOOT_SOUL_REVIEW`: `off` (default, backwards compatible), `log` (writes proceed, diff audited to `.soul/pending/`), `confirm` (modal on local console + mobile pair-page, user approves each write; timeout or oversize diff → rejected). Blocks prompt-injected agents from silently persisting hostile content.
+- **`CONTRIBUTING.md`** + `CONTRIBUTING.zh.md`, `.github/ISSUE_TEMPLATE/` (bug_report / feature_request / config.yml), `.github/PULL_REQUEST_TEMPLATE.md` — standard open-source housekeeping for the v0.4.0-and-later flow.
+- **Mobile TTS proxy** — relay pair-page now fetches MP3 from the daemon's Edge TTS over the encrypted WS (`tts_request` / `tts_audio` frames) so mobile JARVIS matches local console voice; falls back to browser `speechSynthesis` if the daemon is unreachable. Shared helper `tts_synth.synthesize_spoken()` keeps the two paths from drifting.
+
 ## [0.4.0] - 2026-04-22
 
 First release since the repo went public. Large feature pass on Telegram voice I/O, LAN security, self-upgrade, and conversation memory.
