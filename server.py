@@ -135,6 +135,7 @@ from chat_handler import handle_chat
 from session_watcher import watcher as _session_watcher
 import chat_store
 import memory
+import soul_review
 
 # Active web-console WebSockets. The session watcher, self-upgrade loop,
 # and any future broadcaster push `notify` frames through here.
@@ -380,6 +381,14 @@ async def websocket_endpoint(ws: WebSocket):
             try:
                 data = await ws.receive_text()
                 msg = json.loads(data)
+                # soul_review decisions arrive out-of-band from chat turns;
+                # resolve the pending future and move on (stale req_ids are
+                # fine — user may have clicked after the timeout fired).
+                if msg.get("type") == "soul_review_decision":
+                    soul_review.resolve_decision(
+                        msg.get("req_id", ""), bool(msg.get("approved"))
+                    )
+                    continue
                 # A client that wants to resume sends `resume_session_id` on
                 # its first payload. We replay once, then stick to the new
                 # history_session_id going forward so we don't double-record.
@@ -466,10 +475,30 @@ async def _relay_broadcast(relay, frame: dict) -> None:
             pass
 
 
+async def _broadcast_soul_review(frame: dict) -> None:
+    """soul_review broadcaster for local LAN consoles. Mirrors the fan-out
+    pattern used by `_broadcast_waiting_notification`."""
+    dead: list[WebSocket] = []
+    for client_ws in list(_active_ws_clients):
+        try:
+            await client_ws.send_json(frame)
+        except Exception:
+            dead.append(client_ws)
+    for client_ws in dead:
+        _active_ws_clients.discard(client_ws)
+
+
+def _register_soul_review_broadcaster() -> None:
+    """Idempotent registration (startup hooks can fire repeatedly under
+    some reload scenarios; soul_review.register_broadcaster dedupes)."""
+    soul_review.register_broadcaster(_broadcast_soul_review)
+
+
 @app.on_event("startup")
 async def _start_session_watcher():
     _session_watcher.subscribe(_broadcast_waiting_notification)
     _session_watcher.start()
+    _register_soul_review_broadcaster()
 
 
 @app.on_event("startup")

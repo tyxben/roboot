@@ -36,6 +36,7 @@ import websockets
 import chat_store
 import identity
 import memory
+import soul_review
 from chat_handler import handle_chat
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -129,6 +130,9 @@ class RelayClient:
         # owner can be GC'd mid-await — silently cancelled. Hold refs here
         # and discard on completion.
         self._handler_tasks: set[asyncio.Task] = set()
+        # soul.md review gate: fan review frames out to every paired client.
+        # register_broadcaster dedupes, so reconnects can't double-register.
+        soul_review.register_broadcaster(self._broadcast_soul_review)
 
     @property
     def pairing_url(self) -> str:
@@ -469,6 +473,11 @@ class RelayClient:
                 await self._on_send_session(client_id, msg)
             elif msg_type == "tts_request":
                 await self._on_tts_request(client_id, msg)
+            elif msg_type == "soul_review_decision":
+                # Stale req_ids (post-timeout clicks) return False; ignore.
+                soul_review.resolve_decision(
+                    msg.get("req_id", ""), bool(msg.get("approved"))
+                )
             elif msg_type == "client_disconnect":
                 self.chat_sessions.pop(client_id, None)
                 self._ciphers.pop(client_id, None)
@@ -695,6 +704,16 @@ class RelayClient:
         """Send a control/handshake message that MUST bypass encryption."""
         if self.ws:
             await self.ws.send(json.dumps(data))
+
+    async def _broadcast_soul_review(self, frame: dict) -> None:
+        """Fan a `soul_review` frame to every paired client. `_send_to_client`
+        already encrypts; clients without a cipher (handshake not finished)
+        are silently skipped there."""
+        for cid in list(self._ciphers.keys()):
+            try:
+                await self._send_to_client(cid, frame)
+            except Exception:
+                pass
 
     def stop(self):
         """Stop the relay connection gracefully."""
