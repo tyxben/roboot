@@ -268,6 +268,94 @@ body {
 }
 .notify-bell .badge.hidden { display: none; }
 
+/* Soul-review modal: agent is asking permission to write to soul.md.
+   Blocking — no backdrop-click dismissal. Centered on desktop; bottom
+   sheet on narrow viewports. */
+.soul-review-backdrop {
+  display: none;
+  position: fixed; top: 0; left: 0;
+  width: 100%; height: 100%;
+  background: rgba(0,0,0,0.6);
+  z-index: 200;
+  align-items: center; justify-content: center;
+  padding: 20px;
+}
+.soul-review-backdrop.open { display: flex; }
+.soul-review-modal {
+  width: 100%; max-width: 560px;
+  max-height: 86vh;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+  display: flex; flex-direction: column;
+  animation: soulReviewIn 0.2s ease;
+}
+@keyframes soulReviewIn {
+  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.soul-review-header {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px;
+  flex-shrink: 0;
+}
+.soul-review-header .title { font-size: 14px; font-weight: 600; flex: 1; }
+.soul-review-header .origin {
+  font-size: 11px; color: var(--text-dim);
+  font-family: "SF Mono","Menlo",monospace;
+}
+.soul-review-diff {
+  flex: 1; overflow: auto;
+  padding: 12px 16px;
+  background: var(--bg);
+  font-family: "SF Mono","Menlo",monospace;
+  font-size: 12px; line-height: 1.5;
+  white-space: pre; word-break: normal;
+  color: var(--text);
+  -webkit-overflow-scrolling: touch;
+}
+.soul-review-diff .diff-add { color: var(--green); }
+.soul-review-diff .diff-del { color: var(--red); }
+.soul-review-diff .diff-hdr { color: var(--text-dim); }
+.soul-review-timer { padding: 8px 18px 0 18px; flex-shrink: 0; }
+.soul-review-timer-bar {
+  height: 3px; background: var(--surface2); border-radius: 2px; overflow: hidden;
+}
+.soul-review-timer-fill {
+  height: 100%; background: var(--accent); width: 100%;
+  transition: width 1s linear;
+}
+.soul-review-timer-label {
+  font-size: 11px; color: var(--text-dim);
+  margin-top: 4px; text-align: right;
+}
+.soul-review-actions {
+  padding: 12px 18px 16px 18px;
+  display: flex; gap: 10px; justify-content: flex-end;
+  flex-shrink: 0;
+}
+.soul-review-actions button {
+  padding: 8px 18px; border: none; border-radius: 8px;
+  font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit;
+}
+.soul-review-actions button:disabled { opacity: 0.4; cursor: default; }
+.soul-review-allow { background: var(--accent); color: white; }
+.soul-review-deny { background: var(--surface2); color: var(--text); }
+.soul-review-allow:hover:not(:disabled) { opacity: 0.9; }
+.soul-review-deny:hover:not(:disabled) { background: rgba(255,255,255,0.08); }
+
+@media (max-width: 560px) {
+  /* Bottom sheet on narrow screens — swipe-friendly, full-width. */
+  .soul-review-backdrop { padding: 0; align-items: flex-end; }
+  .soul-review-modal {
+    max-width: 100%; max-height: 90vh;
+    border-radius: 16px 16px 0 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
 /* Input bar */
 .input-bar {
   padding: 10px 14px; border-top: 1px solid var(--border);
@@ -486,6 +574,25 @@ body {
 <button class="notify-bell" id="notify-bell" onclick="openNotifyDrawer()" title="Notifications">
   &#128276;<span class="badge hidden" id="notify-badge">0</span>
 </button>
+<!-- Soul-review modal (soul.md write confirmation). No onclick on backdrop. -->
+<div class="soul-review-backdrop" id="soul-review-backdrop">
+  <div class="soul-review-modal" role="dialog" aria-modal="true" aria-labelledby="soul-review-title">
+    <div class="soul-review-header">
+      <div class="title" id="soul-review-title">Soul 修改确认</div>
+      <div class="origin" id="soul-review-origin"></div>
+    </div>
+    <div class="soul-review-diff" id="soul-review-diff"></div>
+    <div class="soul-review-timer">
+      <div class="soul-review-timer-bar"><div class="soul-review-timer-fill" id="soul-review-timer-fill"></div></div>
+      <div class="soul-review-timer-label" id="soul-review-timer-label">30s</div>
+    </div>
+    <div class="soul-review-actions">
+      <button class="soul-review-deny" id="soul-review-deny" onclick="soulReviewDecide(false)">拒绝</button>
+      <button class="soul-review-allow" id="soul-review-allow" onclick="soulReviewDecide(true)">允许</button>
+    </div>
+  </div>
+</div>
+
 <div class="notify-drawer-backdrop" id="notify-drawer-backdrop" onclick="closeNotifyDrawer()"></div>
 <div class="notify-drawer" id="notify-drawer">
   <div class="notify-drawer-header">
@@ -1046,6 +1153,9 @@ function connectWS() {
       // Edge-TTS MP3 reply for a prior tts_request. Decoded and played via
       // HTMLAudioElement; falls back to speechSynthesis if it didn't make it.
       handleTtsAudio(data);
+    } else if (data.type === 'soul_review') {
+      // Daemon wants permission to write soul.md — queue + show modal.
+      handleSoulReview(data);
     }
   };
 
@@ -1713,6 +1823,107 @@ function clearNotifyHistory() {
   if (bell) bell.classList.remove('has-items');
   updateNotifyBadge();
   renderNotifyHistory();
+}
+
+// === Soul-review modal ===
+// Daemon sends {type:"soul_review", req_id, origin, diff, timeout_s} when
+// it wants approval to write soul.md. User approves/rejects via buttons;
+// silence means no send (daemon owns its own timeout).
+var SOUL_ORIGIN_LABELS = {
+  'update_self': 'agent 想修改自己',
+  'remember_user': 'agent 想记住关于你的事',
+  'add_note': 'agent 想写笔记',
+  'self_feedback': 'agent 想记录自我反馈'
+};
+var soulReviewQueue = [];
+var currentSoulReview = null;
+var soulReviewTimer = null;
+
+function handleSoulReview(data) {
+  if (!data || !data.req_id) return;
+  // Queue a second review instead of clobbering the current one.
+  soulReviewQueue.push(data);
+  if (!currentSoulReview) showNextSoulReview();
+}
+
+function showNextSoulReview() {
+  if (currentSoulReview) return;
+  var next = soulReviewQueue.shift();
+  if (!next) return;
+  currentSoulReview = next;
+  var originLabel = SOUL_ORIGIN_LABELS[next.origin] || ('agent 想修改 soul.md (' + (next.origin || '?') + ')');
+  document.getElementById('soul-review-title').textContent = originLabel;
+  document.getElementById('soul-review-origin').textContent = next.origin || '';
+  renderSoulReviewDiff(next.diff || '');
+  document.getElementById('soul-review-allow').disabled = false;
+  document.getElementById('soul-review-deny').disabled = false;
+  document.getElementById('soul-review-backdrop').classList.add('open');
+  startSoulReviewTimer(typeof next.timeout_s === 'number' ? next.timeout_s : 30);
+}
+
+function renderSoulReviewDiff(diffText) {
+  var box = document.getElementById('soul-review-diff');
+  box.textContent = '';
+  var lines = String(diffText).split('\\n');
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    var span = document.createElement('span');
+    if (line.indexOf('+++') === 0 || line.indexOf('---') === 0 || line.indexOf('@@') === 0) {
+      span.className = 'diff-hdr';
+    } else if (line.charAt(0) === '+') {
+      span.className = 'diff-add';
+    } else if (line.charAt(0) === '-') {
+      span.className = 'diff-del';
+    }
+    span.textContent = line + (i < lines.length - 1 ? '\\n' : '');
+    box.appendChild(span);
+  }
+}
+
+function startSoulReviewTimer(totalSec) {
+  stopSoulReviewTimer();
+  var remaining = Math.max(1, Math.floor(totalSec));
+  var total = remaining;
+  var fill = document.getElementById('soul-review-timer-fill');
+  var label = document.getElementById('soul-review-timer-label');
+  fill.style.transition = 'none';
+  fill.style.width = '100%';
+  label.textContent = remaining + 's';
+  // Force reflow so the next transition animates from 100%.
+  void fill.offsetWidth;
+  fill.style.transition = 'width 1s linear';
+  soulReviewTimer = setInterval(function() {
+    remaining -= 1;
+    label.textContent = Math.max(0, remaining) + 's';
+    fill.style.width = (Math.max(0, remaining) / total * 100) + '%';
+    if (remaining <= 0) {
+      // Silent dismissal on timeout — daemon handles its own timeout path.
+      stopSoulReviewTimer();
+      closeSoulReview();
+    }
+  }, 1000);
+}
+
+function stopSoulReviewTimer() {
+  if (soulReviewTimer) { clearInterval(soulReviewTimer); soulReviewTimer = null; }
+}
+
+function closeSoulReview() {
+  stopSoulReviewTimer();
+  document.getElementById('soul-review-backdrop').classList.remove('open');
+  currentSoulReview = null;
+  // Drain queued reviews on the next tick so the exit can finish.
+  if (soulReviewQueue.length > 0) setTimeout(showNextSoulReview, 200);
+}
+
+function soulReviewDecide(approved) {
+  if (!currentSoulReview) return;
+  // Disable immediately so a double-click can't send twice.
+  document.getElementById('soul-review-allow').disabled = true;
+  document.getElementById('soul-review-deny').disabled = true;
+  var reqId = currentSoulReview.req_id;
+  secureSend({ type: 'soul_review_decision', req_id: reqId, approved: !!approved });
+  closeSoulReview();
 }
 
 // === Start ===
