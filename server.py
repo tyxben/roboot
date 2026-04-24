@@ -346,6 +346,24 @@ async def api_tts(body: dict):
     return Response(content=audio, media_type="audio/mpeg")
 
 
+@app.get("/api/filevault-status", dependencies=[Depends(require_lan_token)])
+async def api_filevault_status():
+    """Report macOS FileVault status so the console can warn the user
+    if disk encryption is off. See `filevault_status.py` for why this
+    matters to Roboot's at-rest security model."""
+    import filevault_status as fv
+    return await fv.check()
+
+
+@app.post("/api/chat-history-wipe", dependencies=[Depends(require_lan_token)])
+async def api_chat_history_wipe():
+    """Drop every chat session + message from `.chat_history.db` and VACUUM
+    the file so deleted pages are reclaimed. One-shot hygiene button for the
+    console; mirrors the intent of the relay-revoke control but for local data."""
+    deleted = await chat_store.wipe_all()
+    return {"deleted_messages": deleted}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     # Auth happens before accept() so unauthenticated connections are

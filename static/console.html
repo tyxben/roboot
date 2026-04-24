@@ -410,6 +410,26 @@ body {
 .soul-review-allow:hover:not(:disabled) { opacity: 0.9; }
 .soul-review-deny:hover:not(:disabled) { background: rgba(255,255,255,0.08); }
 
+/* FileVault-off warning banner. Shown when /api/filevault-status reports
+   {enabled:false}. Dismissible per-session (sessionStorage) — reappears
+   next tab so the user doesn't get permanently blind to it. */
+.fv-banner {
+  position: sticky; top: 0; z-index: 150;
+  background: var(--red); color: #fff;
+  padding: 8px 14px;
+  font-size: 12px; line-height: 1.4;
+  display: flex; align-items: center; gap: 10px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+}
+.fv-banner.hidden { display: none !important; }
+.fv-banner .msg { flex: 1; }
+.fv-banner .close {
+  background: transparent; border: none; color: #fff;
+  font-size: 16px; cursor: pointer; padding: 0 4px;
+  opacity: 0.8;
+}
+.fv-banner .close:hover { opacity: 1; }
+
 /* Unread badge on sidebar 🔔 tab */
 .chat-tab .badge {
   margin-left: auto;
@@ -566,6 +586,15 @@ body {
 </head>
 <body>
 
+<!-- FileVault-off warning. Hidden by default; unhidden by checkFileVault()
+     when /api/filevault-status returns enabled:false. -->
+<div class="fv-banner hidden" id="fv-banner">
+  <div class="msg">
+    ⚠ FileVault 已关闭 — config.yaml (API keys)、daemon 身份密钥、soul.md、聊天记录都是明文落盘。建议在"系统设置 → 隐私与安全 → FileVault"中开启。
+  </div>
+  <button class="close" onclick="dismissFvBanner()" title="Dismiss for this session">×</button>
+</div>
+
 <!-- Mobile sidebar backdrop -->
 <div class="sidebar-backdrop" id="sidebar-backdrop" onclick="closeSidebar()"></div>
 
@@ -679,7 +708,7 @@ body {
           </div>
         </div>
 
-        <div style="background:var(--surface2);border-radius:12px;padding:20px;">
+        <div style="background:var(--surface2);border-radius:12px;padding:20px;margin-bottom:20px;">
           <h3 style="font-size:14px;font-weight:600;margin-bottom:12px;color:var(--text);">说明</h3>
           <ul style="font-size:13px;line-height:1.6;color:var(--text-dim);margin-left:20px;">
             <li>局域网访问：确保手机和电脑在同一 WiFi</li>
@@ -687,6 +716,12 @@ body {
             <li>使用手机相机扫描二维码</li>
             <li>建议将页面添加到主屏幕以便快速访问</li>
           </ul>
+        </div>
+
+        <div style="background:var(--surface2);border-radius:12px;padding:20px;">
+          <h3 style="font-size:14px;font-weight:600;margin-bottom:12px;color:var(--red);">本地数据</h3>
+          <div style="font-size:13px;color:var(--text-dim);margin-bottom:12px;">所有聊天记录存在本机 .chat_history.db，默认保留 30 天可用 ROBOOT_CHAT_RETENTION_DAYS 覆盖。手动一次性清空：</div>
+          <button onclick="wipeChatHistory()" style="font-size:12px;padding:6px 14px;background:var(--red);color:#fff;border:none;border-radius:6px;cursor:pointer;">擦除所有聊天</button>
         </div>
       </div>
     </div>
@@ -1147,6 +1182,42 @@ function refreshRelayToken() {
     .catch(function() {
       showToast('Failed to refresh relay link');
     });
+}
+
+function wipeChatHistory() {
+  var ok = window.confirm('确认擦除？.chat_history.db 里的所有会话和消息都会被删除并 VACUUM。此操作不可撤销。');
+  if (!ok) return;
+  authFetch('/api/chat-history-wipe', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var n = (data && typeof data.deleted_messages === 'number') ? data.deleted_messages : 0;
+      showToast('已擦除 ' + n + ' 条聊天记录');
+    })
+    .catch(function() {
+      showToast('擦除失败');
+    });
+}
+
+// FileVault warning: Roboot's at-rest security assumes the boot volume is
+// encrypted (config.yaml API keys, daemon ed25519 key, soul.md, chat db —
+// all plaintext). If FileVault is off, that assumption fails silently, so
+// we surface a red sticky banner. Dismissal is per-sessionStorage so it
+// comes back next tab.
+function checkFileVault() {
+  if (sessionStorage.getItem('fv-banner-dismissed') === '1') return;
+  authFetch('/api/filevault-status')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data && data.enabled === false) {
+        document.getElementById('fv-banner').classList.remove('hidden');
+      }
+    })
+    .catch(function() { /* non-macOS or probe error — stay silent */ });
+}
+
+function dismissFvBanner() {
+  sessionStorage.setItem('fv-banner-dismissed', '1');
+  document.getElementById('fv-banner').classList.add('hidden');
 }
 
 function revokeRelayAccess() {
@@ -1882,6 +1953,7 @@ function soulReviewDecide(approved) {
 
 // Load sessions once on startup
 loadSessions();
+checkFileVault();
 
 // ===== Mobile Viewport Height Fix =====
 // Fix for Chrome mobile toolbar covering bottom content

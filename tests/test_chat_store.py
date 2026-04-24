@@ -109,6 +109,39 @@ async def test_sessions_do_not_cross_contaminate(tmp_db):
     assert [m["content"] for m in msgs_b] == ["from B"]
 
 
+async def test_wipe_all_clears_messages_and_sessions(tmp_db):
+    # Populate two sessions across sources so we cover the multi-row path.
+    sid_a = await chat_store.create_session("local", label="A")
+    sid_b = await chat_store.create_session("remote", label="B")
+    await chat_store.record_user(sid_a, "a1")
+    await chat_store.record_assistant(sid_a, "a2", tools_used=1)
+    await chat_store.record_user(sid_b, "b1")
+
+    deleted = await chat_store.wipe_all()
+    assert deleted == 3
+
+    import sqlite3
+
+    conn = sqlite3.connect(tmp_db)
+    msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    sess_count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    conn.close()
+    assert msg_count == 0
+    assert sess_count == 0
+
+    # Creating a new session after wipe must still work (schema intact).
+    sid_fresh = await chat_store.create_session("local")
+    await chat_store.record_user(sid_fresh, "post-wipe")
+    msgs = await chat_store.list_messages(sid_fresh)
+    assert [m["content"] for m in msgs] == ["post-wipe"]
+
+
+async def test_wipe_all_on_empty_db_returns_zero(tmp_db):
+    # No sessions, no messages — wipe is still safe.
+    deleted = await chat_store.wipe_all()
+    assert deleted == 0
+
+
 async def test_retention_purge_drops_old_sessions_on_create(tmp_db, monkeypatch):
     # Freeze time to "40 days ago", create + populate an old session.
     real_time = time.time

@@ -139,3 +139,31 @@ async def record_assistant(session_id: str, content: str, tools_used: int = 0) -
 async def list_messages(session_id: str, limit: int = 200) -> list[dict]:
     """Oldest-first list of recent messages in a session."""
     return await asyncio.to_thread(_list_messages_sync, session_id, limit)
+
+
+def _wipe_all_sync() -> int:
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+        deleted = int(row[0]) if row else 0
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM sessions")
+        # VACUUM must not run inside a transaction. _connect() uses
+        # isolation_level=None (autocommit) so the DELETEs above are
+        # already committed, and VACUUM will reclaim pages so deleted
+        # rows aren't recoverable from the file.
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+    return deleted
+
+
+async def wipe_all() -> int:
+    """Delete every session and message row, then VACUUM so the on-disk
+    file actually shrinks. Returns the number of messages deleted — the
+    console surfaces this in a toast so the user knows it did something.
+
+    Active WS connections keep their in-memory session_id; subsequent
+    record_user/record_assistant calls will silently re-insert into the
+    newly-empty tables (no FK enforcement, so this is safe)."""
+    return await asyncio.to_thread(_wipe_all_sync)
