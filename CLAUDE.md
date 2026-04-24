@@ -19,6 +19,8 @@ server.py (FastAPI)              <- Main entry point
 +-- REST /api/relay-qr           <- QR code PNG for relay pairing URL
 +-- REST /api/network-info       <- Local IP addresses
 +-- REST /api/qr-code            <- QR code PNG for LAN URL
++-- REST /api/filevault-status   <- macOS FileVault probe (fdesetup)
++-- REST /api/chat-history-wipe  <- Drop all chat rows + VACUUM (POST)
 +-- Static /static/console.html  <- Unified web console
 
 relay_client.py                  <- Relay WebSocket client (connects to CF Worker)
@@ -30,6 +32,7 @@ config.yaml                      <- API keys + provider config (gitignored)
 text_utils.py                    <- Shared helpers (extract_spoken_text, ...)
 tts_synth.py                     <- Edge TTS helper shared by /api/tts + mobile relay
 soul_review.py                   <- Review gate for soul.md overwrites (off/log/confirm)
+filevault_status.py              <- macOS fdesetup probe for the console warning banner
 
 tools/                           <- Arcana tools (agent's capabilities)
 +-- shell.py                     <- Terminal command execution
@@ -125,6 +128,11 @@ Every overwrite of `soul.md` (from `update_self` / `remember_user` / `add_note` 
 - `confirm` — daemon broadcasts a `{"type":"soul_review","req_id":...,"origin":...,"diff":...}` frame to every connected console (local + paired mobile); modal shows the diff + a countdown + 允许/拒绝 buttons. The user's choice comes back as `{"type":"soul_review_decision","req_id":...,"approved":true|false}`; no reply within `timeout_s` (default 30) counts as REJECTED.
 
 Diffs over 2 KB are always REJECTED (too large to eyeball on a phone). Automated origins (the periodic distiller via `remember_user_automated`, and `append_self_feedback` on its sync path) degrade CONFIRM to LOG so the user isn't modal-spammed every K turns — the diff still gets audited.
+
+### At-Rest Assumptions
+Roboot keeps `config.yaml` (API keys + Telegram token), `.identity/daemon.ed25519.key`, `soul.md`, `.chat_history.db`, and `.faces/faces.json` in plaintext on disk. Per-file encryption was evaluated and dropped as theater — same-user attacker reads everything regardless, and the real defense is **FileVault on the boot volume**. `filevault_status.py` (probes `fdesetup status`, 3 s timeout) feeds `/api/filevault-status`; the console shows a red sticky banner if it returns `{enabled: false}` so the assumption is visible, not silent. Non-macOS and probe failures map to `enabled=None` (banner stays hidden).
+
+Chat-history privacy hygiene is handled by `chat_store.wipe_all()` behind `POST /api/chat-history-wipe` (LAN-token gated) — wired to the 擦除所有聊天 button in the Network panel. It DELETEs all rows from `messages` + `sessions` and runs `VACUUM` on a post-autocommit connection so deleted pages are reclaimed and not recoverable from the file. Active WS connections keep their in-memory `history_session_id`; subsequent message writes just re-create the row. Retention is still governed by `ROBOOT_CHAT_RETENTION_DAYS` (default 30) which runs automatically on every `create_session()`.
 
 ### Face Recognition
 `tools/vision.py` captures camera frames and runs face detection via `face_recognition` library. Known faces are stored in `.faces/faces.json` (encoding vectors) with reference photos in `.faces/photos/`. The `look` tool auto-recognizes faces; `enroll_face` registers new ones. Threshold 0.6 (standard), confidence = 1 - distance/threshold.

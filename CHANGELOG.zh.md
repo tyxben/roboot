@@ -7,6 +7,8 @@ Roboot 的所有重要变更都记录在这里。格式遵循 [Keep a Changelog]
 ## [未发布]
 
 ### 新增
+- **FileVault 未开启警告条**（`filevault_status.py`、`/api/filevault-status`）—— 本地控制台加载时调用 `fdesetup status` 探测磁盘加密状态；如果启动卷未加密，顶部显示红色 sticky 警告条。Roboot 的整套 at-rest 安全模型（明文的 `config.yaml` API keys、`.identity/daemon.ed25519.key`、`soul.md`、`.chat_history.db`）都是以"FileVault 开着"为前提，警告条把这个前提显式化。每个 tab 可 `sessionStorage` 关闭当次会话。
+- **"擦除所有聊天"按钮**（`chat_store.wipe_all`、`POST /api/chat-history-wipe`）—— 移动访问面板里的一键隐私卫生按钮，清掉所有 session + message 行并 VACUUM 数据库，删掉的页从文件层面不可恢复。这是放弃 at-rest DB 加密（被判定为 theater，详见 `SECURITY.md`）后的轻量替代方案。
 - **Soul 写入审查闸**（`soul_review.py`）—— 所有对 `soul.md` 的写入（`update_self` / `remember_user` / `add_note` / 自我反馈蒸馏）都走这条闸。通过 `ROBOOT_SOUL_REVIEW` 选模式：`off`（默认，向后兼容）、`log`（允许落盘但把 diff 审计到 `.soul/pending/`）、`confirm`（本地控制台 + 移动配对页弹窗，每次写入都要用户确认；超时或 diff 超过 2KB 直接拒绝）。堵死 prompt 注入的 agent 偷偷持久化恶意内容。
 - **`CONTRIBUTING.md`** + `CONTRIBUTING.zh.md`、`.github/ISSUE_TEMPLATE/`（bug_report / feature_request / config.yml）、`.github/PULL_REQUEST_TEMPLATE.md` —— v0.4.0 之后的开源项目基础设施。
 - **移动端 TTS 代理** —— relay pair-page 现在通过加密 WS（`tts_request` / `tts_audio` 帧）从 daemon 的 Edge TTS 拉 MP3，让移动端 JARVIS 音色和本地一致；daemon 不可达时回退到浏览器 `speechSynthesis`。共享助手 `tts_synth.synthesize_spoken()` 避免两条路分叉。
