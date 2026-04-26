@@ -6,6 +6,9 @@ Roboot 的所有重要变更都记录在这里。格式遵循 [Keep a Changelog]
 
 ## [未发布]
 
+### 变更
+- **Arcana 0.4.0 → 0.8.2** —— 在 `pyproject.toml` 把 agent 框架下限抬到 `>=0.8.2,<0.9`，同步刷新 `uv.lock`。Roboot 用到的 arcana 表面（`Runtime`、`Budget`、`RuntimeConfig`、`@arcana.tool()`、`create_chat_session`、`LLM_CHUNK` 流式事件）从 0.4 到 0.8.2 没动过，因此源码层面无兼容性改动。换来的是 0.4 之后上游累积的 tool calling / provider 修复，以及 0.8.x 一系列 long-running 服务里 bounded cache 的内存泄漏补丁。顺手做一次 import 加固：`memory.py` 改成从 `arcana.contracts.llm` 导入 `Message` / `MessageRole`（canonical 路径），不再走 `arcana.runtime.conversation` 那个无 CHANGELOG 保证的 re-export。
+
 ### 新增
 - **FileVault 未开启警告条**（`filevault_status.py`、`/api/filevault-status`）—— 本地控制台加载时调用 `fdesetup status` 探测磁盘加密状态；如果启动卷未加密，顶部显示红色 sticky 警告条。Roboot 的整套 at-rest 安全模型（明文的 `config.yaml` API keys、`.identity/daemon.ed25519.key`、`soul.md`、`.chat_history.db`）都是以"FileVault 开着"为前提，警告条把这个前提显式化。每个 tab 可 `sessionStorage` 关闭当次会话。
 - **"擦除所有聊天"按钮**（`chat_store.wipe_all`、`POST /api/chat-history-wipe`）—— 移动访问面板里的一键隐私卫生按钮，清掉所有 session + message 行并 VACUUM 数据库，删掉的页从文件层面不可恢复。这是放弃 at-rest DB 加密（被判定为 theater，详见 `SECURITY.md`）后的轻量替代方案。

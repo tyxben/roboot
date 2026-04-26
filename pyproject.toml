@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Personal AI agent hub — voice, terminal, Claude Code management"
 requires-python = ">=3.11"
 dependencies = [
-    "arcana-agent[all-providers]>=0.4.0",
+    "arcana-agent[all-providers]>=0.8.2,<0.9",
     "pyyaml>=6.0",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
@@ -40,6 +40,11 @@ desktop = [
 ]
 all = [
     "roboot[voice,vision,telegram,desktop]",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
 ]
 
 [project.scripts]

@@ -79,7 +79,7 @@ def _seed_messages(session: Any, messages: list[dict]) -> int:
         return 0
 
     try:
-        from arcana.runtime.conversation import Message, MessageRole  # type: ignore
+        from arcana.contracts.llm import Message, MessageRole  # type: ignore
     except Exception as e:  # pragma: no cover — Arcana always present in prod
         logger.warning("Arcana Message import failed: %s", e)
         return 0
@@ -189,7 +189,7 @@ async def replay_history(
     if not summary:
         return 0
     try:
-        from arcana.runtime.conversation import Message, MessageRole  # type: ignore
+        from arcana.contracts.llm import Message, MessageRole  # type: ignore
 
         backing = getattr(session, "_messages", None)
         if isinstance(backing, list):

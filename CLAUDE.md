@@ -96,8 +96,8 @@ cd relay && npm install && npx wrangler deploy
 
 ## Key Design Decisions
 
-### Agent: Arcana 0.4.0
-All LLM interaction goes through Arcana's `Runtime` and `ChatSession`. Tools are registered with `@arcana.tool()` decorator with affordance metadata (`when_to_use`, `what_to_expect`). Streaming uses `session.stream()` which emits `LLM_CHUNK` events (not `TEXT_DELTA`).
+### Agent: Arcana 0.8.2
+All LLM interaction goes through Arcana's `Runtime` and `ChatSession`. Tools are registered with `@arcana.tool()` decorator with affordance metadata (`when_to_use`, `what_to_expect`). Streaming uses `session.stream()` which emits `LLM_CHUNK` events (not `TEXT_DELTA`). Pinned floor `>=0.8.2,<0.9` in `pyproject.toml` — 0.8.x is the "Collaborative Cognition" line; we only use the single-agent surface, so the multi-agent (`runtime.collaborate()`) and cognitive-primitives (`recall`/`pin`) features are available but unused. `Message` / `MessageRole` are imported from `arcana.contracts.llm` (canonical path), not `arcana.runtime.conversation` (re-export, fragile).
 
 ### iTerm2 Integration
 `iterm_bridge.py` maintains a persistent websocket to iTerm2's Python API. This replaced an earlier AppleScript approach. Requires iTerm2 -> Settings -> General -> Magic -> Enable Python API.

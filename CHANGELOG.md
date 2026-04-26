@@ -6,6 +6,9 @@ All notable changes to Roboot. Format follows [Keep a Changelog](https://keepach
 
 ## [Unreleased]
 
+### Changed
+- **Arcana 0.4.0 → 0.8.2** — bumped the agent framework floor in `pyproject.toml` (now `>=0.8.2,<0.9`) and refreshed `uv.lock`. Roboot's API surface (`Runtime`, `Budget`, `RuntimeConfig`, `@arcana.tool()`, `create_chat_session`, `LLM_CHUNK` streaming) didn't move between 0.4 and 0.8.2, so no source changes were required for compatibility. Picks up upstream tool-calling and provider fixes plus the 0.8.x bounded-cache memory-leak patches in long-running services. As a hardening pass, `memory.py` now imports `Message` / `MessageRole` from `arcana.contracts.llm` (canonical) rather than the `arcana.runtime.conversation` re-export, which has no CHANGELOG guarantee.
+
 ### Added
 - **FileVault-off warning banner** (`filevault_status.py`, `/api/filevault-status`) — local console polls macOS `fdesetup status` on load and shows a red sticky banner if the boot volume isn't encrypted. Roboot's entire at-rest security model (plaintext `config.yaml` with API keys, `.identity/daemon.ed25519.key`, `soul.md`, `.chat_history.db`) assumes FileVault is on; the banner surfaces the assumption instead of leaving it silent. Dismissible per tab via `sessionStorage`.
 - **"擦除所有聊天" button** (`chat_store.wipe_all`, `POST /api/chat-history-wipe`) — one-click hygiene control in the Network panel that drops every session + message row and VACUUMs the DB so deleted pages aren't recoverable from the file. Lightweight alternative to at-rest DB encryption (which was dropped as theater — see `SECURITY.md`).
