@@ -346,10 +346,93 @@ body {
 .soul-review-allow:hover:not(:disabled) { opacity: 0.9; }
 .soul-review-deny:hover:not(:disabled) { background: rgba(255,255,255,0.08); }
 
+/* Tool-approval modal: agent is asking permission to run a gated tool
+   call (today: shell with a danger pattern). Same blocking shape as
+   soul-review; allow button is red — friction for dangerous actions. */
+.tool-approval-backdrop {
+  display: none;
+  position: fixed; top: 0; left: 0;
+  width: 100%; height: 100%;
+  background: rgba(0,0,0,0.6);
+  z-index: 200;
+  align-items: center; justify-content: center;
+  padding: 20px;
+}
+.tool-approval-backdrop.open { display: flex; }
+.tool-approval-modal {
+  width: 100%; max-width: 560px;
+  max-height: 86vh;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+  display: flex; flex-direction: column;
+  animation: soulReviewIn 0.2s ease;
+}
+.tool-approval-header {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px;
+  flex-shrink: 0;
+}
+.tool-approval-header .title { font-size: 14px; font-weight: 600; flex: 1; }
+.tool-approval-header .origin {
+  font-size: 11px; color: var(--text-dim);
+  font-family: "SF Mono","Menlo",monospace;
+}
+.tool-approval-danger {
+  padding: 10px 18px;
+  background: rgba(255, 80, 80, 0.12);
+  border-bottom: 1px solid rgba(255, 80, 80, 0.3);
+  color: var(--red);
+  font-size: 12px; font-weight: 600;
+  flex-shrink: 0;
+  display: none;
+}
+.tool-approval-danger.show { display: block; }
+.tool-approval-cmd {
+  flex: 1; overflow: auto;
+  padding: 14px 18px;
+  background: var(--bg);
+  font-family: "SF Mono","Menlo",monospace;
+  font-size: 12.5px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-all;
+  color: var(--text);
+  -webkit-overflow-scrolling: touch;
+}
+.tool-approval-timer { padding: 8px 18px 0 18px; flex-shrink: 0; }
+.tool-approval-timer-bar {
+  height: 3px; background: var(--surface2); border-radius: 2px; overflow: hidden;
+}
+.tool-approval-timer-fill {
+  height: 100%; background: var(--accent); width: 100%;
+  transition: width 1s linear;
+}
+.tool-approval-timer-label {
+  font-size: 11px; color: var(--text-dim);
+  margin-top: 4px; text-align: right;
+}
+.tool-approval-actions {
+  padding: 12px 18px 16px 18px;
+  display: flex; gap: 10px; justify-content: flex-end;
+  flex-shrink: 0;
+}
+.tool-approval-actions button {
+  padding: 8px 18px; border: none; border-radius: 8px;
+  font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit;
+}
+.tool-approval-actions button:disabled { opacity: 0.4; cursor: default; }
+.tool-approval-allow { background: var(--red); color: white; }
+.tool-approval-deny { background: var(--surface2); color: var(--text); }
+.tool-approval-allow:hover:not(:disabled) { opacity: 0.9; }
+.tool-approval-deny:hover:not(:disabled) { background: rgba(255,255,255,0.08); }
+
 @media (max-width: 560px) {
   /* Bottom sheet on narrow screens — swipe-friendly, full-width. */
-  .soul-review-backdrop { padding: 0; align-items: flex-end; }
-  .soul-review-modal {
+  .soul-review-backdrop,
+  .tool-approval-backdrop { padding: 0; align-items: flex-end; }
+  .soul-review-modal,
+  .tool-approval-modal {
     max-width: 100%; max-height: 90vh;
     border-radius: 16px 16px 0 0;
     padding-bottom: env(safe-area-inset-bottom);
@@ -589,6 +672,27 @@ body {
     <div class="soul-review-actions">
       <button class="soul-review-deny" id="soul-review-deny" onclick="soulReviewDecide(false)">拒绝</button>
       <button class="soul-review-allow" id="soul-review-allow" onclick="soulReviewDecide(true)">允许</button>
+    </div>
+  </div>
+</div>
+
+<!-- Tool-approval modal — same blocking shape as soul-review, but the
+     allow button is red; we don't want dangerous actions to feel default. -->
+<div class="tool-approval-backdrop" id="tool-approval-backdrop">
+  <div class="tool-approval-modal" role="dialog" aria-modal="true" aria-labelledby="tool-approval-title">
+    <div class="tool-approval-header">
+      <div class="title" id="tool-approval-title">工具调用确认</div>
+      <div class="origin" id="tool-approval-origin"></div>
+    </div>
+    <div class="tool-approval-danger" id="tool-approval-danger"></div>
+    <div class="tool-approval-cmd" id="tool-approval-cmd"></div>
+    <div class="tool-approval-timer">
+      <div class="tool-approval-timer-bar"><div class="tool-approval-timer-fill" id="tool-approval-timer-fill"></div></div>
+      <div class="tool-approval-timer-label" id="tool-approval-timer-label">30s</div>
+    </div>
+    <div class="tool-approval-actions">
+      <button class="tool-approval-deny" id="tool-approval-deny" onclick="toolApprovalDecide(false)">拒绝</button>
+      <button class="tool-approval-allow" id="tool-approval-allow" onclick="toolApprovalDecide(true)">允许</button>
     </div>
   </div>
 </div>
@@ -1156,6 +1260,10 @@ function connectWS() {
     } else if (data.type === 'soul_review') {
       // Daemon wants permission to write soul.md — queue + show modal.
       handleSoulReview(data);
+    } else if (data.type === 'tool_approval') {
+      // Daemon wants permission to run a gated tool call (today: shell
+      // with a danger pattern). Queue + show modal.
+      handleToolApproval(data);
     }
   };
 
@@ -1924,6 +2032,99 @@ function soulReviewDecide(approved) {
   var reqId = currentSoulReview.req_id;
   secureSend({ type: 'soul_review_decision', req_id: reqId, approved: !!approved });
   closeSoulReview();
+}
+
+// Daemon sends {type:"tool_approval", req_id, tool, args_summary,
+// danger_reason, origin, issued_at, timeout_s} when ROBOOT_TOOL_APPROVAL=
+// confirm and a gated tool call (today: shell) hits a danger pattern.
+// User approves/rejects; silence = no send (daemon owns the timeout).
+var toolApprovalQueue = [];
+var currentToolApproval = null;
+var toolApprovalTimer = null;
+
+function handleToolApproval(data) {
+  if (!data || !data.req_id) return;
+  toolApprovalQueue.push(data);
+  if (!currentToolApproval) showNextToolApproval();
+}
+
+function showNextToolApproval() {
+  if (currentToolApproval) return;
+  var next = toolApprovalQueue.shift();
+  if (!next) return;
+  currentToolApproval = next;
+
+  var title = next.danger_reason ? '危险命令确认' : '工具调用确认';
+  document.getElementById('tool-approval-title').textContent = title;
+  document.getElementById('tool-approval-origin').textContent =
+    (next.tool || '?') + ' · ' + (next.origin || 'remote');
+
+  var dangerEl = document.getElementById('tool-approval-danger');
+  if (next.danger_reason) {
+    dangerEl.textContent = '⚠️ ' + next.danger_reason;
+    dangerEl.classList.add('show');
+  } else {
+    dangerEl.textContent = '';
+    dangerEl.classList.remove('show');
+  }
+
+  document.getElementById('tool-approval-cmd').textContent = next.args_summary || '';
+  document.getElementById('tool-approval-allow').disabled = false;
+  document.getElementById('tool-approval-deny').disabled = false;
+  document.getElementById('tool-approval-backdrop').classList.add('open');
+
+  // issued_at lets the local countdown account for WS hop latency so a
+  // 30s daemon timeout doesn't render as 30s on a phone that took 2s
+  // to receive the frame. Clock skew defenses: clamp negatives to 0.
+  var totalTimeout = typeof next.timeout_s === 'number' ? next.timeout_s : 30;
+  var elapsed = 0;
+  if (typeof next.issued_at === 'number' && next.issued_at > 0) {
+    elapsed = (Date.now() / 1000) - next.issued_at;
+    if (elapsed < 0) elapsed = 0;
+  }
+  startToolApprovalTimer(Math.max(1, totalTimeout - elapsed));
+}
+
+function startToolApprovalTimer(totalSec) {
+  stopToolApprovalTimer();
+  var remaining = Math.max(1, Math.floor(totalSec));
+  var total = remaining;
+  var fill = document.getElementById('tool-approval-timer-fill');
+  var label = document.getElementById('tool-approval-timer-label');
+  fill.style.transition = 'none';
+  fill.style.width = '100%';
+  label.textContent = remaining + 's';
+  void fill.offsetWidth;
+  fill.style.transition = 'width 1s linear';
+  toolApprovalTimer = setInterval(function() {
+    remaining -= 1;
+    label.textContent = Math.max(0, remaining) + 's';
+    fill.style.width = (Math.max(0, remaining) / total * 100) + '%';
+    if (remaining <= 0) {
+      stopToolApprovalTimer();
+      closeToolApproval();
+    }
+  }, 1000);
+}
+
+function stopToolApprovalTimer() {
+  if (toolApprovalTimer) { clearInterval(toolApprovalTimer); toolApprovalTimer = null; }
+}
+
+function closeToolApproval() {
+  stopToolApprovalTimer();
+  document.getElementById('tool-approval-backdrop').classList.remove('open');
+  currentToolApproval = null;
+  if (toolApprovalQueue.length > 0) setTimeout(showNextToolApproval, 200);
+}
+
+function toolApprovalDecide(approved) {
+  if (!currentToolApproval) return;
+  document.getElementById('tool-approval-allow').disabled = true;
+  document.getElementById('tool-approval-deny').disabled = true;
+  var reqId = currentToolApproval.req_id;
+  secureSend({ type: 'tool_approval_decision', req_id: reqId, approved: !!approved });
+  closeToolApproval();
 }
 
 // === Start ===
