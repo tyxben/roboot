@@ -6,6 +6,9 @@ Roboot 的所有重要变更都记录在这里。格式遵循 [Keep a Changelog]
 
 ## [未发布]
 
+### 新增
+- **`scripts/run.sh` 启动包装器** —— 所有入口（`server` / `cli` / `telegram` / `chainlit` / `test` / `py`）都通过 `uv run` 启动，确保跑的是锁定的 `arcana-agent`，不会因为 `$PATH` 上恰好排前面的某个系统 Python 而落到错版本。`.venv` 不存在时首次跑会自动 bootstrap；`test` 模式会按需同步 `dev` extra。
+
 ### 变更
 - **Arcana 0.4.0 → 0.8.2** —— 在 `pyproject.toml` 把 agent 框架下限抬到 `>=0.8.2,<0.9`，同步刷新 `uv.lock`。Roboot 用到的 arcana 表面（`Runtime`、`Budget`、`RuntimeConfig`、`@arcana.tool()`、`create_chat_session`、`LLM_CHUNK` 流式事件）从 0.4 到 0.8.2 没动过，因此源码层面无兼容性改动。换来的是 0.4 之后上游累积的 tool calling / provider 修复，以及 0.8.x 一系列 long-running 服务里 bounded cache 的内存泄漏补丁。顺手做一次 import 加固：`memory.py` 改成从 `arcana.contracts.llm` 导入 `Message` / `MessageRole`（canonical 路径），不再走 `arcana.runtime.conversation` 那个无 CHANGELOG 保证的 re-export。
 

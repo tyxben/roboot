@@ -6,6 +6,9 @@ All notable changes to Roboot. Format follows [Keep a Changelog](https://keepach
 
 ## [Unreleased]
 
+### Added
+- **`scripts/run.sh` launcher** — every entry point (`server`, `cli`, `telegram`, `chainlit`, `test`, `py`) goes through `uv run` so the locked `arcana-agent` is the one that boots, not whatever system Python sits on `$PATH`. Auto-bootstraps `.venv` on first run; `test` mode lazily syncs the `dev` extra.
+
 ### Changed
 - **Arcana 0.4.0 → 0.8.2** — bumped the agent framework floor in `pyproject.toml` (now `>=0.8.2,<0.9`) and refreshed `uv.lock`. Roboot's API surface (`Runtime`, `Budget`, `RuntimeConfig`, `@arcana.tool()`, `create_chat_session`, `LLM_CHUNK` streaming) didn't move between 0.4 and 0.8.2, so no source changes were required for compatibility. Picks up upstream tool-calling and provider fixes plus the 0.8.x bounded-cache memory-leak patches in long-running services. As a hardening pass, `memory.py` now imports `Message` / `MessageRole` from `arcana.contracts.llm` (canonical) rather than the `arcana.runtime.conversation` re-export, which has no CHANGELOG guarantee.
 
