@@ -102,6 +102,15 @@ def _get_runtime() -> arcana.Runtime:
                 default_model=config.get("default_model"),
             ),
         )
+        # Wire the approval gate into Arcana. Any tool decorated with
+        # `requires_confirmation=True` (today: `shell`) routes through
+        # tool_guard.confirmation_callback before execution. Touches a
+        # private attribute because Arcana 0.8.x doesn't surface a public
+        # setter; matches the same pragmatic poke we already do in memory.py.
+        if _runtime._tool_gateway is not None:
+            _runtime._tool_gateway.confirmation_callback = (
+                tool_guard.confirmation_callback
+            )
     return _runtime
 
 
@@ -136,6 +145,7 @@ from session_watcher import watcher as _session_watcher
 import chat_store
 import memory
 import soul_review
+import tool_guard
 
 # Active web-console WebSockets. The session watcher, self-upgrade loop,
 # and any future broadcaster push `notify` frames through here.
@@ -407,6 +417,11 @@ async def websocket_endpoint(ws: WebSocket):
                         msg.get("req_id", ""), bool(msg.get("approved"))
                     )
                     continue
+                if msg.get("type") == "tool_approval_decision":
+                    tool_guard.resolve_decision(
+                        msg.get("req_id", ""), bool(msg.get("approved"))
+                    )
+                    continue
                 # A client that wants to resume sends `resume_session_id` on
                 # its first payload. We replay once, then stick to the new
                 # history_session_id going forward so we don't double-record.
@@ -424,6 +439,10 @@ async def websocket_endpoint(ws: WebSocket):
 
                 global _chat_in_flight
                 _chat_in_flight += 1
+                # Tag this chat turn's origin so any tool_guard audit record
+                # logs `local` (LAN console) rather than the contextvar's
+                # default. Token-based reset keeps siblings unaffected.
+                origin_token = tool_guard.current_origin.set("local")
                 try:
                     await handle_chat(
                         session,
@@ -432,6 +451,7 @@ async def websocket_endpoint(ws: WebSocket):
                         history_session_id=history_session_id,
                     )
                 finally:
+                    tool_guard.current_origin.reset(origin_token)
                     _chat_in_flight -= 1
                 # Layer B: count turns; when the window fills, schedule a
                 # background distillation pass.
@@ -506,10 +526,39 @@ async def _broadcast_soul_review(frame: dict) -> None:
         _active_ws_clients.discard(client_ws)
 
 
+async def _broadcast_tool_approval(frame: dict) -> None:
+    """tool_guard broadcaster for local LAN consoles. Same fan-out shape as
+    `_broadcast_soul_review`; also forwards to paired relay clients so
+    every connected surface sees the same approval modal."""
+    dead: list[WebSocket] = []
+    for client_ws in list(_active_ws_clients):
+        try:
+            await client_ws.send_json(frame)
+        except Exception:
+            dead.append(client_ws)
+    for client_ws in dead:
+        _active_ws_clients.discard(client_ws)
+    # Forward to paired mobile clients via the relay (best-effort).
+    global _relay_client
+    relay = _relay_client
+    if relay is not None and getattr(relay, "_loop", None) is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _relay_broadcast(relay, frame), relay._loop
+            )
+        except Exception:
+            pass
+
+
 def _register_soul_review_broadcaster() -> None:
     """Idempotent registration (startup hooks can fire repeatedly under
     some reload scenarios; soul_review.register_broadcaster dedupes)."""
     soul_review.register_broadcaster(_broadcast_soul_review)
+
+
+def _register_tool_guard_broadcaster() -> None:
+    """Idempotent registration; tool_guard.register_broadcaster dedupes."""
+    tool_guard.register_broadcaster(_broadcast_tool_approval)
 
 
 @app.on_event("startup")
@@ -517,6 +566,7 @@ async def _start_session_watcher():
     _session_watcher.subscribe(_broadcast_waiting_notification)
     _session_watcher.start()
     _register_soul_review_broadcaster()
+    _register_tool_guard_broadcaster()
 
 
 @app.on_event("startup")

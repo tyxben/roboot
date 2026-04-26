@@ -37,6 +37,7 @@ import chat_store
 import identity
 import memory
 import soul_review
+import tool_guard
 from chat_handler import handle_chat
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -133,6 +134,7 @@ class RelayClient:
         # soul.md review gate: fan review frames out to every paired client.
         # register_broadcaster dedupes, so reconnects can't double-register.
         soul_review.register_broadcaster(self._broadcast_soul_review)
+        tool_guard.register_broadcaster(self._broadcast_tool_approval)
 
     @property
     def pairing_url(self) -> str:
@@ -478,6 +480,10 @@ class RelayClient:
                 soul_review.resolve_decision(
                     msg.get("req_id", ""), bool(msg.get("approved"))
                 )
+            elif msg_type == "tool_approval_decision":
+                tool_guard.resolve_decision(
+                    msg.get("req_id", ""), bool(msg.get("approved"))
+                )
             elif msg_type == "client_disconnect":
                 self.chat_sessions.pop(client_id, None)
                 self._ciphers.pop(client_id, None)
@@ -541,13 +547,19 @@ class RelayClient:
         async def send(frame: dict):
             await self._send_to_client(client_id, frame)
 
-        await handle_chat(
-            session,
-            user_text,
-            send,
-            include_sessions_on_done=client_id in self._sessions_subscribed,
-            history_session_id=history_id,
-        )
+        # Tag this turn's origin so any tool approval audit record reflects
+        # that the tool call came in over the relay (vs `local` LAN console).
+        origin_token = tool_guard.current_origin.set("relay")
+        try:
+            await handle_chat(
+                session,
+                user_text,
+                send,
+                include_sessions_on_done=client_id in self._sessions_subscribed,
+                history_session_id=history_id,
+            )
+        finally:
+            tool_guard.current_origin.reset(origin_token)
         # Layer B: every K turns, fire a background distillation pass.
         memory.record_turn_and_maybe_distill(history_id, runtime=self.runtime)
 
@@ -709,6 +721,16 @@ class RelayClient:
         """Fan a `soul_review` frame to every paired client. `_send_to_client`
         already encrypts; clients without a cipher (handshake not finished)
         are silently skipped there."""
+        for cid in list(self._ciphers.keys()):
+            try:
+                await self._send_to_client(cid, frame)
+            except Exception:
+                pass
+
+    async def _broadcast_tool_approval(self, frame: dict) -> None:
+        """Fan a `tool_approval` frame to every paired client. Same shape as
+        `_broadcast_soul_review` — pre-handshake clients are skipped silently
+        inside `_send_to_client`."""
         for cid in list(self._ciphers.keys()):
             try:
                 await self._send_to_client(cid, frame)
