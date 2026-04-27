@@ -32,6 +32,7 @@ config.yaml                      <- API keys + provider config (gitignored)
 text_utils.py                    <- Shared helpers (extract_spoken_text, ...)
 tts_synth.py                     <- Edge TTS helper shared by /api/tts + mobile relay
 soul_review.py                   <- Review gate for soul.md overwrites (off/log/confirm)
+tool_guard.py                    <- Approval gate for agent tool calls (off/log/confirm) — gates run_command via Arcana confirmation_callback
 filevault_status.py              <- macOS fdesetup probe for the console warning banner
 
 tools/                           <- Arcana tools (agent's capabilities)
@@ -129,6 +130,18 @@ Every overwrite of `soul.md` (from `update_self` / `remember_user` / `add_note` 
 
 Diffs over 2 KB are always REJECTED (too large to eyeball on a phone). Automated origins (the periodic distiller via `remember_user_automated`, and `append_self_feedback` on its sync path) degrade CONFIRM to LOG so the user isn't modal-spammed every K turns — the diff still gets audited.
 
+### Tool Approval Gate
+Same shape as the soul review gate, but it gates the *action* path (the agent calling `run_command` etc.) instead of the *persistence* path (writes to soul.md). Without it, a prompt-injected `session_watcher` tail or Telegram message can chain straight into shell. Mode is controlled by `ROBOOT_TOOL_APPROVAL`:
+- `off` (default) — bypass entirely; preserves pre-v0.4 behavior.
+- `log` — non-dangerous calls pass through; dangerous calls (matched against `tool_guard.DANGEROUS_PATTERNS` — 38 curated regexes covering rm/dd/sudo/pipe-to-shell/credential dirs/Roboot at-rest paths/etc.) are still allowed but the call lands in `.tool_audit/<ts>-<tool>-LOGGED.json`.
+- `confirm` — dangerous calls broadcast `{"type":"tool_approval","req_id":...,"tool":...,"args_summary":...,"danger_reason":...,"origin":...,"issued_at":...,"timeout_s":30}` to every registered surface (local console + relay mobile + Telegram). The reply `{"type":"tool_approval_decision","req_id":...,"approved":bool}` resolves the gate's pending future. No reply within `timeout_s` → REJECTED. Args summary > 2 KB → REJECTED unconditionally.
+
+Hooked into Arcana via `runtime._tool_gateway.confirmation_callback = tool_guard.confirmation_callback` — each gated tool just declares `requires_confirmation=True` on its `@arcana.tool(...)` decorator. Currently gated: `run_command` (shell). The callback fails *closed* on any internal exception (returns False) so a crashing gate rejects the call rather than waving it through.
+
+The danger detector applies NFKC + ANSI strip + null-byte normalization before matching, with a 16 KB hard cap on detector input (ReDoS guard). Allowlist at `~/.roboot/tool_allowlist.json` (per-machine, gitignored) does prefix matching with token boundaries; metachar-containing entries (`;`, `&`, backtick, `$(`, `||`, etc.) are silently rejected at lookup time so a user can't write `prefix: "ls; rm -rf"` and feel safe. Allowlist CANNOT override danger detection — a dangerous shell command goes to modal regardless.
+
+Origin tracking via `tool_guard.current_origin` contextvar (set to `"local"` in `server.py`, `"relay"` in `relay_client.py`, `"telegram"` in `adapters/telegram_bot.py` at message-receive boundary) — surfaces in audit records and the broadcast frame. Telegram only DMs the *triggering* user (read from the existing `current_tg_user` contextvar); cross-user clicks on the inline-keyboard message are rejected with a toast and don't touch the future, so a stranger who learns a `req_id` can't approve another user's tool.
+
 ### At-Rest Assumptions
 Roboot keeps `config.yaml` (API keys + Telegram token), `.identity/daemon.ed25519.key`, `soul.md`, `.chat_history.db`, and `.faces/faces.json` in plaintext on disk. Per-file encryption was evaluated and dropped as theater — same-user attacker reads everything regardless, and the real defense is **FileVault on the boot volume**. `filevault_status.py` (probes `fdesetup status`, 3 s timeout) feeds `/api/filevault-status`; the console shows a red sticky banner if it returns `{enabled: false}` so the assumption is visible, not silent. Non-macOS and probe failures map to `enabled=None` (banner stays hidden).
 
@@ -208,6 +221,8 @@ WebSocket messages from server to frontend:
 - `{"type": "tts_audio", "req_id": N, "mp3_b64": "..." | "error": "..."}` -- daemon→client: Edge TTS MP3 response
 - `{"type": "soul_review", "req_id": H, "origin": "...", "diff": "...", "timeout_s": 30}` -- daemon→clients: requires user approve/reject on a proposed soul.md overwrite
 - `{"type": "soul_review_decision", "req_id": H, "approved": bool}` -- client→daemon: user's choice; resolves the waiting review_write future
+- `{"type": "tool_approval", "req_id": H, "tool": "...", "args_summary": "...", "danger_reason": "...", "origin": "...", "issued_at": ts, "timeout_s": 30}` -- daemon→clients: agent wants to run a tool flagged as dangerous; user must approve/reject
+- `{"type": "tool_approval_decision", "req_id": H, "approved": bool}` -- client→daemon: user's choice; resolves the waiting tool_guard future. (Telegram surface uses inline-keyboard `tool_ok:<req_id>` / `tool_no:<req_id>` callback_data instead of a JSON frame.)
 
 ## Configuration
 

@@ -96,3 +96,45 @@ remote_access:
     endpoint: "wss://relay.coordbound.com"
     # Or deploy your own: see relay/ directory and relay/wrangler.toml
     # endpoint: "wss://your-own-relay.example.com"
+
+# ---------------------------------------------------------------------------
+# Security hardening (set as environment variables, not config keys)
+# ---------------------------------------------------------------------------
+#
+# ROBOOT_SOUL_REVIEW   -- gates writes to soul.md from update_self /
+#                          remember_user / add_note / append_self_feedback.
+#                            off     (default) -- writes proceed unreviewed
+#                            log               -- writes proceed, diff
+#                                                 audited to .soul/pending/
+#                            confirm           -- modal on every connected
+#                                                 console (local + relay
+#                                                 mobile); diffs >2 KB or
+#                                                 30 s timeout = REJECTED
+#
+# ROBOOT_TOOL_APPROVAL -- gates `run_command` shell calls before Arcana
+#                          dispatches them. Same shape as ROBOOT_SOUL_REVIEW
+#                          but for the action path.
+#                            off     (default) -- bypass entirely
+#                            log               -- dangerous calls allowed,
+#                                                 recorded to .tool_audit/
+#                            confirm           -- approval modal on local
+#                                                 console + relay mobile +
+#                                                 Telegram inline keyboard
+#
+# Both gates default to `off` for backwards compatibility. If your daemon
+# routinely accepts input from untrusted surfaces (Telegram, paired remote
+# clients, session_watcher reading sessions you don't fully control), the
+# hardening recommendation in SECURITY.md is `log` to build an audit trail
+# without modals, or `confirm` for active approval.
+#
+# Other env vars worth knowing:
+#   ROBOOT_AUTO_UPGRADE=1                -- enable hourly self-upgrade loop
+#                                            (off by default; see SECURITY.md §5)
+#   ROBOOT_UPGRADE_REQUIRE_SIGNED_TAG=1  -- only auto-upgrade when origin/main
+#                                            points to a `git verify-tag`-clean
+#                                            v* tag
+#   ROBOOT_CHAT_RETENTION_DAYS=30        -- chat-history auto-purge cutoff
+#                                            (default 30; runs on every
+#                                             create_session)
+#   ROBOOT_WHISPER_MODEL                 -- override voice.stt.model ad-hoc
+#   ROBOOT_WHISPER_LANGUAGE              -- override voice.stt.language ad-hoc
