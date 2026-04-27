@@ -33,6 +33,7 @@ import arcana
 
 import chat_store
 import memory
+import tool_guard
 from text_utils import extract_spoken_text
 from adapters.stt import get_backend as _get_stt_backend
 from adapters.tts_streamer import (
@@ -136,6 +137,14 @@ def _get_runtime() -> arcana.Runtime:
                 default_model=CONFIG.get("default_model"),
             ),
         )
+        # Wire the approval gate. Same private-attribute poke as server.py:
+        # Arcana 0.8.x has no public setter. Without this, Telegram-driven
+        # `run_command` calls bypass the gate entirely (D2 only wired the
+        # daemon's runtime).
+        if _runtime._tool_gateway is not None:
+            _runtime._tool_gateway.confirmation_callback = (
+                tool_guard.confirmation_callback
+            )
     return _runtime
 
 
@@ -574,6 +583,26 @@ async def callback_handler(update: Update, context) -> None:
             pass
         await _send_voice_sample(query, voice, label=label)
 
+    # --- Tool approval (allow / deny) ---
+    elif data.startswith("tool_ok:") or data.startswith("tool_no:"):
+        approved = data.startswith("tool_ok:")
+        req_id = data.split(":", 1)[1]
+        resolved = tool_guard.resolve_decision(req_id, approved)
+        if not resolved:
+            # Future already gone — user clicked after the 30s timeout, or
+            # the daemon raced ahead and rejected. Tell them, don't pretend
+            # the click did anything.
+            try:
+                await query.edit_message_text("⏰ 该工具批准请求已超时或已处理。")
+            except Exception:
+                pass
+            return
+        verdict = "✅ 已批准" if approved else "❌ 已拒绝"
+        try:
+            await query.edit_message_text(verdict)
+        except Exception:
+            pass
+
 
 async def cmd_remote(update: Update, context) -> None:
     """Get remote access link from the local server's relay info."""
@@ -686,7 +715,8 @@ async def _agent_reply(user_id: int, text: str) -> str:
     session = _chat_sessions[user_id]
     history_id = _history_ids.get(user_id)
 
-    token = current_tg_user.set(user_id)
+    user_token = current_tg_user.set(user_id)
+    origin_token = tool_guard.current_origin.set("telegram")
     try:
         if history_id:
             await chat_store.record_user(history_id, text)
@@ -697,7 +727,8 @@ async def _agent_reply(user_id: int, text: str) -> str:
             memory.record_turn_and_maybe_distill(history_id, runtime=runtime)
         return reply
     finally:
-        current_tg_user.reset(token)
+        tool_guard.current_origin.reset(origin_token)
+        current_tg_user.reset(user_token)
 
 
 async def _send_voice_reply(update: Update, reply: str) -> None:
@@ -875,6 +906,66 @@ async def handle_voice(update: Update, context) -> None:
             pass
 
 
+# Set in main() once the Application is built; the tool_guard broadcaster
+# reads this to know which bot to send through. Module-global instead of
+# closure so tests can swap it for a stub without touching post_init.
+_tg_app = None
+
+
+def _truncate_summary(text: str, limit: int = 600) -> str:
+    """Inline-keyboard messages live in chat history forever. Cap the
+    args_summary so a noisy 2KB command doesn't clog the user's chat —
+    the audit file in `.tool_audit/` keeps the full record."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...(截断)"
+
+
+async def _broadcast_tool_approval(frame: dict) -> None:
+    """tool_guard broadcaster for Telegram. DM the *triggering* user (read
+    from the `current_tg_user` contextvar set in `_agent_reply`) with an
+    inline keyboard. If the contextvar is unset — i.e. the tool fired
+    outside a Telegram-driven chat turn — bail silently and let the gate
+    time out (REJECTED). Better than spamming every allowed user.
+    """
+    app = _tg_app
+    if app is None:
+        logger.warning("tool_guard broadcaster: _tg_app is None, skipping")
+        return
+    user_id = current_tg_user.get(None)
+    if user_id is None:
+        logger.warning(
+            "tool_guard broadcaster: no current_tg_user, skipping req_id=%s",
+            frame.get("req_id"),
+        )
+        return
+    req_id = frame.get("req_id", "")
+    tool = frame.get("tool", "?")
+    danger = frame.get("danger_reason") or "(无具体原因)"
+    summary = _truncate_summary(str(frame.get("args_summary", "")))
+    timeout_s = int(frame.get("timeout_s", 30))
+    text = (
+        "⚠️ <b>工具调用待批准</b>\n"
+        f"工具: <code>{escape(tool)}</code>\n"
+        f"原因: {escape(str(danger))}\n"
+        f"超时: {timeout_s}s\n\n"
+        f"<pre>{escape(summary)}</pre>"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ 允许", callback_data=f"tool_ok:{req_id}"),
+        InlineKeyboardButton("❌ 拒绝", callback_data=f"tool_no:{req_id}"),
+    ]])
+    try:
+        await app.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as e:  # pragma: no cover - network dependent
+        logger.warning("tool_approval send failed for %s: %s", user_id, e)
+
+
 async def _notify_allowed_users(tg_app, payload: dict) -> None:
     """Session-watcher subscriber: DM every allowed user when a Claude Code
     session enters a waiting-for-confirmation state.
@@ -914,6 +1005,10 @@ def _register_session_watcher(tg_app) -> None:
         watcher.subscribe(_cb)
         watcher.start()
 
+        # Idempotent — register_broadcaster dedupes, so a reload-style
+        # double post_init wouldn't double-notify. Mirrors server.py.
+        tool_guard.register_broadcaster(_broadcast_tool_approval)
+
         async def _prewarm_stt():
             try:
                 backend = _get_stt_backend()
@@ -951,6 +1046,11 @@ def main():
     print("Roboot Telegram Bot 启动中...")
 
     app = Application.builder().token(token).build()
+    # Stash for the tool_guard broadcaster — must be set before _post_init
+    # registers the broadcaster, since the broadcaster reads this global
+    # to know which bot to send through.
+    global _tg_app
+    _tg_app = app
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
