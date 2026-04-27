@@ -49,6 +49,7 @@ def _isolate_paths(tmp_path, monkeypatch):
 def _reset_module_state():
     tool_guard._broadcasters.clear()
     tool_guard._pending.clear()
+    telegram_bot._pending_owner.clear()
     # Don't leak _tg_app between tests — main() sets it, tests stub it.
     prev_app = telegram_bot._tg_app
     yield
@@ -57,6 +58,7 @@ def _reset_module_state():
         if not fut.done():
             fut.cancel()
     tool_guard._pending.clear()
+    telegram_bot._pending_owner.clear()
     telegram_bot._tg_app = prev_app
     # Force `_get_runtime()` to rebuild on next call so its callback wiring
     # is exercised fresh in each test.
@@ -242,6 +244,66 @@ async def test_callback_stale_decision_says_timeout(monkeypatch):
 
     edit_text = q.edit_message_text.await_args.args[0]
     assert "已超时" in edit_text or "已处理" in edit_text
+
+
+async def test_callback_rejects_cross_user_click(monkeypatch):
+    """Owner-binding: only the triggering user can answer the modal.
+    A second allowed user who somehow learned the req_id (e.g. it was
+    cached, or a future multi-device pairing) must NOT be able to
+    approve someone else's tool call. Toast + don't touch the future."""
+    monkeypatch.setattr(telegram_bot, "_is_allowed", lambda _uid: True)
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    tool_guard._pending["xx"] = fut
+    telegram_bot._pending_owner["xx"] = 100  # request was for user 100
+
+    # User 200 clicks — different user.
+    q = _make_query(user_id=200, data="tool_ok:xx")
+    await telegram_bot.callback_handler(_make_update_with_query(q), context=None)
+
+    assert not fut.done(), "stranger's click must NOT resolve user 100's future"
+    # `query.answer()` is awaited twice: once unconditionally at the top
+    # of `callback_handler` (standard PTB acknowledge), once with
+    # show_alert=True in the cross-user branch. We only care that the
+    # alert variant fired.
+    alert_calls = [
+        c for c in q.answer.await_args_list if c.kwargs.get("show_alert")
+    ]
+    assert len(alert_calls) == 1
+    assert "不是你的" in alert_calls[0].args[0]
+    # No edit_message_text — we don't want to give the clicker UX feedback
+    # that mutates the message; just the toast via answer().
+    q.edit_message_text.assert_not_awaited()
+
+    # And the legitimate owner can still approve afterwards.
+    q2 = _make_query(user_id=100, data="tool_ok:xx")
+    await telegram_bot.callback_handler(_make_update_with_query(q2), context=None)
+    assert fut.done() and fut.result() is True
+
+
+async def test_broadcaster_send_failure_falls_through_to_timeout(
+    fake_app, set_user, monkeypatch
+):
+    """If `bot.send_message` raises (network blip, blocked, revoked bot
+    token), the gate must NOT silently succeed. The exception is swallowed
+    so the agent loop doesn't crash, but the future stays unresolved and
+    the gate's wait_for times out → REJECTED. This is the security
+    contract: any broadcaster failure → fail closed."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+    telegram_bot._tg_app = fake_app
+    fake_app.bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+    set_user(7)
+    tool_guard.register_broadcaster(telegram_bot._broadcast_tool_approval)
+
+    decision = await tool_guard.gate(
+        "shell",
+        {"command": "rm -rf /tmp/scratch"},
+        origin="telegram",
+        timeout=0.3,  # short — we WANT the timeout path
+    )
+    assert decision == tool_guard.Decision.REJECTED
+    # And the owner map shouldn't leak across broadcaster failures.
+    assert telegram_bot._pending_owner == {}
 
 
 # -----------------------------------------------------------------------------

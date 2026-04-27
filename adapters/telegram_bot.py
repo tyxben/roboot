@@ -587,7 +587,16 @@ async def callback_handler(update: Update, context) -> None:
     elif data.startswith("tool_ok:") or data.startswith("tool_no:"):
         approved = data.startswith("tool_ok:")
         req_id = data.split(":", 1)[1]
+        owner = _pending_owner.get(req_id)
+        # Refuse cross-user clicks: only the user the modal was sent to may
+        # answer. Without this, any allowed user who learned a req_id could
+        # approve another user's tool. The targeted DM doesn't enforce it
+        # by itself — callback_data is just bytes back to the bot.
+        if owner is not None and owner != user_id:
+            await query.answer("这不是你的批准请求", show_alert=True)
+            return
         resolved = tool_guard.resolve_decision(req_id, approved)
+        _pending_owner.pop(req_id, None)
         if not resolved:
             # Future already gone — user clicked after the 30s timeout, or
             # the daemon raced ahead and rejected. Tell them, don't pretend
@@ -911,6 +920,14 @@ async def handle_voice(update: Update, context) -> None:
 # closure so tests can swap it for a stub without touching post_init.
 _tg_app = None
 
+# Bind req_id → triggering Telegram user_id so the callback handler can
+# refuse cross-user clicks. The DM is targeted, but there is nothing in the
+# `tool_ok:<req_id>` callback_data itself that ties it to one user — without
+# this map any allowed user (or future second-device pairing) who learned
+# a req_id could approve someone else's tool call. We rely on dict ops being
+# atomic under the asyncio loop (no locks needed).
+_pending_owner: dict[str, int] = {}
+
 
 def _truncate_summary(text: str, limit: int = 600) -> str:
     """Inline-keyboard messages live in chat history forever. Cap the
@@ -941,13 +958,13 @@ async def _broadcast_tool_approval(frame: dict) -> None:
         return
     req_id = frame.get("req_id", "")
     tool = frame.get("tool", "?")
-    danger = frame.get("danger_reason") or "(无具体原因)"
+    danger = str(frame.get("danger_reason") or "(无具体原因)")
     summary = _truncate_summary(str(frame.get("args_summary", "")))
     timeout_s = int(frame.get("timeout_s", 30))
     text = (
         "⚠️ <b>工具调用待批准</b>\n"
         f"工具: <code>{escape(tool)}</code>\n"
-        f"原因: {escape(str(danger))}\n"
+        f"原因: {escape(danger)}\n"
         f"超时: {timeout_s}s\n\n"
         f"<pre>{escape(summary)}</pre>"
     )
@@ -955,6 +972,12 @@ async def _broadcast_tool_approval(frame: dict) -> None:
         InlineKeyboardButton("✅ 允许", callback_data=f"tool_ok:{req_id}"),
         InlineKeyboardButton("❌ 拒绝", callback_data=f"tool_no:{req_id}"),
     ]])
+    # Bind owner BEFORE sending. If the send fails, we still fail closed —
+    # the gate will time out at 30s, and the stale entry is cleaned up
+    # below. The window where _pending_owner has an entry but the user has
+    # no message to click on is harmless (no one can click).
+    if req_id:
+        _pending_owner[req_id] = user_id
     try:
         await app.bot.send_message(
             chat_id=user_id,
@@ -964,6 +987,7 @@ async def _broadcast_tool_approval(frame: dict) -> None:
         )
     except Exception as e:  # pragma: no cover - network dependent
         logger.warning("tool_approval send failed for %s: %s", user_id, e)
+        _pending_owner.pop(req_id, None)
 
 
 async def _notify_allowed_users(tg_app, payload: dict) -> None:
