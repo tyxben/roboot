@@ -920,21 +920,34 @@ function tokenizeUrl(url) {
   return url + sep + 'token=' + encodeURIComponent(LAN_TOKEN);
 }
 
+// Dedup guard: page-load fires loadSessions / checkFileVault / loadNetwork /
+// loadRelayInfo in quick succession; each 401 used to spawn its own
+// window.prompt(). The guard must be a *sync* boolean set BEFORE calling
+// prompt() — prompt() blocks the main thread, so microtask-based dedup
+// races. Reload-on-success means we don't need to reset on the success
+// path; only the cancel/invalid paths need to clear the flag in finally.
+var _tokenPromptInFlight = false;
 function promptForToken() {
-  var entered = window.prompt('需要配对令牌。请粘贴 Roboot 启动时打印的完整 URL：');
-  if (!entered) return;
+  if (_tokenPromptInFlight) return;
+  _tokenPromptInFlight = true;
   try {
-    var u = new URL(entered, window.location.origin);
-    var t = u.searchParams.get('token');
-    if (t) {
-      localStorage.setItem(LAN_TOKEN_KEY, t);
-      LAN_TOKEN = t;
-      window.location.reload();
-    } else {
-      alert('URL 中没有 token= 参数');
+    var entered = window.prompt('需要配对令牌。请粘贴 Roboot 启动时打印的完整 URL：');
+    if (!entered) return;
+    try {
+      var u = new URL(entered, window.location.origin);
+      var t = u.searchParams.get('token');
+      if (t) {
+        localStorage.setItem(LAN_TOKEN_KEY, t);
+        LAN_TOKEN = t;
+        window.location.reload();
+      } else {
+        alert('URL 中没有 token= 参数');
+      }
+    } catch (e) {
+      alert('URL 无效');
     }
-  } catch (e) {
-    alert('URL 无效');
+  } finally {
+    _tokenPromptInFlight = false;
   }
 }
 
