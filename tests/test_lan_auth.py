@@ -232,3 +232,128 @@ def test_attach_token_to_url_overwrites_stale_token(isolated_token):
     # Only the real token should appear; "stale" is gone.
     assert f"token={real_token}" in out
     assert "token=stale" not in out
+
+
+# ---------------------------------------------------------------------------
+# Loopback bypass — requests from 127.0.0.1 / ::1 skip the token check.
+# Same-user attacker on the same Mac can already read .auth/lan_token from
+# disk, so requiring a token on loopback is friction without a payoff.
+# ---------------------------------------------------------------------------
+
+
+def _make_request(client_host, *, query_string: bytes = b"") -> "Request":
+    """Build a Starlette Request whose ``client.host`` we control.
+
+    TestClient hard-codes client="testclient", so we have to drop down to
+    a raw ASGI scope to exercise the loopback bypass.
+    """
+    from fastapi import Request
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/ping",
+        "headers": [],
+        "query_string": query_string,
+        "client": (client_host, 0) if client_host is not None else None,
+    }
+    return Request(scope)
+
+
+class _StubWS:
+    """Minimal WebSocket stand-in for testing ``require_lan_token_ws``.
+
+    Only the attributes the function reads are populated. ``close()`` is
+    awaited on rejection but not on the loopback path, so it's a no-op
+    coroutine.
+    """
+
+    def __init__(self, client_host, *, subprotocols=None, query_string: str = ""):
+        self.client = type("C", (), {"host": client_host})() if client_host is not None else None
+        self.scope = {"subprotocols": subprotocols or []}
+        # Headers + query_params mimic Starlette's interface for the bits
+        # _extract_bearer_from_subprotocol / require_lan_token_ws read.
+        self.headers = {}
+        self.query_params = dict(
+            p.split("=", 1) for p in query_string.split("&") if "=" in p
+        )
+        self.closed_with: int | None = None
+
+    async def close(self, code: int = 1000) -> None:
+        self.closed_with = code
+
+
+@pytest.mark.asyncio
+async def test_rest_loopback_v4_skips_token_check(isolated_token):
+    """127.0.0.1 with no Authorization header must not raise."""
+    request = _make_request("127.0.0.1")
+    # No exception = pass.
+    await auth.require_lan_token(request, authorization=None)
+
+
+@pytest.mark.asyncio
+async def test_rest_loopback_v6_skips_token_check(isolated_token):
+    """::1 with no Authorization header must not raise."""
+    request = _make_request("::1")
+    await auth.require_lan_token(request, authorization=None)
+
+
+@pytest.mark.asyncio
+async def test_rest_lan_ip_still_requires_token(isolated_token):
+    """Regression pin — LAN clients (e.g. phones on Wi-Fi) keep getting 401."""
+    from fastapi import HTTPException
+
+    request = _make_request("192.168.1.50")
+    with pytest.raises(HTTPException) as excinfo:
+        await auth.require_lan_token(request, authorization=None)
+    assert excinfo.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_rest_no_client_falls_through(isolated_token):
+    """request.client == None (rare) must not crash; falls through to 401."""
+    from fastapi import HTTPException
+
+    request = _make_request(None)
+    with pytest.raises(HTTPException) as excinfo:
+        await auth.require_lan_token(request, authorization=None)
+    assert excinfo.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_ws_loopback_v4_returns_empty_string(isolated_token):
+    """127.0.0.1 WS gets a no-subprotocol pass; caller calls ws.accept()."""
+    ws = _StubWS("127.0.0.1")
+    out = await auth.require_lan_token_ws(ws)
+    assert out == ""
+    assert ws.closed_with is None
+
+
+@pytest.mark.asyncio
+async def test_ws_loopback_v6_returns_empty_string(isolated_token):
+    ws = _StubWS("::1")
+    out = await auth.require_lan_token_ws(ws)
+    assert out == ""
+    assert ws.closed_with is None
+
+
+@pytest.mark.asyncio
+async def test_ws_lan_ip_still_rejected_with_4401(isolated_token):
+    """Regression pin — LAN clients without a token are closed 4401."""
+    from fastapi import WebSocketDisconnect
+
+    ws = _StubWS("192.168.1.50")
+    with pytest.raises(WebSocketDisconnect):
+        await auth.require_lan_token_ws(ws)
+    assert ws.closed_with == 4401
+
+
+@pytest.mark.asyncio
+async def test_ws_no_client_falls_through(isolated_token):
+    """ws.client == None (rare) must not crash; falls through to 4401."""
+    from fastapi import WebSocketDisconnect
+
+    ws = _StubWS(None)
+    with pytest.raises(WebSocketDisconnect):
+        await auth.require_lan_token_ws(ws)
+    assert ws.closed_with == 4401

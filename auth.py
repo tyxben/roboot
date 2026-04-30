@@ -32,6 +32,15 @@ from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 from fastapi import Header, HTTPException, Request, WebSocket, status
 
 
+# Loopback addresses that bypass the token gate. The same-user attacker on
+# the same Mac can already read .auth/lan_token, config.yaml, soul.md, and
+# .identity/* from disk, so requiring a token on loopback is friction
+# without a defensive payoff. Only the literal IP forms — never trust a
+# Host header string like "localhost" because reverse proxies can rewrite
+# it; ``request.client.host`` comes from the socket and is reliable.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+
+
 # Where the token lives on disk. Overridable by tests.
 AUTH_DIR: Path = Path(__file__).parent / ".auth"
 TOKEN_PATH: Path = AUTH_DIR / "lan_token"
@@ -139,7 +148,14 @@ async def require_lan_token(
         * ``?token=<token>`` query param (fallback; uvicorn logs it, so
           the console.html frontend strips it immediately after first
           load).
+
+    Loopback bypass: requests originating from 127.0.0.1 or ::1 skip the
+    token check entirely. See ``_LOOPBACK_HOSTS`` for rationale.
     """
+    client = request.client
+    if client is not None and client.host in _LOOPBACK_HOSTS:
+        return
+
     expected = load_or_generate_token()
 
     token: Optional[str] = None
@@ -167,8 +183,16 @@ async def require_lan_token_ws(ws: WebSocket) -> str:
     pass that string to ``ws.accept(subprotocol=...)``. Closes the socket
     with code 4401 and raises ``WebSocketDisconnect`` on failure so the
     endpoint coroutine exits cleanly.
+
+    Loopback bypass: connections from 127.0.0.1 or ::1 skip the token
+    check and return ``""`` so the caller can ``ws.accept()`` with no
+    subprotocol. See ``_LOOPBACK_HOSTS`` for rationale.
     """
     from fastapi import WebSocketDisconnect
+
+    client = ws.client
+    if client is not None and client.host in _LOOPBACK_HOSTS:
+        return ""
 
     expected = load_or_generate_token()
     token = _extract_bearer_from_subprotocol(ws)
