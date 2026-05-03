@@ -737,6 +737,16 @@ class RelayClient:
             except Exception:
                 pass
 
+    async def _broadcast_sessions_changed(self, frame: dict) -> None:
+        """Fan a `sessions_changed` frame to every paired client that has
+        opted in via `get_sessions`. Skipping clients that never asked for
+        sessions data avoids waking idle phones in the background."""
+        for cid in list(self._sessions_subscribed):
+            try:
+                await self._send_to_client(cid, frame)
+            except Exception:
+                pass
+
     def stop(self):
         """Stop the relay connection gracefully."""
         self.running = False

@@ -103,6 +103,14 @@ class SessionWatcher:
         # session_id -> "idle" | "waiting"
         self._states: dict[str, str] = {}
         self._subscribers: list[Subscriber] = []
+        # Subscribers fired on the *set* of session ids changing (add or
+        # remove). Distinct from `_subscribers` which only fires on
+        # idle->waiting prompt transitions.
+        self._sessions_changed_subscribers: list[Callable[[], Awaitable[None]]] = []
+        # None = uninitialized; first successful poll seeds it without
+        # broadcasting, so a daemon restart does not look like "all sessions
+        # appeared". Subsequent polls compare against this set.
+        self._prev_session_ids: set[str] | None = None
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -115,6 +123,18 @@ class SessionWatcher:
         raised by the callback are caught and logged.
         """
         self._subscribers.append(callback)
+
+    def subscribe_sessions_changed(
+        self, callback: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Register an async callback invoked when the set of iTerm2 session
+        ids changes between polls (a window/tab is opened or closed).
+
+        Callback takes no arguments — subscribers re-fetch the full list
+        themselves. Exceptions are caught and logged. The first successful
+        poll does NOT fire (initial state, not a change).
+        """
+        self._sessions_changed_subscribers.append(callback)
 
     # --- Lifecycle ---
 
@@ -165,8 +185,20 @@ class SessionWatcher:
         try:
             sessions = await bridge.list_sessions()
         except Exception as e:
+            # Swallow and bail without touching `_prev_session_ids` — a
+            # transient iTerm2 hiccup must not look like "every session
+            # disappeared" on the next successful poll.
             logger.debug("[watcher] list_sessions failed: %s", e)
             return
+
+        current_ids: set[str] = {s.session_id for s in sessions}
+        if self._prev_session_ids is None:
+            # First successful poll: seed silently. Daemon restart should
+            # not cause a spurious "everything new" broadcast.
+            self._prev_session_ids = current_ids
+        elif current_ids != self._prev_session_ids:
+            self._prev_session_ids = current_ids
+            await self._notify_sessions_changed()
 
         seen_ids: set[str] = set()
         for s in sessions:
@@ -213,6 +245,14 @@ class SessionWatcher:
                 await cb(payload)
             except Exception as e:
                 logger.warning("[watcher] subscriber %r failed: %s", cb, e)
+
+    async def _notify_sessions_changed(self) -> None:
+        """Fan out to every sessions-changed subscriber, isolating failures."""
+        for cb in list(self._sessions_changed_subscribers):
+            try:
+                await cb()
+            except Exception as e:
+                logger.warning("[watcher] sessions_changed subscriber %r failed: %s", cb, e)
 
 
 # Module-level singleton used by server.py + adapters.telegram_bot.

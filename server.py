@@ -550,6 +550,37 @@ async def _broadcast_tool_approval(frame: dict) -> None:
             pass
 
 
+async def _broadcast_sessions_changed() -> None:
+    """Push a content-free `sessions_changed` frame to every active console
+    so the frontend re-fetches via its existing `loadSessions()` path.
+
+    Mirrors the fan-out shape of `_broadcast_waiting_notification`: snapshot
+    the WS set, isolate per-client failures, forward to relay clients via
+    their event loop. Sending the bare type keeps the wire payload tiny and
+    avoids duplicating the canonical session list (the GET endpoint stays
+    the source of truth).
+    """
+    frame = {"type": "sessions_changed"}
+    dead: list[WebSocket] = []
+    for client_ws in list(_active_ws_clients):
+        try:
+            await client_ws.send_json(frame)
+        except Exception:
+            dead.append(client_ws)
+    for client_ws in dead:
+        _active_ws_clients.discard(client_ws)
+    # Forward to paired mobile clients via the relay (best-effort).
+    global _relay_client
+    relay = _relay_client
+    if relay is not None and getattr(relay, "_loop", None) is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                relay._broadcast_sessions_changed(frame), relay._loop
+            )
+        except Exception:
+            pass
+
+
 def _register_soul_review_broadcaster() -> None:
     """Idempotent registration (startup hooks can fire repeatedly under
     some reload scenarios; soul_review.register_broadcaster dedupes)."""
@@ -564,6 +595,7 @@ def _register_tool_guard_broadcaster() -> None:
 @app.on_event("startup")
 async def _start_session_watcher():
     _session_watcher.subscribe(_broadcast_waiting_notification)
+    _session_watcher.subscribe_sessions_changed(_broadcast_sessions_changed)
     _session_watcher.start()
     _register_soul_review_broadcaster()
     _register_tool_guard_broadcaster()

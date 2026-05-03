@@ -1507,6 +1507,11 @@ function connectWS() {
       // Daemon is asking permission to run a gated tool call (today: shell
       // with a danger pattern). Queue + show modal.
       handleToolApproval(data);
+
+    } else if (data.type === 'sessions_changed') {
+      // iTerm2 window/tab opened or closed — refresh the left panel.
+      // Frame carries no payload; loadSessions() does the GET itself.
+      loadSessions();
     }
   };
   ws.onclose = function() { ws = null; };

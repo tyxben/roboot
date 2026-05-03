@@ -226,6 +226,115 @@ def test_sanitize_prompt_line_truncates_and_is_idempotent():
     assert once == twice
 
 
+def _collect_sessions_changed_subscriber():
+    calls: list[None] = []
+
+    async def cb():
+        calls.append(None)
+
+    return cb, calls
+
+
+async def test_sessions_changed_fires_on_add_and_remove(fake_bridge):
+    """The diff must broadcast on both add and remove, and the very first
+    poll must NOT broadcast (initial seed, not a change)."""
+    watcher = SessionWatcher()
+    cb, calls = _collect_sessions_changed_subscriber()
+    watcher.subscribe_sessions_changed(cb)
+
+    # Poll 1: [A, B] -> initial seed, NO broadcast.
+    fake_bridge.sessions[:] = [
+        FakeSess(session_id="A", project="p"),
+        FakeSess(session_id="B", project="p"),
+    ]
+    await watcher.poll_once()
+    assert calls == []
+
+    # Poll 2: [A, B, C] -> add, fires.
+    fake_bridge.sessions.append(FakeSess(session_id="C", project="p"))
+    await watcher.poll_once()
+    assert len(calls) == 1
+
+    # Poll 3: [A, B, C] unchanged -> no fire.
+    await watcher.poll_once()
+    assert len(calls) == 1
+
+    # Poll 4: [A] -> remove, fires.
+    fake_bridge.sessions[:] = [FakeSess(session_id="A", project="p")]
+    await watcher.poll_once()
+    assert len(calls) == 2
+
+
+async def test_sessions_changed_silent_after_bridge_exception(monkeypatch):
+    """If list_sessions raises, the diff state must NOT advance — otherwise
+    a transient iTerm hiccup followed by recovery would look like every
+    session reappeared and fire a spurious broadcast."""
+
+    class FlakyBridge:
+        def __init__(self):
+            self.sessions = [
+                FakeSess(session_id="A", project="p"),
+                FakeSess(session_id="B", project="p"),
+            ]
+            self._call = 0
+
+        async def list_sessions(self):
+            self._call += 1
+            if self._call == 2:
+                raise RuntimeError("iterm2 hiccup")
+            return list(self.sessions)
+
+        async def read_session(self, *a, **k):
+            return ""
+
+    bridge = FlakyBridge()
+    module = types.ModuleType("iterm_bridge")
+    module.bridge = bridge
+    monkeypatch.setitem(sys.modules, "iterm_bridge", module)
+
+    watcher = SessionWatcher()
+    cb, calls = _collect_sessions_changed_subscriber()
+    watcher.subscribe_sessions_changed(cb)
+
+    # Poll 1: success, seed silently.
+    await watcher.poll_once()
+    assert calls == []
+    assert watcher._prev_session_ids == {"A", "B"}
+
+    # Poll 2: bridge raises. State must NOT advance and callback must not fire.
+    await watcher.poll_once()
+    assert calls == []
+    assert watcher._prev_session_ids == {"A", "B"}
+
+    # Poll 3: bridge recovers with the same set — still no spurious diff.
+    await watcher.poll_once()
+    assert calls == []
+    assert watcher._prev_session_ids == {"A", "B"}
+
+
+async def test_sessions_changed_subscriber_failure_isolated(fake_bridge):
+    """One throwing subscriber must not block the others."""
+    watcher = SessionWatcher()
+
+    async def boom():
+        raise RuntimeError("nope")
+
+    good_calls: list[None] = []
+
+    async def good():
+        good_calls.append(None)
+
+    watcher.subscribe_sessions_changed(boom)
+    watcher.subscribe_sessions_changed(good)
+
+    # Seed.
+    await watcher.poll_once()
+    # Trigger a real change.
+    fake_bridge.sessions.append(FakeSess(session_id="sess-2", project="p"))
+    await watcher.poll_once()
+    assert len(good_calls) == 1
+
+
 async def test_notify_sanitizes_prompt_line_before_subscribers(fake_bridge):
     """Subscribers must receive a sanitized prompt_line, not the raw
     terminal bytes — prompt-injection + XSS defense-in-depth."""

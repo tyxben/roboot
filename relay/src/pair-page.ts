@@ -1264,6 +1264,11 @@ function connectWS() {
       // Daemon wants permission to run a gated tool call (today: shell
       // with a danger pattern). Queue + show modal.
       handleToolApproval(data);
+    } else if (data.type === 'sessions_changed') {
+      // iTerm2 window/tab opened or closed — re-issue get_sessions so the
+      // panel matches reality. loadSessions() is already a no-op when the
+      // socket is not open, so this is safe pre-handshake.
+      loadSessions();
     }
   };
 
