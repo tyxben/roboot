@@ -84,9 +84,15 @@ def _seed_messages(session: Any, messages: list[dict]) -> int:
         logger.warning("Arcana Message import failed: %s", e)
         return 0
 
+    # Only replay user turns. Assistant replies in chat_store may include
+    # hallucinated "已经做过了" claims (DeepSeek tends to dodge destructive
+    # commands by faking success). Re-seeding those across reconnects makes
+    # the model double down on the lie next session — it sees its own past
+    # claim as ground truth and skips the real tool call. User messages are
+    # authoritative records of what was asked; the model can re-derive
+    # context from them without trusting unaudited prior replies.
     role_map = {
         "user": MessageRole.USER,
-        "assistant": MessageRole.ASSISTANT,
     }
 
     # Resolve the backing message list. Prefer a public attribute if
@@ -131,19 +137,16 @@ def _fallback_context_summary(messages: list[dict]) -> str | None:
     """
     if not messages:
         return None
+    # User-only, mirroring the _seed_messages policy: assistant turns may
+    # contain hallucinated success claims and re-feeding them lets the
+    # model double down. Replay only what the user actually asked.
     lines = []
     for m in messages:
         role = (m.get("role") or "").lower()
         content = (m.get("content") or "").strip()
-        if not content:
+        if not content or role != "user":
             continue
-        if role == "user":
-            lines.append(f"User: {content}")
-        elif role == "assistant":
-            # Trim assistant turns hard — replays shouldn't blow the
-            # context window. 200 chars keeps flavor without bloat.
-            snippet = content if len(content) <= 200 else content[:200] + "..."
-            lines.append(f"Assistant: {snippet}")
+        lines.append(f"User: {content}")
     if not lines:
         return None
     joined = "\n".join(lines)

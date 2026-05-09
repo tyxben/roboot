@@ -38,9 +38,14 @@ class FakeChatSession:
 # -----------------------------------------------------------------------------
 
 
-async def test_replay_history_seeds_last_n_in_order(monkeypatch):
-    """chat_store returns oldest-first; memory must seed them in the same
-    order, preserving roles, after the system prompt."""
+async def test_replay_history_seeds_only_user_turns_in_order(monkeypatch):
+    """chat_store returns oldest-first; memory seeds user turns only.
+
+    Assistant replies are dropped on purpose: a hallucinated success claim
+    in chat_store would otherwise be re-seeded next session, and the model
+    treats its own past words as ground truth (DeepSeek will skip the real
+    tool call). User messages are authoritative; assistant replies aren't.
+    """
     history = [
         {"role": "user", "content": "msg 1"},
         {"role": "assistant", "content": "reply 1"},
@@ -58,12 +63,11 @@ async def test_replay_history_seeds_last_n_in_order(monkeypatch):
     session = FakeChatSession()
     seeded = await memory.replay_history(session, "s-abc")
 
-    assert seeded == 4
-    # System prompt still first, then the 4 replayed turns.
+    assert seeded == 2
     roles = [str(m.role.value) for m in session._messages]
     contents = [m.content for m in session._messages]
-    assert roles == ["system", "user", "assistant", "user", "assistant"]
-    assert contents == ["sys", "msg 1", "reply 1", "msg 2", "reply 2"]
+    assert roles == ["system", "user", "user"]
+    assert contents == ["sys", "msg 1", "msg 2"]
 
 
 async def test_replay_history_noop_on_empty(monkeypatch):
@@ -95,11 +99,13 @@ async def test_replay_history_noop_when_no_session_id(monkeypatch):
 
 
 async def test_replay_history_skips_unknown_roles(monkeypatch):
-    """Tool-role messages (or weird rows) get skipped, not crashed on."""
+    """Tool-role and assistant messages get skipped (assistant by policy,
+    tool/unknown because their schema doesn't match a chat turn). Empty
+    content is also skipped."""
     history = [
         {"role": "user", "content": "hi"},
         {"role": "tool", "content": "tool output"},  # unknown -> skip
-        {"role": "assistant", "content": "bye"},
+        {"role": "assistant", "content": "bye"},  # by policy -> skip
         {"role": "user", "content": ""},  # empty content -> skip
     ]
 
@@ -110,10 +116,10 @@ async def test_replay_history_skips_unknown_roles(monkeypatch):
 
     session = FakeChatSession()
     seeded = await memory.replay_history(session, "sid")
-    assert seeded == 2  # only the user+assistant with non-empty content
+    assert seeded == 1  # only the non-empty user turn
 
     contents = [m.content for m in session._messages]
-    assert contents == ["sys", "hi", "bye"]
+    assert contents == ["sys", "hi"]
 
 
 async def test_replay_history_respects_limit_argument(monkeypatch):
