@@ -404,66 +404,79 @@ async def websocket_endpoint(ws: WebSocket):
     name = get_name()
     await ws.send_json({"type": "response", "content": f"Hey，我是 {name}。有什么事？"})
 
+    # Reader/runner split: the WS receive loop must keep pumping while a
+    # chat turn is in-flight, otherwise tool_approval/soul_review decision
+    # frames sit unread and the gate always times out. User-input frames go
+    # onto a queue so chat turns still serialize one-at-a-time per session.
+    chat_queue: asyncio.Queue = asyncio.Queue()
+
+    async def chat_runner() -> None:
+        global _chat_in_flight
+        while True:
+            user_text = await chat_queue.get()
+            if user_text is None:  # shutdown sentinel
+                return
+            _chat_in_flight += 1
+            origin_token = tool_guard.current_origin.set("local")
+            try:
+                await handle_chat(
+                    session,
+                    user_text,
+                    ws.send_json,
+                    history_session_id=history_session_id,
+                )
+            except Exception as e:
+                try:
+                    await ws.send_json({"type": "error", "content": str(e)})
+                except Exception:
+                    pass
+            finally:
+                tool_guard.current_origin.reset(origin_token)
+                _chat_in_flight -= 1
+            memory.record_turn_and_maybe_distill(history_session_id, runtime=runtime)
+
+    runner_task = asyncio.create_task(chat_runner())
+
     try:
         while True:
-            try:
-                data = await ws.receive_text()
-                msg = json.loads(data)
-                # soul_review decisions arrive out-of-band from chat turns;
-                # resolve the pending future and move on (stale req_ids are
-                # fine — user may have clicked after the timeout fired).
-                if msg.get("type") == "soul_review_decision":
-                    soul_review.resolve_decision(
-                        msg.get("req_id", ""), bool(msg.get("approved"))
-                    )
-                    continue
-                if msg.get("type") == "tool_approval_decision":
-                    tool_guard.resolve_decision(
-                        msg.get("req_id", ""), bool(msg.get("approved"))
-                    )
-                    continue
-                # A client that wants to resume sends `resume_session_id` on
-                # its first payload. We replay once, then stick to the new
-                # history_session_id going forward so we don't double-record.
-                if prior_history_id is None:
-                    rid = msg.get("resume_session_id")
-                    if rid:
-                        prior_history_id = rid
-                        try:
-                            await memory.replay_history(session, rid)
-                        except Exception as e:
-                            print(f"[memory] replay_history failed: {e}")
-                user_text = msg.get("content", "").strip()
-                if not user_text:
-                    continue
-
-                global _chat_in_flight
-                _chat_in_flight += 1
-                # Tag this chat turn's origin so any tool_guard audit record
-                # logs `local` (LAN console) rather than the contextvar's
-                # default. Token-based reset keeps siblings unaffected.
-                origin_token = tool_guard.current_origin.set("local")
-                try:
-                    await handle_chat(
-                        session,
-                        user_text,
-                        ws.send_json,
-                        history_session_id=history_session_id,
-                    )
-                finally:
-                    tool_guard.current_origin.reset(origin_token)
-                    _chat_in_flight -= 1
-                # Layer B: count turns; when the window fills, schedule a
-                # background distillation pass.
-                memory.record_turn_and_maybe_distill(
-                    history_session_id, runtime=runtime
+            data = await ws.receive_text()
+            msg = json.loads(data)
+            # soul_review decisions arrive out-of-band from chat turns;
+            # resolve the pending future and move on (stale req_ids are
+            # fine — user may have clicked after the timeout fired).
+            if msg.get("type") == "soul_review_decision":
+                soul_review.resolve_decision(
+                    msg.get("req_id", ""), bool(msg.get("approved"))
                 )
-
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                await ws.send_json({"type": "error", "content": str(e)})
+                continue
+            if msg.get("type") == "tool_approval_decision":
+                tool_guard.resolve_decision(
+                    msg.get("req_id", ""), bool(msg.get("approved"))
+                )
+                continue
+            # A client that wants to resume sends `resume_session_id` on
+            # its first payload. We replay once, then stick to the new
+            # history_session_id going forward so we don't double-record.
+            if prior_history_id is None:
+                rid = msg.get("resume_session_id")
+                if rid:
+                    prior_history_id = rid
+                    try:
+                        await memory.replay_history(session, rid)
+                    except Exception as e:
+                        print(f"[memory] replay_history failed: {e}")
+            user_text = msg.get("content", "").strip()
+            if not user_text:
+                continue
+            await chat_queue.put(user_text)
+    except WebSocketDisconnect:
+        pass
     finally:
+        await chat_queue.put(None)
+        try:
+            await asyncio.wait_for(runner_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            runner_task.cancel()
         _active_ws_clients.discard(ws)
 
 
