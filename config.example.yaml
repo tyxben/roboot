@@ -121,11 +121,17 @@ remote_access:
 #                                                 console + relay mobile +
 #                                                 Telegram inline keyboard
 #
-# Both gates default to `off` for backwards compatibility. If your daemon
-# routinely accepts input from untrusted surfaces (Telegram, paired remote
-# clients, session_watcher reading sessions you don't fully control), the
-# hardening recommendation in SECURITY.md is `log` to build an audit trail
-# without modals, or `confirm` for active approval.
+# Both gates default to `off` for backwards compatibility, NOT as a
+# recommendation. Pick by the agent's actual exposure:
+#
+#   localhost-only, no Telegram, no relay, no untrusted session_watcher
+#     -> log     (audit trail, no modal friction)
+#   Telegram bot listening / paired mobile via relay /
+#   session_watcher reading sessions where untrusted text can land
+#     -> confirm (modal stops prompt-injection -> rm -rf chains)
+#
+# Same recipe for both ROBOOT_TOOL_APPROVAL and ROBOOT_SOUL_REVIEW.
+# Full deployment matrix + reasoning: SECURITY.md §7.
 #
 # Other env vars worth knowing:
 #   ROBOOT_AUTO_UPGRADE=1                -- enable hourly self-upgrade loop

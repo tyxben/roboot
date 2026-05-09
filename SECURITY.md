@@ -108,7 +108,17 @@ Allowlist at `~/.roboot/tool_allowlist.json` (per-machine, gitignored) lets the 
 
 The callback fails *closed*: any unexpected exception inside the gate returns False, surfacing `CONFIRMATION_REJECTED` to the agent rather than waving the call through. Telegram surface DMs only the *triggering user* (read from a contextvar set at message-receive boundary); cross-user clicks on the inline-keyboard message are rejected with a toast and don't touch the future, so a stranger who learns a `req_id` cannot approve another user's tool. Audit records under `.tool_audit/<ts>-<random>-<tool>-<status>.json` log every approved/rejected/timed-out/oversize call so a forensic trail exists even when the user clicks through quickly.
 
-This **replaces** the legacy 8-entry substring blacklist in `tools/shell.py` (which returned a hardcoded "拒绝执行危险命令" string for matched substrings, gave the agent no useful error for everything else, and offered no mobile UX or audit trail). With `ROBOOT_TOOL_APPROVAL=off`, dangerous commands now run unconditionally — the gate IS the protection. Hardening recommendation: ship `log` to build an audit trail without modals, or `confirm` if the daemon routinely accepts input from untrusted surfaces (Telegram, paired remote clients, `session_watcher` reading sessions you don't fully control).
+This **replaces** the legacy 8-entry substring blacklist in `tools/shell.py` (which returned a hardcoded "拒绝执行危险命令" string for matched substrings, gave the agent no useful error for everything else, and offered no mobile UX or audit trail). With `ROBOOT_TOOL_APPROVAL=off`, dangerous commands now run unconditionally — the gate IS the protection.
+
+**Deployment recommendation.** Pick by the agent's actual exposure, not by what's installed:
+
+| Setup | `ROBOOT_TOOL_APPROVAL` | `ROBOOT_SOUL_REVIEW` | Why |
+| --- | --- | --- | --- |
+| `localhost`-only console, no Telegram, no relay, no `session_watcher` reading untrusted sessions | `log` | `log` | Only you reach the agent. Modals are friction; the audit trail still catches surprises. |
+| Any of: Telegram bot listening, paired mobile via relay, `session_watcher` reading sessions where untrusted text can land (Claude Code on PRs / issues / web content) | **`confirm`** | **`confirm`** | Each is a prompt-injection vector. Modal is what stops a malicious tail from chaining into `rm -rf` or rewriting `soul.md`. |
+| Public-facing daemon (don't) | not supported | not supported | Roboot has no auth model for this. Don't. |
+
+`off` is the legacy default for backwards compatibility, not a recommendation. Use `log` as the floor unless you explicitly want pre-v0.4 behavior.
 
 ## 8. What to do if your pairing URL leaks
 
