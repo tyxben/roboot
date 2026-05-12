@@ -80,7 +80,10 @@ from tools.claude_code import (
     send_to_session,
     create_claude_session,
 )
-from tools.vision import screenshot
+try:
+    from tools.vision import screenshot
+except ImportError:
+    screenshot = None
 from tools.soul import build_personality, summarize_sessions
 from tools.voice_switch import current_tg_user, switch_tts_voice
 
@@ -92,9 +95,10 @@ ALL_TOOLS = [
     read_session,
     send_to_session,
     create_claude_session,
-    screenshot,
     switch_tts_voice,
 ]
+if screenshot is not None:
+    ALL_TOOLS.append(screenshot)
 
 
 def _load_config() -> dict:
