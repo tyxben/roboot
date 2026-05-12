@@ -20,7 +20,7 @@ jobs:
       - name: Install package
         run: |
           pip install --upgrade pip
-          pip install -e .
+          pip install -e '.[telegram]'
           pip install pytest pytest-asyncio
 
       - name: Run tests

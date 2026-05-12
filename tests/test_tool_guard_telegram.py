@@ -23,6 +23,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+pytest.importorskip("telegram")
+
 import arcana
 import tool_guard
 from tools.voice_switch import current_tg_user
