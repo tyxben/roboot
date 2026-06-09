@@ -23,21 +23,18 @@ Layer B -- long-term distillation (`TurnCounter` + `maybe_distill`)
 
 Arcana API notes (verified at runtime against arcana-agent 0.4.x)
 -----------------------------------------------------------------
-`ChatSession` has no public `add_message` / `history.extend` seeding
-method. The `history` property returns a **copy** of non-system messages
-as dicts, so `session.history.append(...)` is a no-op.
+Arcana 1.0 exposes a public seeding API: `ChatSession.seed_history(
+list[Message] | list[dict])`, which appends after the system prompt and
+before any future `send()` — exactly the cold-start restore we want.
+`_seed_messages` uses it when present and only falls back to appending to
+the private `session._messages: list[Message]` backing list for older
+Arcana (pre-1.0) that lacks the public seeder.
 
-The actual backing list is `session._messages: list[Message]`, starting
-with the system prompt at index 0. Public seeding API: absent. We append
-`arcana.runtime.conversation.Message(role=MessageRole.USER/ASSISTANT,
-content=...)` to `_messages` directly. This is a stable internal — Arcana
-exposes `Message`, `MessageRole`, and `ChatSession.history` in its public
-surface, just not a combined seeding entrypoint.
-
-If a future Arcana version exposes a seeding API, `_seed_messages` is the
-only place to update. If `_messages` disappears entirely, `replay_history`
-falls back to injecting a single synthetic `user` message summarizing the
-prior turns — so the feature degrades gracefully instead of blowing up.
+`Message` / `MessageRole` come from `arcana.contracts.llm` (canonical) with
+`arcana.runtime.conversation` as a re-export. If `seed_history` and
+`_messages` are both unreachable, `replay_history` falls back to injecting a
+single synthetic `user` message summarizing the prior turns — so the
+feature degrades gracefully instead of blowing up.
 """
 
 from __future__ import annotations
@@ -95,8 +92,36 @@ def _seed_messages(session: Any, messages: list[dict]) -> int:
         "user": MessageRole.USER,
     }
 
-    # Resolve the backing message list. Prefer a public attribute if
-    # present; fall back to the private `_messages` that Arcana 0.4.x uses.
+    # Build the user-only Message objects first, independent of how we
+    # actually inject them.
+    seed: list = []
+    for m in messages:
+        role = role_map.get((m.get("role") or "").lower())
+        content = m.get("content") or ""
+        if role is None or not content:
+            continue
+        try:
+            seed.append(Message(role=role, content=content))
+        except Exception as e:
+            logger.warning("Failed to build replay Message: %s", e)
+            continue
+    if not seed:
+        return 0
+
+    # Arcana 1.0 exposes a public seeding API (ChatSession.seed_history) that
+    # appends after the system prompt and before any future send() — exactly
+    # our semantics. Prefer it over poking the private `_messages` list.
+    seed_history = getattr(session, "seed_history", None)
+    if callable(seed_history):
+        try:
+            seed_history(seed)
+            return len(seed)
+        except Exception as e:
+            logger.warning("ChatSession.seed_history failed, falling back: %s", e)
+
+    # Fallback for older Arcana (no public seeder): append to the private
+    # backing list directly. If it disappears entirely, the caller drops to a
+    # synthetic context summary, so replay degrades instead of crashing.
     backing = None
     if hasattr(session, "_messages") and isinstance(session._messages, list):
         backing = session._messages
@@ -112,13 +137,9 @@ def _seed_messages(session: Any, messages: list[dict]) -> int:
         return 0
 
     seeded = 0
-    for m in messages:
-        role = role_map.get((m.get("role") or "").lower())
-        content = m.get("content") or ""
-        if role is None or not content:
-            continue
+    for msg in seed:
         try:
-            backing.append(Message(role=role, content=content))
+            backing.append(msg)
             seeded += 1
         except Exception as e:
             logger.warning("Failed to seed one message into ChatSession: %s", e)

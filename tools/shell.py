@@ -21,7 +21,12 @@ import arcana
     when_to_use="当用户让你在电脑上做任何事情：查文件、开应用、跑命令、查系统信息、操作 git 等",
     what_to_expect="命令的 stdout/stderr 输出，最多 4000 字符",
     failure_meaning="命令执行失败或超时，检查命令是否正确",
-    side_effect="read",
+    # write, not read: this executes arbitrary commands. side_effect="read"
+    # let Arcana schedule it concurrently with genuine read tools; "write"
+    # serializes it like claude_code send/create and soul writes. The
+    # approval gate fires either way (requires_confirmation), but the
+    # metadata must not claim this is side-effect-free.
+    side_effect="write",
     requires_confirmation=True,
 )
 async def shell(command: str) -> str:
