@@ -14,8 +14,6 @@ hop at a time, re-validating each Location's host — so a public URL can't 302
 you onto an internal one.
 """
 
-from __future__ import annotations
-
 import html
 import ipaddress
 import logging

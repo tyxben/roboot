@@ -240,3 +240,34 @@ async def test_schedule_list_cancel_round_trip(origin):
 
 async def test_cancel_unknown_id(origin):
     assert "未找到" in await scheduler.cancel_reminder(99999)
+
+
+# ---------------------------------------------------------------------------
+# Per-telegram-user isolation + int coercion
+# ---------------------------------------------------------------------------
+
+
+def test_list_and_cancel_scoped_by_target():
+    now = time.time()
+    a = scheduler._add_sync("A 的提醒", now + 100, 0, "telegram", "111")
+    b = scheduler._add_sync("B 的提醒", now + 100, 0, "telegram", "222")
+    # User A sees only A's.
+    rows = scheduler._list_pending_sync(["telegram"], "111")
+    assert [r["id"] for r in rows] == [a]
+    # User B cannot cancel A's reminder.
+    assert scheduler._cancel_sync(a, "telegram", "222") is False
+    # A can.
+    assert scheduler._cancel_sync(a, "telegram", "111") is True
+    assert {r["id"] for r in scheduler._list_pending_sync(["telegram"], None)} == {b}
+
+
+async def test_schedule_reminder_coerces_string_int(origin):
+    # A provider that ignores the integer schema and sends "600" must still work
+    # (not crash on '600' < 0).
+    out = await scheduler.schedule_reminder("喝水", delay_seconds="600")
+    assert "已设置提醒 #" in out
+    assert len(scheduler._list_pending_sync(["local"])) == 1
+
+
+async def test_schedule_reminder_rejects_garbage(origin):
+    assert "整数" in await scheduler.schedule_reminder("x", delay_seconds="abc")

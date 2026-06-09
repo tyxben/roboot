@@ -27,8 +27,6 @@ picks it up. So the common case ("set from console, fires on console") is
 instant.
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import sqlite3
@@ -103,20 +101,25 @@ def _add_sync(
         return int(cur.lastrowid)
 
 
-def _list_pending_sync(origins: list[str] | None) -> list[dict]:
+def _list_pending_sync(
+    origins: list[str] | None, target: str | None = None
+) -> list[dict]:
+    where = ["fired=0"]
+    args: list = []
+    if origins:
+        where.append(f"origin IN ({','.join('?' for _ in origins)})")
+        args.extend(origins)
+    if target is not None:
+        # Per-user scope within a surface (Telegram): one user must not see
+        # another's reminders even though they share origin='telegram'.
+        where.append("target=?")
+        args.append(target)
     with closing(_connect()) as conn:
-        if origins:
-            qs = ",".join("?" for _ in origins)
-            rows = conn.execute(
-                f"SELECT id, text, due_at, repeat_seconds, origin, target FROM reminders"
-                f" WHERE fired=0 AND origin IN ({qs}) ORDER BY due_at ASC",
-                tuple(origins),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT id, text, due_at, repeat_seconds, origin, target FROM reminders"
-                " WHERE fired=0 ORDER BY due_at ASC"
-            ).fetchall()
+        rows = conn.execute(
+            "SELECT id, text, due_at, repeat_seconds, origin, target FROM reminders"
+            " WHERE " + " AND ".join(where) + " ORDER BY due_at ASC",
+            tuple(args),
+        ).fetchall()
     return [
         {
             "id": r[0],
@@ -130,20 +133,24 @@ def _list_pending_sync(origins: list[str] | None) -> list[dict]:
     ]
 
 
-def _cancel_sync(reminder_id: int, origin: str | None) -> bool:
-    """Cancel a pending reminder. If `origin` is given, only cancel a reminder
-    with that origin — so a Telegram user can't cancel a console reminder by
-    guessing its id and vice-versa."""
+def _cancel_sync(
+    reminder_id: int, origin: str | None, target: str | None = None
+) -> bool:
+    """Cancel a pending reminder, scoped to (origin, target) so a Telegram user
+    can't cancel a console reminder — nor ANOTHER Telegram user's — by guessing
+    its id. target adds the per-user scope within the telegram surface."""
+    where = ["id=?", "fired=0"]
+    args: list = [reminder_id]
+    if origin is not None:
+        where.append("origin=?")
+        args.append(origin)
+    if target is not None:
+        where.append("target=?")
+        args.append(target)
     with closing(_connect()) as conn:
-        if origin is not None:
-            cur = conn.execute(
-                "DELETE FROM reminders WHERE id=? AND fired=0 AND origin=?",
-                (reminder_id, origin),
-            )
-        else:
-            cur = conn.execute(
-                "DELETE FROM reminders WHERE id=? AND fired=0", (reminder_id,)
-            )
+        cur = conn.execute(
+            "DELETE FROM reminders WHERE " + " AND ".join(where), tuple(args)
+        )
         return cur.rowcount > 0
 
 
@@ -367,6 +374,24 @@ def _current_target(origin: str) -> str | None:
     return None
 
 
+def coerce_int(value, default: int = 0) -> int | None:
+    """Best-effort int from an LLM-supplied arg. Returns None if it isn't a
+    whole number. Defense-in-depth: the @arcana.tool int schema makes providers
+    send real ints, but a provider that ignores the schema (e.g. sends '600')
+    must not crash the tool on a '600' < 0 comparison."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):  # NaN / inf
+        return None
+    return int(f)
+
+
 @arcana.tool(
     when_to_use=(
         "当用户要你在未来某个时间提醒他做某事时，例如'15分钟后提醒我喝水'、"
@@ -384,11 +409,15 @@ async def schedule_reminder(
     text = (text or "").strip()
     if not text:
         return "提醒内容不能为空"
-    if delay_seconds is None or delay_seconds <= 0:
+    delay_seconds = coerce_int(delay_seconds, default=0)
+    repeat_seconds = coerce_int(repeat_seconds, default=0)
+    if delay_seconds is None or repeat_seconds is None:
+        return "时间参数必须是整数秒"
+    if delay_seconds <= 0:
         return "delay_seconds 必须为正整数（从现在起多少秒后提醒）"
     if delay_seconds > MAX_DELAY_SECONDS:
         return "提醒时间太远了（超过一年）"
-    if repeat_seconds and repeat_seconds < 0:
+    if repeat_seconds < 0:
         return "repeat_seconds 不能为负"
     origin = _current_origin()
     target = _current_target(origin)
@@ -411,9 +440,11 @@ async def schedule_reminder(
 async def list_reminders() -> str:
     """列出当前所有未触发的提醒。"""
     origin = _current_origin()
-    # A surface only sees its own reminders, matching how they're delivered.
+    # A surface only sees its own reminders, and within Telegram only the
+    # triggering user's (target), matching how they're delivered.
     origins = [origin] if origin else None
-    rows = await asyncio.to_thread(_list_pending_sync, origins)
+    target = _current_target(origin)
+    rows = await asyncio.to_thread(_list_pending_sync, origins, target)
     if not rows:
         return "当前没有待触发的提醒"
     lines = []
@@ -431,8 +462,12 @@ async def list_reminders() -> str:
 )
 async def cancel_reminder(reminder_id: int) -> str:
     """按编号取消一个未触发的提醒。"""
+    reminder_id = coerce_int(reminder_id, default=-1)
+    if reminder_id is None or reminder_id < 0:
+        return "提醒编号必须是整数"
     origin = _current_origin()
+    target = _current_target(origin)
     ok = await asyncio.to_thread(
-        _cancel_sync, reminder_id, origin if origin else None
+        _cancel_sync, reminder_id, origin if origin else None, target
     )
     return f"已取消提醒 #{reminder_id}" if ok else f"未找到可取消的提醒 #{reminder_id}"

@@ -110,6 +110,40 @@ async def test_complete_unknown_id():
     assert "未找到" in await todos.complete_todo(99999)
 
 
+async def test_telegram_users_isolated(as_origin):
+    """Two Telegram users must not see/complete each other's todos."""
+    from tools.voice_switch import current_tg_user
+
+    as_origin("telegram")
+    ta = current_tg_user.set(111)
+    await todos.add_todo("A 的待办")
+    current_tg_user.reset(ta)
+
+    tb = current_tg_user.set(222)
+    try:
+        # B's list doesn't show A's.
+        assert "没有未完成" in await todos.list_todos()
+        await todos.add_todo("B 的待办")
+        # B sees only B's.
+        lst = await todos.list_todos()
+        assert "B 的待办" in lst and "A 的待办" not in lst
+        # B can't complete A's todo (#1).
+        assert "未找到" in await todos.complete_todo(1)
+    finally:
+        current_tg_user.reset(tb)
+
+
+async def test_add_todo_coerces_string_due():
+    out = await todos.add_todo("交报告", due_seconds="600")
+    assert "已记下待办 #" in out and "截止" in out
+    assert len(scheduler._list_pending_sync(["local"])) == 1
+
+
+async def test_add_todo_rejects_garbage_due():
+    assert "整数" in await todos.add_todo("x", due_seconds="abc")
+    assert "整数" in await todos.complete_todo("notanid")
+
+
 # ---------------------------------------------------------------------------
 # security: .todos.db is on the files.py deny-list
 # ---------------------------------------------------------------------------

@@ -20,8 +20,6 @@ symlink-free relative paths can't dodge it. This is defense-in-depth that
 holds even when ROBOOT_TOOL_APPROVAL=off.
 """
 
-from __future__ import annotations
-
 import os
 from pathlib import Path
 
@@ -76,6 +74,8 @@ _DENY_ABS = {str((_HOME / ".roboot").resolve())}
 # real (lower-case) files. Every comparison below is done casefolded.
 _SECRET_REPO_PATHS_CF = {x.casefold() for x in _SECRET_REPO_PATHS}
 _READONLY_REPO_PATHS_CF = {x.casefold() for x in _READONLY_REPO_PATHS}
+# Stems whose -wal/-shm/-journal sidecars must also be denied (sqlite DBs).
+_SECRET_DB_STEMS = (".chat_history.db", ".reminders.db", ".todos.db")
 
 
 def _resolved(path: str) -> Path:
@@ -126,6 +126,11 @@ def _deny_reason(path: str, *, for_write: bool) -> str | None:
     if top is not None:
         top_cf = top.casefold()
         if top_cf in _SECRET_REPO_PATHS_CF:
+            return f"拒绝访问 Roboot 机密文件：{top}"
+        # Also catch the WAL/SHM/journal sidecars of the secret DBs
+        # (.chat_history.db-wal, .todos.db-shm, …) — write_file to one of those
+        # would corrupt the live DB; the .db entry alone wouldn't match them.
+        if any(top_cf.startswith(stem) for stem in _SECRET_DB_STEMS):
             return f"拒绝访问 Roboot 机密文件：{top}"
         if for_write and top_cf in _READONLY_REPO_PATHS_CF:
             return "soul.md 不能直接写入——请用 update_self / remember_user / add_note（会走审核门）"

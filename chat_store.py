@@ -29,6 +29,7 @@ import os
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / ".chat_history.db"
@@ -92,6 +93,10 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, isolation_level=None)  # autocommit
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # The one-time FTS rebuild below briefly holds the writer lock; without an
+    # explicit busy_timeout a concurrent record_user/record_assistant could
+    # hit "database is locked". Match the scheduler/todos stores.
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_INIT_SQL)
     _backfill_fts(conn)
     return conn
@@ -190,12 +195,27 @@ async def list_messages(session_id: str, limit: int = 200) -> list[dict]:
     return await asyncio.to_thread(_list_messages_sync, session_id, limit)
 
 
-def _search_sync(query: str, limit: int) -> list[dict]:
+def _search_sync(
+    query: str, limit: int, source: str | None = None, label: str | None = None
+) -> list[dict]:
     q = (query or "").strip()
     if not q:
         return []
     limit = max(1, min(int(limit or 10), 50))
-    with _connect() as conn:
+    # Scope to the caller's surface (and, for Telegram, their user). Sessions
+    # are stamped source='local'/'remote'/'telegram' + label=client_id/user_id;
+    # WITHOUT this WHERE the search spans every surface and every user — a
+    # Telegram user (or a prompt-injected agent) could read the console owner's
+    # and other users' private transcripts. NULL source = unscoped (internal).
+    scope_sql = ""
+    scope_args: tuple = ()
+    if source is not None:
+        scope_sql = " AND s.source = ?"
+        scope_args = (source,)
+        if label is not None:
+            scope_sql += " AND s.label = ?"
+            scope_args = (source, label)
+    with closing(_connect()) as conn:
         # >=3 chars → trigram FTS (relevance-ranked, with snippet). <3 chars →
         # LIKE substring (trigram can't match a query shorter than one trigram).
         if len(q) >= 3:
@@ -203,14 +223,15 @@ def _search_sync(query: str, limit: int) -> list[dict]:
             # interpreted as FTS operators (", *, OR, NEAR, column filters).
             phrase = '"' + q.replace('"', '""') + '"'
             rows = conn.execute(
-                """SELECT m.session_id, m.role, m.created_at,
+                f"""SELECT m.session_id, m.role, m.created_at,
                           snippet(messages_fts, 0, '《', '》', '…', 12) AS snip
                    FROM messages_fts
                    JOIN messages m ON m.id = messages_fts.rowid
-                   WHERE messages_fts MATCH ?
+                   JOIN sessions s ON s.session_id = m.session_id
+                   WHERE messages_fts MATCH ?{scope_sql}
                    ORDER BY rank
                    LIMIT ?""",
-                (phrase, limit),
+                (phrase, *scope_args, limit),
             ).fetchall()
             return [
                 {"session_id": r[0], "role": r[1], "created_at": r[2], "snippet": r[3]}
@@ -218,10 +239,12 @@ def _search_sync(query: str, limit: int) -> list[dict]:
             ]
         like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         rows = conn.execute(
-            r"""SELECT session_id, role, created_at, content FROM messages
-                WHERE content LIKE ? ESCAPE '\'
-                ORDER BY created_at DESC LIMIT ?""",
-            (like, limit),
+            rf"""SELECT m.session_id, m.role, m.created_at, m.content
+                FROM messages m
+                JOIN sessions s ON s.session_id = m.session_id
+                WHERE m.content LIKE ? ESCAPE '\'{scope_sql}
+                ORDER BY m.created_at DESC LIMIT ?""",
+            (like, *scope_args, limit),
         ).fetchall()
         return [
             {
@@ -234,11 +257,16 @@ def _search_sync(query: str, limit: int) -> list[dict]:
         ]
 
 
-async def search_messages(query: str, limit: int = 10) -> list[dict]:
-    """Full-text search across all stored chat messages. Returns matches as
-    dicts: session_id, role, created_at, snippet (oldest-first by relevance for
-    FTS, recency for the short-query LIKE path)."""
-    return await asyncio.to_thread(_search_sync, query, limit)
+async def search_messages(
+    query: str, limit: int = 10, source: str | None = None, label: str | None = None
+) -> list[dict]:
+    """Full-text search over stored chat messages, scoped to (source, label).
+
+    source/label MUST be passed by surface-facing callers (e.g. the search_chat
+    tool) to enforce per-surface / per-user isolation; leaving them None
+    searches everything and is for internal/admin use only. Returns dicts:
+    session_id, role, created_at, snippet."""
+    return await asyncio.to_thread(_search_sync, query, limit, source, label)
 
 
 def _wipe_all_sync() -> int:

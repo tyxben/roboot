@@ -13,8 +13,6 @@ used to bypass the per-origin isolation enforced here. complete/cancel carry an
 origin guard so a Telegram user can't check off a console todo and vice-versa.
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import sqlite3
@@ -72,35 +70,51 @@ def _add_sync(
         return int(cur.lastrowid)
 
 
-def _list_open_sync(origin: str | None) -> list[dict]:
+def _scope(origin: str | None, target: str | None) -> tuple[str, list]:
+    """SQL fragment + args scoping a todo to (origin, target). target adds the
+    per-user scope within a surface (Telegram) so one user can't touch another
+    user's todos even though they share origin='telegram'."""
+    parts: list[str] = []
+    args: list = []
+    if origin is not None:
+        parts.append("origin=?")
+        args.append(origin)
+    if target is not None:
+        parts.append("target=?")
+        args.append(target)
+    return ("".join(" AND " + p for p in parts), args)
+
+
+def _link_reminder_sync(todo_id: int, reminder_id: int) -> None:
     with closing(_connect()) as conn:
-        if origin:
-            rows = conn.execute(
-                "SELECT id, text, due_at FROM todos WHERE done=0 AND origin=?"
-                " ORDER BY (due_at IS NULL), due_at ASC, id ASC",
-                (origin,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT id, text, due_at FROM todos WHERE done=0"
-                " ORDER BY (due_at IS NULL), due_at ASC, id ASC"
-            ).fetchall()
+        conn.execute(
+            "UPDATE todos SET reminder_id=? WHERE id=?", (reminder_id, todo_id)
+        )
+
+
+def _list_open_sync(origin: str | None, target: str | None = None) -> list[dict]:
+    scope, args = _scope(origin, target)
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            "SELECT id, text, due_at FROM todos WHERE done=0" + scope
+            + " ORDER BY (due_at IS NULL), due_at ASC, id ASC",
+            tuple(args),
+        ).fetchall()
     return [{"id": r[0], "text": r[1], "due_at": r[2]} for r in rows]
 
 
-def _close_sync(todo_id: int, origin: str | None, *, delete: bool) -> tuple[bool, int | None]:
-    """Complete (done=1) or delete an OPEN todo, origin-guarded. Returns
-    (ok, linked_reminder_id) so the caller can cancel a pending reminder."""
+def _close_sync(
+    todo_id: int, origin: str | None, target: str | None = None, *, delete: bool
+) -> tuple[bool, int | None]:
+    """Complete (done=1) or delete an OPEN todo, scoped to (origin, target).
+    Returns (ok, linked_reminder_id) so the caller can cancel a pending
+    reminder."""
+    scope, args = _scope(origin, target)
     with closing(_connect()) as conn:
-        if origin is not None:
-            row = conn.execute(
-                "SELECT reminder_id FROM todos WHERE id=? AND done=0 AND origin=?",
-                (todo_id, origin),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT reminder_id FROM todos WHERE id=? AND done=0", (todo_id,)
-            ).fetchone()
+        row = conn.execute(
+            "SELECT reminder_id FROM todos WHERE id=? AND done=0" + scope,
+            (todo_id, *args),
+        ).fetchone()
         if row is None:
             return False, None
         reminder_id = row[0]
@@ -138,21 +152,30 @@ async def add_todo(text: str, due_seconds: int = 0) -> str:
     text = (text or "").strip()
     if not text:
         return "待办内容不能为空"
-    if due_seconds and due_seconds < 0:
+    due_seconds = scheduler.coerce_int(due_seconds, default=0)
+    if due_seconds is None:
+        return "due_seconds 必须是整数（从现在起多少秒）"
+    if due_seconds < 0:
         return "due_seconds 不能为负"
-    if due_seconds and due_seconds > scheduler.MAX_DELAY_SECONDS:
+    if due_seconds > scheduler.MAX_DELAY_SECONDS:
         return "截止时间太远了（超过一年）"
     origin = scheduler._current_origin()
     target = scheduler._current_target(origin)
     due_at = time.time() + float(due_seconds) if due_seconds else None
-    reminder_id = None
+    # Insert the todo FIRST (reminder_id NULL), then create the linked reminder,
+    # then back-link it. If reminder creation fails, the todo still exists with
+    # no due notification — never a reminder orphaned from a non-existent todo.
+    tid = await asyncio.to_thread(_add_sync, text, due_at, origin, target, None)
     if due_at is not None:
-        # Borrow the scheduler's dispatcher to deliver the due notification.
-        reminder_id = await asyncio.to_thread(
-            scheduler._add_sync, f"待办到期: {text}", due_at, 0.0, origin, target
-        )
-        scheduler._get_wake().set()
-    tid = await asyncio.to_thread(_add_sync, text, due_at, origin, target, reminder_id)
+        try:
+            reminder_id = await asyncio.to_thread(
+                scheduler._add_sync, f"待办到期: {text}", due_at, 0.0, origin, target
+            )
+            await asyncio.to_thread(_link_reminder_sync, tid, reminder_id)
+            scheduler._get_wake().set()
+        except Exception as e:
+            logger.warning("todo #%s: due reminder not set: %s", tid, e)
+            return f"已记下待办 #{tid}：{text}（提醒未能设置）"
     return f"已记下待办 #{tid}：{text}{_fmt_due(due_at)}"
 
 
@@ -165,11 +188,23 @@ async def add_todo(text: str, due_seconds: int = 0) -> str:
 async def list_todos() -> str:
     """列出当前所有未完成的待办。"""
     origin = scheduler._current_origin()
-    rows = await asyncio.to_thread(_list_open_sync, origin if origin else None)
+    target = scheduler._current_target(origin)
+    rows = await asyncio.to_thread(_list_open_sync, origin if origin else None, target)
     if not rows:
         return "当前没有未完成的待办"
     lines = [f"#{r['id']} {r['text']}{_fmt_due(r['due_at'])}" for r in rows]
     return "未完成待办：\n" + "\n".join(lines)
+
+
+async def _cancel_linked_reminder(reminder_id, origin: str | None, target: str | None) -> None:
+    """Cancel a todo's linked reminder, scoped + best-effort (a failure here
+    must not abort the todo close — log and move on)."""
+    if reminder_id is None:
+        return
+    try:
+        await asyncio.to_thread(scheduler._cancel_sync, reminder_id, origin, target)
+    except Exception as e:  # pragma: no cover
+        logger.warning("failed to cancel reminder #%s for todo: %s", reminder_id, e)
 
 
 @arcana.tool(
@@ -180,16 +215,17 @@ async def list_todos() -> str:
 )
 async def complete_todo(todo_id: int) -> str:
     """按编号把一条待办标记为已完成（并取消它挂着的到期提醒）。"""
+    todo_id = scheduler.coerce_int(todo_id, default=-1)
+    if todo_id is None or todo_id < 0:
+        return "待办编号必须是整数"
     origin = scheduler._current_origin()
+    target = scheduler._current_target(origin)
     ok, reminder_id = await asyncio.to_thread(
-        _close_sync, todo_id, origin if origin else None, delete=False
+        _close_sync, todo_id, origin if origin else None, target, delete=False
     )
     if not ok:
         return f"未找到可完成的待办 #{todo_id}"
-    if reminder_id is not None:
-        await asyncio.to_thread(
-            scheduler._cancel_sync, reminder_id, origin if origin else None
-        )
+    await _cancel_linked_reminder(reminder_id, origin if origin else None, target)
     return f"已完成待办 #{todo_id} ✅"
 
 
@@ -201,14 +237,15 @@ async def complete_todo(todo_id: int) -> str:
 )
 async def cancel_todo(todo_id: int) -> str:
     """按编号删除一条待办（并取消它挂着的到期提醒）。"""
+    todo_id = scheduler.coerce_int(todo_id, default=-1)
+    if todo_id is None or todo_id < 0:
+        return "待办编号必须是整数"
     origin = scheduler._current_origin()
+    target = scheduler._current_target(origin)
     ok, reminder_id = await asyncio.to_thread(
-        _close_sync, todo_id, origin if origin else None, delete=True
+        _close_sync, todo_id, origin if origin else None, target, delete=True
     )
     if not ok:
         return f"未找到待办 #{todo_id}"
-    if reminder_id is not None:
-        await asyncio.to_thread(
-            scheduler._cancel_sync, reminder_id, origin if origin else None
-        )
+    await _cancel_linked_reminder(reminder_id, origin if origin else None, target)
     return f"已删除待办 #{todo_id}"

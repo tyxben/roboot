@@ -63,6 +63,22 @@ def test_var_db_denied_both_symlink_forms():
     assert files._deny_reason("/private/var/db/dslocal/x", for_write=False) is not None
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".chat_history.db-wal",
+        ".chat_history.db-shm",
+        ".reminders.db-wal",
+        ".todos.db-shm",
+        ".todos.db-journal",
+    ],
+)
+def test_db_sidecar_files_denied(path):
+    # write_file to a -wal/-shm sidecar would corrupt the live DB.
+    assert files._deny_reason(path, for_write=True) is not None
+    assert files._deny_reason(path, for_write=False) is not None
+
+
 def test_soul_md_read_ok_write_denied():
     assert files._deny_reason("soul.md", for_write=False) is None
     assert files._deny_reason("soul.md", for_write=True) is not None

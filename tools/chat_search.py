@@ -5,13 +5,36 @@ SQLite-backed conversation log instead of only seeing the current turn. Read
 -only — backed by the FTS5 index + triggers in chat_store.py.
 """
 
-from __future__ import annotations
-
 import time
 
 import arcana
 
 import chat_store
+from tools import scheduler
+
+# How a caller's origin (tool_guard.current_origin) maps to the session
+# `source` stamped at write time. NOTE the deliberate mismatch: the relay
+# surface's contextvar is "relay" but its sessions are stored source="remote"
+# (relay_client.py). A naive source==origin filter would return zero rows for
+# relay clients, so map it here.
+_ORIGIN_TO_SOURCE = {"local": "local", "relay": "remote", "telegram": "telegram"}
+
+
+def _scope() -> tuple[str, str | None]:
+    """Return (source, label) restricting search to the caller's own history.
+    Fails closed: an unknown origin, or a Telegram turn with no user id, maps
+    to an impossible source/label so the search returns nothing rather than
+    leaking another surface's transcripts."""
+    origin = scheduler._current_origin()
+    source = _ORIGIN_TO_SOURCE.get(origin)
+    if source is None:
+        return "\x00none", None  # unknown origin → match nothing
+    if source == "telegram":
+        target = scheduler._current_target(origin)  # the telegram user_id
+        return source, (target if target is not None else "\x00no-user")
+    # local / relay: scope by surface; relay isn't per-client today (no
+    # client_id contextvar) — all paired clients share the pairing trust.
+    return source, None
 
 
 @arcana.tool(
@@ -28,7 +51,8 @@ async def search_chat(query: str, limit: int = 10) -> str:
     query = (query or "").strip()
     if not query:
         return "搜索词不能为空"
-    rows = await chat_store.search_messages(query, limit)
+    source, label = _scope()
+    rows = await chat_store.search_messages(query, limit, source=source, label=label)
     if not rows:
         return f"没有找到包含「{query}」的历史消息"
     lines = []
