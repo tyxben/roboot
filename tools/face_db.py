@@ -7,7 +7,13 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
-import numpy as np
+# numpy is imported lazily inside recognize() — it is the only function that
+# actually evaluates it at runtime (the `np.ndarray` annotations are strings
+# under `from __future__ import annotations`, and enroll() only calls
+# `.tolist()` on the array it's handed). Keeping it off the module top means
+# `import tools.face_db` — and transitively `import tools.vision`,
+# `import server`, `import run` — works without the optional [vision] extras
+# installed (the Linux CI runners). See tests/test_import_without_vision_extras.py.
 
 DB_DIR = Path(__file__).parent.parent / ".faces"
 DB_FILE = DB_DIR / "faces.json"
@@ -64,6 +70,8 @@ def enroll(name: str, encoding: np.ndarray, photo_bytes: bytes | None = None) ->
 
 def recognize(encoding: np.ndarray, debug: bool = False) -> FaceMatch | None:
     """Find the closest match in the database. Returns None if no match within threshold."""
+    import numpy as np
+
     db = _load_db()
     if not db:
         return None
