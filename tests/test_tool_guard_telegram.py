@@ -128,6 +128,31 @@ def test_get_runtime_attaches_tool_guard_callback(monkeypatch):
 
 
 # -----------------------------------------------------------------------------
+# Reminder delivery (scheduler dispatcher → Telegram DM)
+# -----------------------------------------------------------------------------
+
+
+async def test_reminder_delivery_dms_target(fake_app):
+    """The telegram dispatcher delivers a reminder to the user_id stored as
+    `target` when it was scheduled."""
+    telegram_bot._tg_app = fake_app
+    await telegram_bot._deliver_reminder_telegram(
+        {"id": 5, "text": "喝水", "target": "424242"}
+    )
+    fake_app.bot.send_message.assert_awaited_once()
+    call = fake_app.bot.send_message.await_args
+    assert call.kwargs["chat_id"] == 424242
+    assert "喝水" in call.kwargs["text"]
+
+
+async def test_reminder_delivery_skips_without_target(fake_app):
+    """A reminder with no telegram target must not crash or mis-deliver."""
+    telegram_bot._tg_app = fake_app
+    await telegram_bot._deliver_reminder_telegram({"id": 6, "text": "x", "target": None})
+    fake_app.bot.send_message.assert_not_awaited()
+
+
+# -----------------------------------------------------------------------------
 # 2. Broadcaster behavior
 # -----------------------------------------------------------------------------
 

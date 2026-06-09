@@ -87,6 +87,8 @@ except ImportError:
     screenshot = None
 from tools.soul import build_personality, summarize_sessions
 from tools.voice_switch import current_tg_user, switch_tts_voice
+from tools import scheduler as _scheduler
+from tools.scheduler import schedule_reminder, list_reminders, cancel_reminder
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,9 @@ ALL_TOOLS = [
     send_to_session,
     create_claude_session,
     switch_tts_voice,
+    schedule_reminder,
+    list_reminders,
+    cancel_reminder,
 ]
 if screenshot is not None:
     ALL_TOOLS.append(screenshot)
@@ -1071,6 +1076,28 @@ async def _broadcast_soul_review(frame: dict) -> None:
         _pending_soul_owner.pop(req_id, None)
 
 
+async def _deliver_reminder_telegram(reminder: dict) -> None:
+    """Scheduler delivery for Telegram. DMs the user who set the reminder
+    (stored as `target` = their telegram user_id at schedule time). The
+    daemon dispatcher owns {local,relay,''}; this one owns {telegram}, so a
+    reminder fires on the surface it was created from."""
+    app = _tg_app
+    if app is None:
+        logger.warning("reminder delivery: _tg_app is None, skipping")
+        return
+    target = reminder.get("target")
+    if not target:
+        logger.warning(
+            "reminder #%s has no telegram target, skipping", reminder.get("id")
+        )
+        return
+    text = f"⏰ 提醒: {reminder.get('text', '')}"
+    try:
+        await app.bot.send_message(chat_id=int(target), text=text[:4000])
+    except Exception as e:  # pragma: no cover - network dependent
+        logger.warning("reminder DM to %s failed: %s", target, e)
+
+
 async def _notify_allowed_users(tg_app, payload: dict) -> None:
     """Session-watcher subscriber: DM every allowed user when a Claude Code
     session enters a waiting-for-confirmation state.
@@ -1116,6 +1143,10 @@ def _register_session_watcher(tg_app) -> None:
         # Without this, ROBOOT_SOUL_REVIEW=confirm degrades to LOG for every
         # Telegram-driven soul.md write (no broadcaster → gate falls back).
         soul_review.register_broadcaster(_broadcast_soul_review)
+        # Reminder dispatcher for the telegram surface — delivers reminders
+        # set via Telegram back to the user who set them. Disjoint origins
+        # from the daemon dispatcher, so no double-fire.
+        _scheduler.start_dispatcher(["telegram"], _deliver_reminder_telegram)
 
         async def _prewarm_stt():
             try:
