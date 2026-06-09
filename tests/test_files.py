@@ -39,6 +39,30 @@ def test_dotdot_cannot_escape_to_secret():
     assert files._deny_reason("foo/../config.yaml", for_write=False) is not None
 
 
+@pytest.mark.parametrize(
+    "path,for_write",
+    [
+        # macOS case-insensitive FS: case-variant paths reach the real
+        # lower-case secret, so the policy must match casefolded.
+        ("Config.yaml", False),
+        ("CONFIG.YAML", False),
+        (".Identity/daemon.ed25519.key", True),
+        (".IDENTITY/daemon.ed25519.key", False),
+        ("Soul.md", True),
+        ("SOUL.MD", True),
+        ("~/.SSH/id_rsa", False),
+        ("~/.AWS/credentials", False),
+    ],
+)
+def test_case_variant_paths_denied(path, for_write):
+    assert files._deny_reason(path, for_write=for_write) is not None
+
+
+def test_var_db_denied_both_symlink_forms():
+    assert files._deny_reason("/var/db/dslocal/x", for_write=True) is not None
+    assert files._deny_reason("/private/var/db/dslocal/x", for_write=False) is not None
+
+
 def test_soul_md_read_ok_write_denied():
     assert files._deny_reason("soul.md", for_write=False) is None
     assert files._deny_reason("soul.md", for_write=True) is not None

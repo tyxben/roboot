@@ -58,9 +58,23 @@ _DENY_FRAGMENTS = (
     "/.kube/",
     "/.config/gcloud/",
 )
-_DENY_PREFIXES = ("/etc/", "/private/etc/", "/var/db/")
+# Both symlink forms of each — macOS resolves /var -> /private/var, /etc ->
+# /private/etc — so list both to avoid the policy silently no-op'ing.
+_DENY_PREFIXES = (
+    "/etc/",
+    "/private/etc/",
+    "/var/db/",
+    "/private/var/db/",
+)
 # ~/.roboot/tool_allowlist.json — editing the allowlist must not be agent-driven.
 _DENY_ABS = {str((_HOME / ".roboot").resolve())}
+
+# Casefolded forms — the default macOS boot volume is case-INSENSITIVE but
+# Path.resolve() is case-PRESERVING, so a bare string compare would let
+# `Config.yaml` / `Soul.md` / `.Identity/` slip past the policy and hit the
+# real (lower-case) files. Every comparison below is done casefolded.
+_SECRET_REPO_PATHS_CF = {x.casefold() for x in _SECRET_REPO_PATHS}
+_READONLY_REPO_PATHS_CF = {x.casefold() for x in _READONLY_REPO_PATHS}
 
 
 def _resolved(path: str) -> Path:
@@ -72,35 +86,48 @@ def _resolved(path: str) -> Path:
     return p.resolve()
 
 
-def _repo_rel(p: Path) -> str | None:
-    try:
-        return str(p.relative_to(_REPO_ROOT))
-    except ValueError:
+def _repo_top(p: Path) -> str | None:
+    """First path component of `p` relative to the repo root, matched
+    case-insensitively (so `/Users/.../Roboot/Config.yaml` still maps in).
+    Returns the component in its original case, or None if `p` isn't under
+    the repo. Every entry in the repo deny/read-only sets is a top-level
+    name, so the first component is all we need to compare."""
+    root_parts = [x.casefold() for x in _REPO_ROOT.parts]
+    p_parts = list(p.parts)
+    if len(p_parts) <= len(root_parts):
         return None
+    if [x.casefold() for x in p_parts[: len(root_parts)]] != root_parts:
+        return None
+    return p_parts[len(root_parts)]
 
 
 def _deny_reason(path: str, *, for_write: bool) -> str | None:
-    """Return a refusal reason if the path is off-limits, else None."""
+    """Return a refusal reason if the path is off-limits, else None.
+
+    All matching is casefolded so a case-variant path on a case-insensitive
+    volume (the macOS default) can't reach a protected lower-case file.
+    """
     p = _resolved(path)
-    s = str(p)
+    s_cf = (str(p) + "/").casefold()
 
     for frag in _DENY_FRAGMENTS:
-        if frag in s + "/":
+        if frag.casefold() in s_cf:
             return f"拒绝访问凭据目录：{path}"
     for pre in _DENY_PREFIXES:
-        if s.startswith(pre):
+        if s_cf.startswith(pre.casefold()):
             return f"拒绝访问系统目录：{path}"
     for deny in _DENY_ABS:
-        if s == deny or s.startswith(deny + os.sep):
+        d = (deny + os.sep).casefold()
+        if s_cf == d or s_cf.startswith(d):
             return f"拒绝访问受保护路径：{path}"
 
-    rel = _repo_rel(p)
-    if rel is not None:
-        top = rel.split(os.sep, 1)[0]
-        if top in _SECRET_REPO_PATHS:
-            return f"拒绝访问 Roboot 机密文件：{rel}"
-        if for_write and rel in _READONLY_REPO_PATHS:
-            return f"soul.md 不能直接写入——请用 update_self / remember_user / add_note（会走审核门）"
+    top = _repo_top(p)
+    if top is not None:
+        top_cf = top.casefold()
+        if top_cf in _SECRET_REPO_PATHS_CF:
+            return f"拒绝访问 Roboot 机密文件：{top}"
+        if for_write and top_cf in _READONLY_REPO_PATHS_CF:
+            return "soul.md 不能直接写入——请用 update_self / remember_user / add_note（会走审核门）"
     return None
 
 
