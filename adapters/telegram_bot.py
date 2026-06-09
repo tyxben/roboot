@@ -33,6 +33,7 @@ import arcana
 
 import chat_store
 import memory
+import soul_review
 import tool_guard
 from text_utils import extract_spoken_text
 from adapters.stt import get_backend as _get_stt_backend
@@ -616,6 +617,30 @@ async def callback_handler(update: Update, context) -> None:
         except Exception:
             pass
 
+    # --- Soul review (allow / deny a soul.md overwrite) ---
+    elif data.startswith("soul_ok:") or data.startswith("soul_no:"):
+        approved = data.startswith("soul_ok:")
+        req_id = data.split(":", 1)[1]
+        owner = _pending_soul_owner.get(req_id)
+        # Same cross-user guard as tool approval: only the triggering user
+        # may answer their own soul-review modal.
+        if owner is not None and owner != user_id:
+            await query.answer("这不是你的审核请求", show_alert=True)
+            return
+        resolved = soul_review.resolve_decision(req_id, approved)
+        _pending_soul_owner.pop(req_id, None)
+        if not resolved:
+            try:
+                await query.edit_message_text("⏰ 该 soul.md 审核请求已超时或已处理。")
+            except Exception:
+                pass
+            return
+        verdict = "✅ 已批准写入" if approved else "❌ 已拒绝写入"
+        try:
+            await query.edit_message_text(verdict)
+        except Exception:
+            pass
+
 
 async def cmd_remote(update: Update, context) -> None:
     """Get remote access link from the local server's relay info."""
@@ -932,6 +957,11 @@ _tg_app = None
 # atomic under the asyncio loop (no locks needed).
 _pending_owner: dict[str, int] = {}
 
+# Same idea for soul.md review requests — separate namespace from tool
+# approvals so the callback branches can't cross-resolve. uuid4 req_ids
+# never collide across the two maps, but keeping them apart is clearer.
+_pending_soul_owner: dict[str, int] = {}
+
 
 def _truncate_summary(text: str, limit: int = 600) -> str:
     """Inline-keyboard messages live in chat history forever. Cap the
@@ -994,6 +1024,53 @@ async def _broadcast_tool_approval(frame: dict) -> None:
         _pending_owner.pop(req_id, None)
 
 
+async def _broadcast_soul_review(frame: dict) -> None:
+    """soul_review broadcaster for Telegram. Mirrors _broadcast_tool_approval:
+    DM the *triggering* user (from current_tg_user) the proposed soul.md diff
+    with an inline keyboard. Without this, ROBOOT_SOUL_REVIEW=confirm silently
+    degrades to LOG for every Telegram-driven soul.md write (the gate finds no
+    broadcaster registered) — the user thinks writes are gated when they
+    aren't. If the contextvar is unset, bail and let the gate time out.
+    """
+    app = _tg_app
+    if app is None:
+        logger.warning("soul_review broadcaster: _tg_app is None, skipping")
+        return
+    user_id = current_tg_user.get(None)
+    if user_id is None:
+        logger.warning(
+            "soul_review broadcaster: no current_tg_user, skipping req_id=%s",
+            frame.get("req_id"),
+        )
+        return
+    req_id = frame.get("req_id", "")
+    origin = str(frame.get("origin") or "?")
+    diff = _truncate_summary(str(frame.get("diff", "")), limit=1500)
+    timeout_s = int(frame.get("timeout_s", 30))
+    text = (
+        "📝 <b>soul.md 写入待审核</b>\n"
+        f"来源: <code>{escape(origin)}</code>\n"
+        f"超时: {timeout_s}s\n\n"
+        f"<pre>{escape(diff)}</pre>"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ 允许", callback_data=f"soul_ok:{req_id}"),
+        InlineKeyboardButton("❌ 拒绝", callback_data=f"soul_no:{req_id}"),
+    ]])
+    if req_id:
+        _pending_soul_owner[req_id] = user_id
+    try:
+        await app.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as e:  # pragma: no cover - network dependent
+        logger.warning("soul_review send failed for %s: %s", user_id, e)
+        _pending_soul_owner.pop(req_id, None)
+
+
 async def _notify_allowed_users(tg_app, payload: dict) -> None:
     """Session-watcher subscriber: DM every allowed user when a Claude Code
     session enters a waiting-for-confirmation state.
@@ -1036,6 +1113,9 @@ def _register_session_watcher(tg_app) -> None:
         # Idempotent — register_broadcaster dedupes, so a reload-style
         # double post_init wouldn't double-notify. Mirrors server.py.
         tool_guard.register_broadcaster(_broadcast_tool_approval)
+        # Without this, ROBOOT_SOUL_REVIEW=confirm degrades to LOG for every
+        # Telegram-driven soul.md write (no broadcaster → gate falls back).
+        soul_review.register_broadcaster(_broadcast_soul_review)
 
         async def _prewarm_stt():
             try:
