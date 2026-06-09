@@ -612,34 +612,45 @@ def _register_tool_guard_broadcaster() -> None:
     tool_guard.register_broadcaster(_broadcast_tool_approval)
 
 
-async def _deliver_reminder(reminder: dict) -> None:
+async def _deliver_reminder(reminder: dict) -> bool:
     """Scheduler delivery for the daemon's surfaces (local consoles + relay).
 
     The dispatcher (started below) owns origins {local, relay, ""}; Telegram
     reminders are delivered by the bot's own dispatcher. Reuses the same
-    local-WS + relay fan-out shape as _broadcast_waiting_notification."""
+    local-WS + relay fan-out shape as _broadcast_waiting_notification.
+
+    Returns True if the reminder reached at least one surface — the dispatcher
+    uses this to decide whether to consume the reminder or retry later (so a
+    reminder set from a now-closed tab isn't silently dropped)."""
     frame = {
         "type": "notify",
         "kind": "reminder",
         "reminder_id": reminder.get("id"),
         "text": f"⏰ 提醒: {reminder.get('text', '')}",
     }
+    sent = 0
     dead: list[WebSocket] = []
     for client_ws in list(_active_ws_clients):
         try:
             await client_ws.send_json(frame)
+            sent += 1
         except Exception:
             dead.append(client_ws)
     for client_ws in dead:
         _active_ws_clients.discard(client_ws)
     relay = _relay_client
     if relay is not None and getattr(relay, "_loop", None) is not None:
-        try:
-            asyncio.run_coroutine_threadsafe(
-                _relay_broadcast(relay, frame), relay._loop
-            )
-        except Exception:
-            pass
+        # Only count the relay as a surface if a client is actually paired
+        # (a derived cipher exists); the push itself is fire-and-forget.
+        if getattr(relay, "_ciphers", None):
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _relay_broadcast(relay, frame), relay._loop
+                )
+                sent += 1
+            except Exception:
+                pass
+    return sent > 0
 
 
 @app.on_event("startup")

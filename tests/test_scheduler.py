@@ -90,15 +90,57 @@ def test_claim_partitions_by_origin():
     assert [c["id"] for c in claimed_tg] == [tg_id]
 
 
-def test_recurring_reschedules_to_future_slot():
+def test_recurring_reschedules_after_delivery():
     now = time.time()
     rid = scheduler._add_sync("hourly", now - 5, 3600, "local", None)
     claimed = scheduler._claim_due_sync(["local"], now)
     assert [c["id"] for c in claimed] == [rid]
-    # Still pending (recurring), with due_at advanced into the future.
+    # Claim alone consumes it (fired=1) — reschedule happens in finalize.
+    assert scheduler._list_pending_sync(["local"]) == []
+    scheduler._finalize_sync(rid, 3600, now - 5, delivered=True, now=now)
     rows = scheduler._list_pending_sync(["local"])
-    assert len(rows) == 1
-    assert rows[0]["due_at"] > now
+    assert len(rows) == 1 and rows[0]["due_at"] > now
+
+
+def test_finalize_oneshot_delivered_consumed():
+    now = time.time()
+    rid = scheduler._add_sync("once", now - 1, 0, "local", None)
+    scheduler._claim_due_sync(["local"], now)
+    scheduler._finalize_sync(rid, 0, now - 1, delivered=True, now=now)
+    assert scheduler._list_pending_sync(["local"]) == []  # consumed
+
+
+def test_finalize_not_delivered_retries():
+    """The HIGH bug: a one-shot reminder that reached no surface must NOT be
+    lost — finalize un-fires it so the next poll retries."""
+    now = time.time()
+    rid = scheduler._add_sync("remind", now - 1, 0, "local", None)
+    scheduler._claim_due_sync(["local"], now)
+    assert scheduler._list_pending_sync(["local"]) == []  # claimed (fired=1)
+    scheduler._finalize_sync(rid, 0, now - 1, delivered=False, now=now)
+    rows = scheduler._list_pending_sync(["local"])
+    assert len(rows) == 1 and rows[0]["id"] == rid  # back to pending → retried
+
+
+def test_finalize_retry_backs_off_due_at():
+    """Retry must push due_at forward (no hot-loop on an overdue row)."""
+    now = time.time()
+    rid = scheduler._add_sync("r", now - 1, 0, "local", None)
+    scheduler._claim_due_sync(["local"], now)
+    scheduler._finalize_sync(rid, 0, now - 1, delivered=False, now=now, attempts=0)
+    rows = scheduler._list_pending_sync(["local"])
+    assert len(rows) == 1 and rows[0]["due_at"] >= now + scheduler.RETRY_BACKOFF - 1
+
+
+def test_finalize_gives_up_after_max_retries():
+    now = time.time()
+    rid = scheduler._add_sync("stale", now - 1, 0, "local", None)
+    scheduler._claim_due_sync(["local"], now)
+    # Simulate the final attempt — retries exhausted → dropped, not retried.
+    scheduler._finalize_sync(
+        rid, 0, now - 1, delivered=False, now=now, attempts=scheduler.MAX_RETRIES
+    )
+    assert scheduler._list_pending_sync(["local"]) == []
 
 
 # ---------------------------------------------------------------------------
@@ -111,18 +153,42 @@ async def test_dispatcher_fires_due_reminder():
 
     async def deliver(r):
         delivered.append(r)
+        return True  # reached a surface → consume
 
     now = time.time()
     scheduler._add_sync("ping", now - 1, 0, "local", None)
     scheduler.start_dispatcher(["local"], deliver)
     try:
-        # Give the loop a few ticks to claim + deliver.
         for _ in range(50):
             if delivered:
                 break
             await asyncio.sleep(0.02)
         assert len(delivered) == 1
         assert delivered[0]["text"] == "ping"
+        # Consumed — not re-delivered on subsequent polls.
+        await asyncio.sleep(0.1)
+        assert len(delivered) == 1
+    finally:
+        await scheduler.stop_dispatcher()
+
+
+async def test_dispatcher_retries_when_no_surface():
+    """deliver() returning False (no surface connected) must leave the
+    reminder pending for a later poll — not consume it."""
+    now = time.time()
+    scheduler._add_sync("later", now - 1, 0, "local", None)
+    attempts = {"n": 0}
+
+    async def deliver(r):
+        attempts["n"] += 1
+        return False  # no surface reached
+
+    scheduler.start_dispatcher(["local"], deliver)
+    try:
+        await asyncio.sleep(0.2)
+        # Tried at least once, and the reminder is STILL pending (retryable).
+        assert attempts["n"] >= 1
+        assert len(scheduler._list_pending_sync(["local"])) == 1
     finally:
         await scheduler.stop_dispatcher()
 

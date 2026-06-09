@@ -1083,26 +1083,32 @@ async def _broadcast_soul_review(frame: dict) -> None:
         _pending_soul_owner.pop(req_id, None)
 
 
-async def _deliver_reminder_telegram(reminder: dict) -> None:
+async def _deliver_reminder_telegram(reminder: dict) -> bool:
     """Scheduler delivery for Telegram. DMs the user who set the reminder
     (stored as `target` = their telegram user_id at schedule time). The
     daemon dispatcher owns {local,relay,''}; this one owns {telegram}, so a
-    reminder fires on the surface it was created from."""
+    reminder fires on the surface it was created from.
+
+    Returns True only if the DM was actually sent — the dispatcher retries
+    (up to a grace window) when the bot is down or the send fails, instead of
+    silently consuming the reminder."""
     app = _tg_app
     if app is None:
-        logger.warning("reminder delivery: _tg_app is None, skipping")
-        return
+        logger.warning("reminder delivery: _tg_app is None, will retry")
+        return False
     target = reminder.get("target")
     if not target:
         logger.warning(
-            "reminder #%s has no telegram target, skipping", reminder.get("id")
+            "reminder #%s has no telegram target, dropping", reminder.get("id")
         )
-        return
+        return True  # unroutable by construction — don't retry forever
     text = f"⏰ 提醒: {reminder.get('text', '')}"
     try:
         await app.bot.send_message(chat_id=int(target), text=text[:4000])
+        return True
     except Exception as e:  # pragma: no cover - network dependent
         logger.warning("reminder DM to %s failed: %s", target, e)
+        return False
 
 
 async def _notify_allowed_users(tg_app, payload: dict) -> None:

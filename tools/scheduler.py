@@ -33,6 +33,7 @@ import asyncio
 import logging
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -43,6 +44,14 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path(__file__).parent.parent / ".reminders.db"
 POLL_INTERVAL = 20.0  # seconds; cross-process latency ceiling
 MAX_DELAY_SECONDS = 365 * 86400  # 1 year — guard against fat-finger/overflow
+# When a due reminder reaches no surface, retry on a backoff instead of
+# consuming it — so "remind me in 1h" survives a closed tab and fires when a
+# console/phone reconnects. RETRY_BACKOFF pushes due_at forward each miss
+# (NO hot-loop: the dispatcher then sleeps until the new due_at), and
+# MAX_RETRIES bounds how long a permanently-undeliverable reminder churns
+# (~24h at a 20s backoff) before it's dropped.
+RETRY_BACKOFF = 20.0
+MAX_RETRIES = int(24 * 3600 / RETRY_BACKOFF)
 
 _INIT_SQL = """
 CREATE TABLE IF NOT EXISTS reminders (
@@ -53,6 +62,7 @@ CREATE TABLE IF NOT EXISTS reminders (
   origin         TEXT NOT NULL DEFAULT '',
   target         TEXT,
   created_at     REAL NOT NULL,
+  attempts       INTEGER NOT NULL DEFAULT 0,
   fired          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_due
@@ -64,6 +74,11 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, isolation_level=None)  # autocommit
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # .reminders.db is written by two processes (daemon + Telegram
+    # dispatchers, plus tool calls). WAL still serializes writers; without a
+    # busy_timeout the loser of a write race fails instantly with "database
+    # is locked" and surfaces as a tool error. Wait for the lock instead.
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_INIT_SQL)
     return conn
 
@@ -76,7 +91,10 @@ def _connect() -> sqlite3.Connection:
 def _add_sync(
     text: str, due_at: float, repeat_seconds: float, origin: str, target: str | None
 ) -> int:
-    with _connect() as conn:
+    # closing() actually closes the sqlite connection on exit — a bare
+    # `with sqlite3.connect(...) as conn` only manages the transaction and
+    # leaks the fd until cyclic GC. Applies to every op below.
+    with closing(_connect()) as conn:
         cur = conn.execute(
             "INSERT INTO reminders(text, due_at, repeat_seconds, origin, target,"
             " created_at, fired) VALUES (?, ?, ?, ?, ?, ?, 0)",
@@ -86,7 +104,7 @@ def _add_sync(
 
 
 def _list_pending_sync(origins: list[str] | None) -> list[dict]:
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         if origins:
             qs = ",".join("?" for _ in origins)
             rows = conn.execute(
@@ -116,7 +134,7 @@ def _cancel_sync(reminder_id: int, origin: str | None) -> bool:
     """Cancel a pending reminder. If `origin` is given, only cancel a reminder
     with that origin — so a Telegram user can't cancel a console reminder by
     guessing its id and vice-versa."""
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         if origin is not None:
             cur = conn.execute(
                 "DELETE FROM reminders WHERE id=? AND fired=0 AND origin=?",
@@ -130,21 +148,20 @@ def _cancel_sync(reminder_id: int, origin: str | None) -> bool:
 
 
 def _claim_due_sync(origins: list[str], now: float) -> list[dict]:
-    """Atomically claim due, unfired reminders for the given origins.
-
-    Returns the claimed rows. For recurring reminders the row is rescheduled
-    (fired reset to 0, due_at advanced) *after* the claim, so the claiming
-    dispatcher owns it exclusively in between."""
+    """Atomically claim due, unfired reminders for the given origins by setting
+    fired=1 (so a second dispatcher won't also take them). The row is NOT
+    consumed/rescheduled here — that's decided in _finalize_sync AFTER delivery
+    is attempted, so a reminder that reached no surface isn't silently lost."""
     claimed: list[dict] = []
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         qs = ",".join("?" for _ in origins)
         candidates = conn.execute(
-            f"SELECT id, text, due_at, repeat_seconds, origin, target FROM reminders"
-            f" WHERE fired=0 AND due_at<=? AND origin IN ({qs})",
+            f"SELECT id, text, due_at, repeat_seconds, origin, target, attempts"
+            f" FROM reminders WHERE fired=0 AND due_at<=? AND origin IN ({qs})",
             (now, *origins),
         ).fetchall()
         for r in candidates:
-            rid, text, due_at, repeat, origin, target = r
+            rid, text, due_at, repeat, origin, target, attempts = r
             cur = conn.execute(
                 "UPDATE reminders SET fired=1 WHERE id=? AND fired=0", (rid,)
             )
@@ -158,24 +175,64 @@ def _claim_due_sync(origins: list[str], now: float) -> list[dict]:
                     "repeat_seconds": repeat,
                     "origin": origin,
                     "target": target,
+                    "attempts": attempts,
                 }
             )
-            if repeat and repeat > 0:
-                # Advance to the next occurrence and un-fire so it recurs.
-                # Skip any missed slots (e.g. daemon was down) to the next
-                # future slot so it doesn't fire a backlog all at once.
-                next_due = due_at + repeat
-                while next_due <= now:
-                    next_due += repeat
-                conn.execute(
-                    "UPDATE reminders SET fired=0, due_at=? WHERE id=?",
-                    (next_due, rid),
-                )
     return claimed
 
 
+def _finalize_sync(
+    rid: int,
+    repeat: float,
+    due_at: float,
+    delivered: bool,
+    now: float,
+    attempts: int = 0,
+) -> None:
+    """Decide a claimed reminder's fate AFTER delivery was attempted.
+
+    delivered: reschedule (recurring) or consume (one-shot, already fired=1).
+    not delivered, retries left: un-fire and push due_at forward by
+      RETRY_BACKOFF so the next poll retries WITHOUT hot-looping (the
+      dispatcher sleeps until the new due_at) — survives a closed tab.
+    not delivered, retries exhausted: give up (recurring → skip to next slot,
+      reset attempts; one-shot → leave consumed) so a permanently-dead
+      surface doesn't churn forever.
+    """
+    def _next_slot() -> float:
+        nxt = due_at + repeat
+        while nxt <= now:
+            nxt += repeat
+        return nxt
+
+    recurring = bool(repeat and repeat > 0)
+    with closing(_connect()) as conn:
+        if delivered:
+            if recurring:
+                conn.execute(
+                    "UPDATE reminders SET fired=0, due_at=?, attempts=0 WHERE id=?",
+                    (_next_slot(), rid),
+                )
+            # one-shot: leave fired=1 (consumed)
+        elif attempts + 1 < MAX_RETRIES:
+            # retry later — back off so we don't spin on an overdue row
+            conn.execute(
+                "UPDATE reminders SET fired=0, due_at=?, attempts=? WHERE id=?",
+                (now + RETRY_BACKOFF, attempts + 1, rid),
+            )
+        else:
+            logger.warning("reminder #%s undeliverable after %d tries, dropping",
+                           rid, attempts + 1)
+            if recurring:
+                conn.execute(
+                    "UPDATE reminders SET fired=0, due_at=?, attempts=0 WHERE id=?",
+                    (_next_slot(), rid),
+                )
+            # one-shot: leave fired=1 (dropped)
+
+
 def _next_due_at_sync(origins: list[str]) -> float | None:
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         qs = ",".join("?" for _ in origins)
         row = conn.execute(
             f"SELECT MIN(due_at) FROM reminders WHERE fired=0 AND origin IN ({qs})",
@@ -207,10 +264,22 @@ async def _dispatcher_loop(
         try:
             now = time.time()
             for r in await asyncio.to_thread(_claim_due_sync, origins, now):
+                delivered = False
                 try:
-                    await deliver(r)
+                    # deliver() returns True if the reminder reached >=1 surface.
+                    delivered = bool(await deliver(r))
                 except Exception as e:
                     logger.warning("reminder delivery failed (#%s): %s", r["id"], e)
+                # Consume / reschedule / retry based on whether it landed.
+                await asyncio.to_thread(
+                    _finalize_sync,
+                    r["id"],
+                    r["repeat_seconds"],
+                    r["due_at"],
+                    delivered,
+                    now,
+                    r["attempts"],
+                )
             nxt = await asyncio.to_thread(_next_due_at_sync, origins)
             if nxt is None:
                 timeout = POLL_INTERVAL
