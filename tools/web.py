@@ -34,33 +34,67 @@ MAX_REDIRECTS = 4
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Roboot/1.0"
 
 
-def _host_is_safe(host: str) -> tuple[bool, str]:
-    """Resolve `host` and require every address to be globally routable."""
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_6TO4 = ipaddress.ip_network("2002::/16")
+
+
+def _ip_is_safe(ip) -> bool:
+    """Globally routable and not multicast — and unwrap IPv6 tunnels that
+    can smuggle a loopback/private IPv4 (IPv4-mapped, NAT64, 6to4) and re-check
+    the embedded v4 (residual SSRF on NAT64/6to4-enabled hosts)."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return _ip_is_safe(ip.ipv4_mapped)
+        if ip in _NAT64:
+            return _ip_is_safe(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+        if ip in _6TO4:
+            return _ip_is_safe(ipaddress.IPv4Address((int(ip) >> 80) & 0xFFFFFFFF))
+    return ip.is_global and not ip.is_multicast
+
+
+def _host_is_safe(host: str) -> tuple[bool, str, str]:
+    """Resolve `host`, require EVERY address globally routable, and return one
+    validated IP to pin the connection to. Returning the vetted IP is what
+    closes the DNS-rebinding TOCTOU: the caller connects to this exact IP
+    instead of letting the HTTP client re-resolve the hostname."""
     if not host:
-        return False, "URL 缺少主机名"
+        return False, "URL 缺少主机名", ""
     host = host.strip("[]")  # ipv6 literal brackets
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
-        return False, f"无法解析主机名 {host}：{e}"
+        return False, f"无法解析主机名 {host}：{e}", ""
+    pinned = ""
     for info in infos:
-        addr = info[4][0]
+        addr = info[4][0].split("%")[0]  # strip scope id
         try:
-            ip = ipaddress.ip_address(addr.split("%")[0])  # strip scope id
+            ip = ipaddress.ip_address(addr)
         except ValueError:
-            return False, f"无法解析 IP：{addr}"
-        if not ip.is_global or ip.is_multicast:
-            return False, f"拒绝访问非公网地址（{addr}），疑似 SSRF"
-    return True, ""
+            return False, f"无法解析 IP：{addr}", ""
+        if not _ip_is_safe(ip):
+            return False, f"拒绝访问非公网地址（{addr}），疑似 SSRF", ""
+        if not pinned:
+            pinned = addr
+    return True, "", pinned
 
 
 def _validate_url(url: str) -> tuple[bool, str]:
+    """Cheap pre-flight check (scheme + host safety). The authoritative,
+    rebinding-proof check happens in _get, which pins the validated IP."""
+    ok, reason, _ = _resolve_validated(url)
+    return ok, reason
+
+
+def _resolve_validated(url: str) -> tuple[bool, str, str]:
+    """Return (ok, reason, pinned_ip) for a URL — scheme must be http/https
+    and the resolved host must be public; pinned_ip is the address to connect
+    to so check-time and connect-time resolution are the same."""
     try:
         parsed = urllib.parse.urlparse(url)
     except Exception as e:
-        return False, f"URL 解析失败：{e}"
+        return False, f"URL 解析失败：{e}", ""
     if parsed.scheme not in ("http", "https"):
-        return False, f"只允许 http/https，拒绝 scheme：{parsed.scheme or '(空)'}"
+        return False, f"只允许 http/https，拒绝 scheme：{parsed.scheme or '(空)'}", ""
     return _host_is_safe(parsed.hostname or "")
 
 
@@ -104,31 +138,69 @@ def _html_to_text(body: str) -> str:
     return parser.text()
 
 
+def _pinned_transport(host: str, ip: str):
+    """An httpx transport that connects to the validated `ip` for `host`,
+    keeping the Host header and TLS SNI = host so HTTPS cert verification
+    still checks the real hostname. This makes the IP we *validated* the IP
+    we *connect to* — the second resolution that DNS-rebinding relies on
+    never happens."""
+    import httpx
+
+    class _Pinned(httpx.AsyncHTTPTransport):
+        async def handle_async_request(self, request):
+            if request.url.host == host:
+                request.extensions = dict(request.extensions or {})
+                request.extensions["sni_hostname"] = host
+                request.headers["Host"] = request.url.netloc.decode("ascii")
+                request.url = request.url.copy_with(host=ip)
+            return await super().handle_async_request(request)
+
+    return _Pinned()
+
+
 async def _get(url: str, *, data: dict | None = None) -> "tuple[int, dict, str]":
-    """SSRF-checked GET/POST with manual redirect following. Returns
-    (status, headers, body_text). Raises on transport error."""
+    """SSRF-checked GET/POST with manual redirect following and IP pinning.
+    Returns (status, headers, body_text). Raises on transport error."""
     import httpx
 
     method = "POST" if data is not None else "GET"
-    async with httpx.AsyncClient(follow_redirects=False, timeout=REQUEST_TIMEOUT) as cli:
-        for _ in range(MAX_REDIRECTS + 1):
-            ok, reason = _validate_url(url)
-            if not ok:
-                raise ValueError(reason)
-            resp = await cli.request(
+    timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=REQUEST_TIMEOUT)
+    for _ in range(MAX_REDIRECTS + 1):
+        # Resolve+validate AND pin the IP on every hop, before connecting.
+        ok, reason, ip = _resolve_validated(url)
+        if not ok:
+            raise ValueError(reason)
+        host = urllib.parse.urlparse(url).hostname or ""
+        transport = _pinned_transport(host, ip)
+        async with httpx.AsyncClient(
+            transport=transport, follow_redirects=False, timeout=timeout
+        ) as cli:
+            req = cli.build_request(
                 method, url, headers={"User-Agent": _UA}, data=data
             )
-            if resp.is_redirect and "location" in resp.headers:
-                url = urllib.parse.urljoin(url, resp.headers["location"])
-                method, data = "GET", None  # follow as GET
-                continue
-            body = resp.content[:MAX_BODY_BYTES]
-            ctype = resp.headers.get("content-type", "")
+            resp = await cli.send(req, stream=True)
             try:
-                text = body.decode(resp.encoding or "utf-8", errors="replace")
-            except Exception:
-                text = body.decode("utf-8", errors="replace")
-            return resp.status_code, {"content-type": ctype}, text
+                if resp.is_redirect and "location" in resp.headers:
+                    await resp.aclose()
+                    url = urllib.parse.urljoin(url, resp.headers["location"])
+                    method, data = "GET", None  # follow as GET
+                    continue
+                # Early reject on a declared oversize body.
+                clen = resp.headers.get("content-length")
+                if clen and clen.isdigit() and int(clen) > MAX_BODY_BYTES:
+                    raise ValueError(f"响应体过大（{clen} 字节 > 上限）")
+                # Stream and STOP at the cap — never buffer an unbounded body.
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if len(buf) >= MAX_BODY_BYTES:
+                        del buf[MAX_BODY_BYTES:]  # don't overshoot on last chunk
+                        break
+                ctype = resp.headers.get("content-type", "")
+                text = bytes(buf).decode(resp.encoding or "utf-8", errors="replace")
+                return resp.status_code, {"content-type": ctype}, text
+            finally:
+                await resp.aclose()
     raise ValueError("重定向次数过多")
 
 
