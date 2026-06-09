@@ -65,6 +65,16 @@ py-modules = [
     "server",
 ]
 
+[tool.uv]
+# Exclude torch (~353 MB). mlx-whisper declares it as a hard dependency, but
+# torch is only used by mlx_whisper/torch_whisper.py — the OpenAI-checkpoint
+# -> MLX *conversion* path. Roboot downloads pre-converted `-mlx` models from
+# HF and never converts, so the runtime STT path (load_models/transcribe/
+# audio/decoding) imports and runs without torch (verified). A false marker is
+# uv's idiom for dropping an unwanted transitive dep. Remove this line if you
+# ever need mlx-whisper's torch conversion utility.
+override-dependencies = ["torch ; sys_platform == 'never'"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

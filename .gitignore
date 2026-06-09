@@ -23,3 +23,4 @@ relay/dist/
 .voice_prefs/
 .tool_audit/
 .claude/
+.venv/
