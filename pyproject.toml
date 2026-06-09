@@ -13,6 +13,7 @@ dependencies = [
     "cryptography>=42.0",
     "iterm2>=2.7",
     "edge-tts>=6.1",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]

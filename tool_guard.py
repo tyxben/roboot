@@ -2,9 +2,11 @@
 
 Hooks into Arcana's `ToolGateway.confirmation_callback` so that any tool
 flagged `requires_confirmation=True` (or `side_effect=WRITE`) routes through
-this module before execution. Today only `shell` is wired up — the gate
-inspects the `command` argument against a danger-pattern list and asks the
-user to approve before running.
+this module before execution. The gated set is `shell` (danger-pattern
+matched on the command), the iTerm write tools `send_to_session` /
+`create_session`, `enroll_face`, and the filesystem writers `write_file` /
+`edit_file` (always-confirm in CONFIRM mode, keyed on the target path,
+allowlistable). Any other tool short-circuits to AUTO.
 
 Modes (env `ROBOOT_TOOL_APPROVAL`):
     off     — bypass entirely; callback always allows (default).
@@ -271,6 +273,8 @@ def _primary_text(tool_name: str, args: dict) -> str:
         return str(args.get("text") or "")
     if tool_name == "create_session":
         return str(args.get("command") or "")
+    if tool_name in ("write_file", "edit_file"):
+        return str(args.get("path") or "")
     return ""
 
 
@@ -401,7 +405,14 @@ async def gate(
     mode = get_mode()
     if mode == Mode.OFF:
         return Decision.AUTO
-    if tool_name not in {"shell", "send_to_session", "create_session", "enroll_face"}:
+    if tool_name not in {
+        "shell",
+        "send_to_session",
+        "create_session",
+        "enroll_face",
+        "write_file",
+        "edit_file",
+    }:
         # Unknown tool — don't gate. Future tools opt in.
         return Decision.AUTO
     if tool_name == "shell" and danger is None:

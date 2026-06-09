@@ -89,6 +89,8 @@ from tools.soul import build_personality, summarize_sessions
 from tools.voice_switch import current_tg_user, switch_tts_voice
 from tools import scheduler as _scheduler
 from tools.scheduler import schedule_reminder, list_reminders, cancel_reminder
+from tools.files import read_file, write_file, edit_file
+from tools.web import web_fetch, web_search
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,11 @@ ALL_TOOLS = [
     schedule_reminder,
     list_reminders,
     cancel_reminder,
+    read_file,
+    write_file,
+    edit_file,
+    web_fetch,
+    web_search,
 ]
 if screenshot is not None:
     ALL_TOOLS.append(screenshot)

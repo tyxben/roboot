@@ -222,6 +222,37 @@ async def test_gate_unknown_tool_returns_auto(monkeypatch):
     assert decision == Decision.AUTO
 
 
+def test_primary_text_for_file_writes():
+    assert tool_guard._primary_text("write_file", {"path": "/tmp/x"}) == "/tmp/x"
+    assert tool_guard._primary_text("edit_file", {"path": "notes.md"}) == "notes.md"
+
+
+async def test_gate_write_file_is_gated(monkeypatch, _isolate_paths):
+    """write_file/edit_file are in the always-confirm set (they bypass shell),
+    so in LOG mode a write lands in the audit with its path as the summary."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "log")
+    decision = await tool_guard.gate("write_file", {"path": "/tmp/note.txt"})
+    assert decision == Decision.LOGGED
+    files = list(tool_guard.AUDIT_DIR.iterdir())
+    assert len(files) == 1
+    record = json.loads(files[0].read_text())
+    assert record["tool"] == "write_file"
+    assert record["args_summary"] == "/tmp/note.txt"
+
+
+async def test_gate_write_file_allowlisted(monkeypatch, _isolate_paths):
+    """An allowlist entry for an exact path auto-approves that write target.
+    (Allowlist matching is token/space-bounded — built for command prefixes —
+    so for paths it's effectively exact-match, which is the safe default.)"""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+    _write_allowlist(
+        tool_guard.ALLOWLIST_PATH,
+        [{"tool": "write_file", "prefix": "/tmp/scratch/a.txt"}],
+    )
+    decision = await tool_guard.gate("write_file", {"path": "/tmp/scratch/a.txt"})
+    assert decision == Decision.AUTO
+
+
 # -----------------------------------------------------------------------------
 # gate — LOG mode
 # -----------------------------------------------------------------------------
