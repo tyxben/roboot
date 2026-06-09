@@ -48,6 +48,7 @@ from tools.scheduler import schedule_reminder, list_reminders, cancel_reminder
 from tools.files import read_file, write_file, edit_file
 from tools.web import web_fetch, web_search
 from tools.chat_search import search_chat
+from tools.todos import add_todo, list_todos, complete_todo, cancel_todo
 
 ALL_TOOLS = [
     shell,
@@ -72,6 +73,10 @@ ALL_TOOLS = [
     web_fetch,
     web_search,
     search_chat,
+    add_todo,
+    list_todos,
+    complete_todo,
+    cancel_todo,
 ]
 
 app = FastAPI(title="Roboot")

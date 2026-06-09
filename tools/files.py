@@ -44,6 +44,7 @@ _SECRET_REPO_PATHS = {
     ".voice_prefs",
     ".chat_history.db",
     ".reminders.db",
+    ".todos.db",
     ".tool_audit",
     ".soul",
 }

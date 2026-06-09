@@ -17,6 +17,9 @@ relay/dist/
 .reminders.db
 .reminders.db-wal
 .reminders.db-shm
+.todos.db
+.todos.db-wal
+.todos.db-shm
 .soul/
 .identity/
 .auth/
