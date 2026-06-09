@@ -91,6 +91,7 @@ from tools import scheduler as _scheduler
 from tools.scheduler import schedule_reminder, list_reminders, cancel_reminder
 from tools.files import read_file, write_file, edit_file
 from tools.web import web_fetch, web_search
+from tools.chat_search import search_chat
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,7 @@ ALL_TOOLS = [
     edit_file,
     web_fetch,
     web_search,
+    search_chat,
 ]
 if screenshot is not None:
     ALL_TOOLS.append(screenshot)
