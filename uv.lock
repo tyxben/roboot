@@ -183,7 +183,7 @@ wheels = [
 
 [[package]]
 name = "arcana-agent"
-version = "0.8.2"
+version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -194,9 +194,9 @@ dependencies = [
     { name = "rich" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/06/36/d17309124d765a7aeed4411abd48a7cf54c017971da94398442bc307c955/arcana_agent-0.8.2.tar.gz", hash = "sha256:f93dbc5b5ed82246e1e7408dd97b2fb79a0c622121fbba52c9a4d1ece0da2a06", size = 805750 }
+sdist = { url = "https://files.pythonhosted.org/packages/78/2d/f07c192c62287bb6d3070b81f4d08f9a8adb447f1e5ab8e631e0efe47af7/arcana_agent-1.0.0.tar.gz", hash = "sha256:214dfa84b6e0f93fddb735d571f71ca3ae3f15601a1a2639fa20d665baae33da", size = 837786 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/45/75/eb07caa7f05ff53197e3ac68f49dd814d67a6f483f6dd4b83597685c93e4/arcana_agent-0.8.2-py3-none-any.whl", hash = "sha256:65417306744c750e56160f455f7d45ad75a33d88f9f298dd1f28182899b135f8", size = 301537 },
+    { url = "https://files.pythonhosted.org/packages/62/82/31c0fbdab54243439b3eb6e3f11015406fb35d284185da2e4ee3e6076a45/arcana_agent-1.0.0-py3-none-any.whl", hash = "sha256:392a469405510eb353116b2d9aff10462265e487606df5668d01b8f01048ec32", size = 304062 },
 ]
 
 [package.optional-dependencies]
@@ -2163,7 +2163,7 @@ voice = [
 
 [package.metadata]
 requires-dist = [
-    { name = "arcana-agent", extras = ["all-providers"], specifier = ">=0.8.2,<0.9" },
+    { name = "arcana-agent", extras = ["all-providers"], specifier = ">=1.0,<2" },
     { name = "cryptography", specifier = ">=42.0" },
     { name = "edge-tts", specifier = ">=6.1" },
     { name = "face-recognition", marker = "extra == 'vision'", specifier = ">=1.3" },
