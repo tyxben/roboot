@@ -85,6 +85,15 @@ _ALWAYS_CONFIRM_TOOLS = {
 # when name-keyed above, or when they explicitly set requires_confirmation.
 _native_tools: set[str] = set()
 
+# Origins of UNATTENDED, self-clocked agent turns (e.g. the daily briefing).
+# There is no human present to approve a gate, and these turns often run over
+# untrusted content — so they are forced READ-ONLY: gate() REJECTS any
+# name-keyed / requires_confirmation / write-side-effect tool from these
+# origins, regardless of ROBOOT_TOOL_APPROVAL mode. An injected briefing can
+# read but never write / shell / exfil. Future autonomous features add their
+# origin here.
+_AUTONOMOUS_ORIGINS: set[str] = {"briefing"}
+
 
 class Mode(str, Enum):
     OFF = "off"
@@ -449,6 +458,8 @@ async def gate(
     have; only UNKNOWN tools change behaviour, and only when flagged WRITE.
 
     Logic (precedence matters — danger always wins over allowlist):
+      0. autonomous origin (briefing etc.) + any keyed/confirm/write tool →
+         REJECTED, regardless of mode (no human to approve; read-only sandbox).
       1. mode=OFF → AUTO.
       2. Gating eligibility (precedence: native name-keyed policy → explicit
          confirmation → side-effect-first for unknown/external writes → AUTO):
@@ -467,12 +478,37 @@ async def gate(
     """
     primary = _primary_text(tool_name, args)
     danger = detect_dangerous(primary) if tool_name in _DANGER_MATCHED_TOOLS else None
+    se = (side_effect or "").strip().lower()
+
+    # Autonomous origins (unattended, self-clocked turns like the daily
+    # briefing) have NO human to approve a gate and often run over untrusted
+    # content — so they are READ-ONLY: any name-keyed tool (shell / iTerm /
+    # file-writes / enroll_face), any requires_confirmation tool, or any write
+    # side-effect is REJECTED outright, regardless of mode. An injected briefing
+    # can read but never write / shell / exfil. Checked BEFORE the OFF
+    # short-circuit so `off` installs are protected here too.
+    if origin in _AUTONOMOUS_ORIGINS and (
+        tool_name in _DANGER_MATCHED_TOOLS
+        or tool_name in _ALWAYS_CONFIRM_TOOLS
+        or requires_confirmation
+        or se == "write"
+    ):
+        _log_audit(
+            {
+                "tool": tool_name,
+                "args_summary": _args_summary(tool_name, args),
+                "danger_reason": danger or f"autonomous origin blocked ({se or 'keyed'})",
+                "side_effect": se or None,
+                "origin": origin,
+                "ts": time.time(),
+            },
+            suffix="REJECTED-AUTONOMOUS",
+        )
+        return Decision.REJECTED
 
     mode = get_mode()
     if mode == Mode.OFF:
         return Decision.AUTO
-
-    se = (side_effect or "").strip().lower()
 
     # Gating eligibility — native name-keyed policy first, then side-effect-first.
     reason = danger
