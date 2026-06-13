@@ -91,6 +91,8 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 _runtime: arcana.Runtime | None = None
 _relay_client = None  # Set when relay is enabled
+_mcp_client = None  # arcana MCPClient, published BEFORE connecting (keep alive)
+_mcp_bootstrap_task = None  # retained so the loop can't GC it; cancelled on shutdown
 
 
 def _load_config() -> dict:
@@ -686,6 +688,44 @@ async def _start_session_watcher():
     # Reminder dispatcher for the daemon-owned surfaces. Origin "" covers
     # reminders created by in-process callers that never set the contextvar.
     _scheduler.start_dispatcher(["local", "relay", ""], _deliver_reminder)
+    # Connect configured MCP servers in the BACKGROUND so a slow/missing server
+    # can't delay readiness. Their tools register as `server.tool` (dotted),
+    # landing outside tool_guard's native snapshot → gated as external writes.
+    global _mcp_bootstrap_task
+    import mcp_bootstrap
+
+    mcp_configs = mcp_bootstrap.parse_mcp_configs(_load_config())
+    if mcp_configs:
+        # Retain the task handle: an unreferenced task can be GC-cancelled on
+        # 3.11, and shutdown needs something to cancel/await.
+        _mcp_bootstrap_task = asyncio.create_task(_bootstrap_mcp(mcp_configs))
+
+
+async def _bootstrap_mcp(configs) -> None:
+    """Connect MCP servers into the (already-built) runtime registry.
+
+    Runs after `_get_runtime()` so the native-tool snapshot is taken BEFORE any
+    MCP tool is registered — MCP tools must NOT be captured as native. The
+    MCPClient is created and published to `_mcp_client` BEFORE connecting, so a
+    shutdown that races this can still `disconnect_all()` whatever connected.
+    """
+    global _mcp_client
+    import mcp_bootstrap
+    from arcana.mcp.client import MCPClient
+
+    rt = _get_runtime()
+    if rt._tool_gateway is None:
+        return
+    _mcp_client = MCPClient()
+    try:
+        _, connected = await mcp_bootstrap.connect_mcp_servers(
+            rt._tool_gateway.registry, configs, client=_mcp_client
+        )
+    except Exception:
+        logger.warning("MCP bootstrap failed", exc_info=True)
+        return
+    if connected:
+        logger.info("MCP servers connected: %s", ", ".join(connected))
 
 
 @app.on_event("startup")
@@ -704,7 +744,23 @@ async def _start_self_upgrade_loop():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global _runtime
+    global _runtime, _mcp_client, _mcp_bootstrap_task
+    # Stop any in-flight MCP bootstrap first so it can't register more after we
+    # tear down; then disconnect everything that connected so far. Publishing
+    # _mcp_client before connecting means disconnect_all() reaches partial state.
+    if _mcp_bootstrap_task is not None:
+        _mcp_bootstrap_task.cancel()
+        try:
+            await _mcp_bootstrap_task
+        except BaseException:
+            pass
+        _mcp_bootstrap_task = None
+    if _mcp_client is not None:
+        try:
+            await _mcp_client.disconnect_all()
+        except Exception:
+            logger.warning("MCP disconnect_all failed", exc_info=True)
+        _mcp_client = None
     if _runtime:
         await _runtime.close()
         _runtime = None

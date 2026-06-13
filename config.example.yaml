@@ -97,6 +97,34 @@ remote_access:
     # Or deploy your own: see relay/ directory and relay/wrangler.toml
     # endpoint: "wss://your-own-relay.example.com"
 
+# External tools via MCP (Model Context Protocol). Optional.
+# Each connected server's tools become first-class agent tools, named
+# `<server>.<tool>` (e.g. `messageinfra.get_briefing`). Because they're
+# external they are ALWAYS gated as writes by tool_guard when their side-effect
+# is a write (so ROBOOT_TOOL_APPROVAL=confirm pops an approval modal before an
+# MCP write runs). A server that's down / slow is skipped at startup without
+# crashing the daemon. Currently wired into the local server only (not relay /
+# Telegram). Omit this block entirely to connect no MCP servers.
+#
+# mcp_servers:
+#   # messageinfra — local info-filtering agent (briefing / digest / search).
+#   # stdio: Roboot spawns the server as a subprocess; it talks JSON-RPC over
+#   # stdin/stdout, so its own deps stay isolated from Roboot's .venv. Needs the
+#   # messageinfra service running (default MESSAGEINFRA_URL=http://localhost:9990).
+#   - name: messageinfra
+#     transport: stdio
+#     command: /Users/ty/anaconda3/bin/python
+#     args: ["-m", "messageinfra.mcp_server"]
+#     env:
+#       MESSAGEINFRA_URL: "http://localhost:9990"
+#
+#   # Gmail / Calendar etc. via an npx MCP server (needs Node + a one-time OAuth
+#   # first-run in the spawned server). Example shape only:
+#   # - name: gmail
+#   #   transport: stdio
+#   #   command: npx
+#   #   args: ["-y", "@your/gmail-mcp-server"]
+
 # ---------------------------------------------------------------------------
 # Security hardening (set as environment variables, not config keys)
 # ---------------------------------------------------------------------------
