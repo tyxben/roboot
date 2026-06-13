@@ -169,6 +169,17 @@ def _get_runtime() -> arcana.Runtime:
             _runtime._tool_gateway.confirmation_callback = (
                 tool_guard.confirmation_callback
             )
+            # Snapshot native tool names (see server.py for rationale): only
+            # UNKNOWN/external writes gate by default; native low-risk writes
+            # stay AUTO. Run before any connect_mcp().
+            try:
+                tool_guard.set_native_tools(
+                    set(_runtime._tool_gateway.registry.list_tools())
+                )
+            except Exception:
+                logger.warning(
+                    "tool_guard: native-tool snapshot failed", exc_info=True
+                )
     return _runtime
 
 

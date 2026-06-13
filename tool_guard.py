@@ -2,11 +2,21 @@
 
 Hooks into Arcana's `ToolGateway.confirmation_callback` so that any tool
 flagged `requires_confirmation=True` (or `side_effect=WRITE`) routes through
-this module before execution. The gated set is `shell` (danger-pattern
+this module before execution. The name-keyed set is `shell` (danger-pattern
 matched on the command), the iTerm write tools `send_to_session` /
 `create_session`, `enroll_face`, and the filesystem writers `write_file` /
 `edit_file` (always-confirm in CONFIRM mode, keyed on the target path,
-allowlistable). Any other tool short-circuits to AUTO.
+allowlistable). Roboot's OTHER native writes (reminders/todos/notes/voice) are
+registered via `set_native_tools()` and stay AUTO — they were never in the
+gated set and aren't now. But any UNKNOWN / external tool Arcana flags WRITE /
+requires_confirmation — e.g. an MCP write tool such as `gmail.send_email`,
+which is NOT a native tool — is gated by default (side-effect-first, not
+name-allowlisted): without this an undeclared write tool reaching
+`confirmation_callback` would short-circuit to AUTO and bypass approval
+entirely (the tool-name-allowlist hole; the MCP tool-poisoning /
+unknown-WRITE-bypass class, CVE-2025-54136). A tool that explicitly declares
+`requires_confirmation=True` is always gated. Unknown READ/none tools that are
+not flagged short-circuit to AUTO.
 
 Modes (env `ROBOOT_TOOL_APPROVAL`):
     off     — bypass entirely; callback always allows (default).
@@ -50,6 +60,30 @@ AUDIT_DIR = Path(__file__).parent / ".tool_audit"
 ALLOWLIST_PATH = Path.home() / ".roboot" / "tool_allowlist.json"
 MAX_ARGS_BYTES = 2048
 DEFAULT_TIMEOUT_S = 30.0
+
+# Tools gated by NAME. `shell` is DANGER-MATCHED — gated only when its command
+# trips a danger pattern (safe commands fast-path to AUTO). The rest are
+# ALWAYS-CONFIRM — every call is gated in CONFIRM mode (allowlistable by their
+# primary text). These names are RESERVED for Roboot-native tools: the
+# fast-path trusts `_primary_text` to know each tool's primary arg. An external
+# tool can't collide (Arcana namespaces MCP tools as "server.tool"), but a
+# future native tool must not reuse these names with a different arg shape.
+_DANGER_MATCHED_TOOLS = {"shell"}
+_ALWAYS_CONFIRM_TOOLS = {
+    "send_to_session",
+    "create_claude_session",
+    "enroll_face",
+    "write_file",
+    "edit_file",
+}
+
+# Names of Roboot's OWN (native, vetted) tools — populated at startup via
+# `set_native_tools()`. The side-effect-first path in `gate()` gates UNKNOWN /
+# external WRITE tools (e.g. MCP) by default, but native low-risk writes
+# (reminders/todos/notes/voice) must stay AUTO as they always were. Empty
+# (never registered) fails safe: every write gates. Native tools still gate
+# when name-keyed above, or when they explicitly set requires_confirmation.
+_native_tools: set[str] = set()
 
 
 class Mode(str, Enum):
@@ -271,8 +305,8 @@ def _primary_text(tool_name: str, args: dict) -> str:
         return str(args.get("command") or "")
     if tool_name == "send_to_session":
         return str(args.get("text") or "")
-    if tool_name == "create_session":
-        return str(args.get("command") or "")
+    if tool_name == "create_claude_session":
+        return str(args.get("initial_prompt") or args.get("directory") or "")
     if tool_name in ("write_file", "edit_file"):
         return str(args.get("path") or "")
     return ""
@@ -343,6 +377,24 @@ _broadcasters: list[Callable[[dict], Awaitable[None]]] = []
 _pending: dict[str, asyncio.Future] = {}
 
 
+def set_native_tools(names: set[str]) -> None:
+    """Register the names of Roboot's OWN (native, vetted) tools.
+
+    The side-effect-first path in `gate()` gates UNKNOWN/external WRITE tools
+    (e.g. MCP) by default, but must NOT start gating Roboot's own low-risk
+    writes (reminders/todos/notes/voice) that were AUTO before. Native tools
+    listed here are exempt from the side-effect-first path; they still gate if
+    name-keyed (shell / iTerm / file writes) or if they explicitly declare
+    `requires_confirmation`.
+
+    Call ONCE at startup, AFTER registering native tools but BEFORE any
+    `connect_mcp()`, so MCP tools are NOT captured as native. Empty set
+    (never registered) fails safe: every write gates.
+    """
+    global _native_tools
+    _native_tools = set(names)
+
+
 def register_broadcaster(fn: Callable[[dict], Awaitable[None]]) -> None:
     if fn not in _broadcasters:
         _broadcasters.append(fn)
@@ -386,40 +438,70 @@ async def gate(
     *,
     origin: str = "unknown",
     timeout: float = DEFAULT_TIMEOUT_S,
+    side_effect: str | None = None,
+    requires_confirmation: bool = False,
 ) -> Decision:
     """The single approval entry point.
 
+    `side_effect` ("write"/"read"/"none") and `requires_confirmation` come from
+    the tool's Arcana spec via `confirmation_callback`. Direct callers (tests,
+    in-process) may omit them — name-keyed tools gate the same way they always
+    have; only UNKNOWN tools change behaviour, and only when flagged WRITE.
+
     Logic (precedence matters — danger always wins over allowlist):
       1. mode=OFF → AUTO.
-      2. unknown tool → AUTO (only the v1 gated set is policed).
-      3. tool=shell + no danger pattern → AUTO (the common case, fast path).
-      4. always-confirm tool (non-shell) + allowlist hit → AUTO.
-         shell + danger → allowlist CANNOT override; falls through to modal.
-      5. summary > MAX_ARGS_BYTES → REJECTED.
-      6. mode=LOG (or no broadcasters in CONFIRM) → LOGGED + audit + allow.
-      7. mode=CONFIRM → broadcast frame, await reply or timeout.
+      2. Gating eligibility (precedence: native name-keyed policy → explicit
+         confirmation → side-effect-first for unknown/external writes → AUTO):
+           - name in _DANGER_MATCHED_TOOLS (shell): gate ONLY if the command
+             trips a danger pattern; safe commands fast-path to AUTO.
+           - name in _ALWAYS_CONFIRM_TOOLS: every call gated.
+           - requires_confirmation set: gated (explicit author request).
+           - side_effect=write AND not a native tool (e.g. an MCP write):
+             gated by default — closes the unknown/external-write bypass.
+           - else (native low-risk write, unknown READ/none, unflagged): AUTO.
+      3. no danger + allowlist hit → AUTO.
+         A dangerous shell command CANNOT be allowlisted; falls through to modal.
+      4. summary > MAX_ARGS_BYTES → REJECTED.
+      5. mode=LOG (or no broadcasters in CONFIRM) → LOGGED + audit + allow.
+      6. mode=CONFIRM → broadcast frame, await reply or timeout.
     """
     primary = _primary_text(tool_name, args)
-    danger = detect_dangerous(primary) if tool_name == "shell" else None
+    danger = detect_dangerous(primary) if tool_name in _DANGER_MATCHED_TOOLS else None
 
     mode = get_mode()
     if mode == Mode.OFF:
         return Decision.AUTO
-    if tool_name not in {
-        "shell",
-        "send_to_session",
-        "create_session",
-        "enroll_face",
-        "write_file",
-        "edit_file",
-    }:
-        # Unknown tool — don't gate. Future tools opt in.
+
+    se = (side_effect or "").strip().lower()
+
+    # Gating eligibility — native name-keyed policy first, then side-effect-first.
+    reason = danger
+    if tool_name in _DANGER_MATCHED_TOOLS:
+        # shell: gate ONLY dangerous commands. Safe ones fast-path to AUTO even
+        # though shell is side_effect=write+requires_confirmation — we don't
+        # modal-spam every `ls`.
+        if danger is None:
+            return Decision.AUTO
+    elif tool_name in _ALWAYS_CONFIRM_TOOLS:
+        pass  # native high-risk write — every call gated (allowlistable below)
+    elif requires_confirmation:
+        # Explicitly flagged by the tool author — gate whether native or not.
+        reason = reason or "requires_confirmation"
+    elif se == "write" and tool_name not in _native_tools:
+        # UNKNOWN / external WRITE — e.g. an MCP write tool (gmail.send_email).
+        # Arcana only reaches this callback for WRITE/requires_confirmation
+        # tools, so an unrecognised one is an external action worth approving.
+        # Native low-risk writes are in _native_tools and fall through to AUTO.
+        reason = f"unknown WRITE tool (side_effect={se or 'inferred'})"
+    else:
+        # Native low-risk write, or unknown READ/none, or unflagged — don't gate.
         return Decision.AUTO
-    if tool_name == "shell" and danger is None:
-        return Decision.AUTO
+
     # Allowlist applies ONLY when there is no danger. A dangerous shell
     # command must always go to modal — the allowlist is for suppressing
     # routine confirmations on always-confirm tools, not for waiving danger.
+    # Unknown WRITE tools have no `_primary_text` extractor, so `is_allowlisted`
+    # returns False for them — they cannot be prefix-allowlisted today.
     if danger is None and is_allowlisted(tool_name, args):
         return Decision.AUTO
 
@@ -427,7 +509,8 @@ async def gate(
     record_base = {
         "tool": tool_name,
         "args_summary": summary,
-        "danger_reason": danger,
+        "danger_reason": reason,
+        "side_effect": se or None,
         "origin": origin,
         "ts": time.time(),
     }
@@ -461,7 +544,7 @@ async def gate(
         "req_id": req_id,
         "tool": tool_name,
         "args_summary": summary,
-        "danger_reason": danger,
+        "danger_reason": reason,
         "origin": origin,
         "issued_at": time.time(),
         "timeout_s": timeout,
@@ -507,6 +590,19 @@ current_origin: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
+def _coerce_side_effect(side_effect: Any) -> str | None:
+    """Normalize Arcana's `SideEffect` enum (or a raw string) to its lowercase
+    value ('write'/'read'/'none'), or None if absent.
+
+    tool_guard deliberately carries no `arcana` import, so we duck-type the
+    enum's `.value` rather than compare against `SideEffect.WRITE`.
+    """
+    if side_effect is None:
+        return None
+    val = getattr(side_effect, "value", side_effect)
+    return str(val).strip().lower() or None
+
+
 async def confirmation_callback(tool_call: Any, spec: Any) -> bool:
     """Adapter for `arcana.tool_gateway.gateway.ToolGateway.confirmation_callback`.
 
@@ -532,7 +628,20 @@ async def confirmation_callback(tool_call: Any, spec: Any) -> bool:
         if not isinstance(raw_args, dict):
             raw_args = {}
         origin = current_origin.get()
-        decision = await gate(name, raw_args, origin=origin)
+        side_effect = _coerce_side_effect(getattr(spec, "side_effect", None))
+        requires_confirmation = bool(getattr(spec, "requires_confirmation", False))
+        # Arcana only invokes this callback for WRITE / requires_confirmation
+        # tools. If the spec is malformed and we can read NEITHER signal, fail
+        # closed — treat it as a write so an unknown tool gates, not slips by.
+        if side_effect is None and not requires_confirmation:
+            side_effect = "write"
+        decision = await gate(
+            name,
+            raw_args,
+            origin=origin,
+            side_effect=side_effect,
+            requires_confirmation=requires_confirmation,
+        )
         return decision in {Decision.AUTO, Decision.LOGGED, Decision.APPROVED}
     except Exception:
         logger.exception("tool_guard: gate crashed; failing closed")

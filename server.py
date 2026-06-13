@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -79,6 +80,8 @@ ALL_TOOLS = [
     cancel_todo,
 ]
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="Roboot")
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -130,6 +133,19 @@ def _get_runtime() -> arcana.Runtime:
             _runtime._tool_gateway.confirmation_callback = (
                 tool_guard.confirmation_callback
             )
+            # Snapshot native tool names so tool_guard's side-effect-first
+            # gating treats only UNKNOWN/external (e.g. MCP) writes as
+            # gate-by-default — native low-risk writes (reminders/todos/notes/
+            # voice) stay AUTO. Must run BEFORE any connect_mcp() so MCP tools
+            # are not captured as native.
+            try:
+                tool_guard.set_native_tools(
+                    set(_runtime._tool_gateway.registry.list_tools())
+                )
+            except Exception:
+                logger.warning(
+                    "tool_guard: native-tool snapshot failed", exc_info=True
+                )
     return _runtime
 
 
