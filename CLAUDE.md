@@ -34,6 +34,7 @@ tts_synth.py                     <- Edge TTS helper shared by /api/tts + mobile 
 soul_review.py                   <- Review gate for soul.md overwrites (off/log/confirm)
 tool_guard.py                    <- Approval gate for agent tool calls (off/log/confirm) — gates run_command via Arcana confirmation_callback
 mcp_bootstrap.py                 <- Connect external MCP servers at startup; register their tools (gated as external writes)
+proactive.py                     <- Proactive daily briefing (read-only autonomous agent turn on a daily clock)
 filevault_status.py              <- macOS fdesetup probe for the console warning banner
 
 tools/                           <- Arcana tools (agent's capabilities)
@@ -146,6 +147,7 @@ Hooked into Arcana via `runtime._tool_gateway.confirmation_callback = tool_guard
 - **Roboot's other native writes** (`schedule_reminder`/`add_todo`/`update_self`/`switch_tts_voice`/…) stay **AUTO** — they're registered via `tool_guard.set_native_tools(...)` at startup (snapshotted from the runtime's tool registry *before* any `connect_mcp()`) and are exempt from side-effect-first gating, preserving pre-MCP behavior (no modal-spam on benign reminders/todos).
 - **Unknown / external WRITE tools** — anything Arcana flags `side_effect=WRITE` that is *not* a native tool, i.e. an **MCP write tool** like `gmail.send_email` — are **gated by default**. Without this an undeclared write would short-circuit to AUTO and bypass approval (the tool-name-allowlist hole; the MCP tool-poisoning / unknown-WRITE-bypass class, CVE-2025-54136). They have no `_primary_text` extractor so they can't be prefix-allowlisted today.
 - A tool that explicitly declares `requires_confirmation=True` is **always gated**, native or not.
+- **Autonomous origins** (`tool_guard._AUTONOMOUS_ORIGINS`, currently `{"briefing"}`) are unattended, self-clocked turns with no human to approve a gate and often running over untrusted content. For these origins, gate() forces **READ-ONLY**: any name-keyed / `requires_confirmation` / write-side-effect tool is **REJECTED outright regardless of mode** (even `off`), audited as `REJECTED-AUTONOMOUS`. So an injected daily-briefing can read (`get_briefing`, `web_search`, `read_file`) but never shell/write/exfil. This is the sandbox for all proactive features; the check runs *before* the OFF short-circuit so default installs are protected.
 
 Residual: Arcana's MCP layer classifies a tool's side-effect by a name/description keyword heuristic (`_infer_side_effect`, default READ), so a write tool whose name dodges the keywords classifies READ and never reaches the gate — an Arcana-level gap (fix later by registering MCP servers with explicit side-effects or the HEAD guardrail API). The danger detector also catches locally-decoded payloads piped to a shell/interpreter (`base64 -d | sh`, `xxd -r | sh`, `cat x | sh`), not just download-anchored `curl | bash`. The callback fails *closed* on any internal exception or malformed spec (returns False / treats unreadable spec as write) so a crashing gate rejects the call rather than waving it through.
 
@@ -165,6 +167,15 @@ Deployment recommendation lives in `SECURITY.md` §7 (matrix keyed on actual exp
 - **Gating:** MCP tools carry dotted names, so they fall OUTSIDE `tool_guard.set_native_tools()` → an MCP write tool (`side_effect=WRITE`) is **gated as an external write** (CONFIRM-mode modal), per the Phase-0 side-effect-first gate. Caveat: Arcana infers an MCP tool's side-effect from a name/description keyword heuristic (`_infer_side_effect`, default READ), so a write tool whose name dodges the keywords (e.g. messageinfra's `trigger_fetch`) classifies READ and is not gated — an Arcana-level residual.
 - **Scope:** wired into the **local server loop only**. stdio transports are bound to the loop that spawned the subprocess, so the relay thread (own loop) and the Telegram process (separate process) don't yet share MCP tools — a documented follow-up.
 - **First server:** `messageinfra` (local stdio, no OAuth) — `command: <anaconda>/python, args: [-m, messageinfra.mcp_server], env: {MESSAGEINFRA_URL: …}`. Process-isolated, so its `arcana 0.4.0` dep doesn't collide with Roboot's `.venv` 1.0.0. Gmail/Calendar would be an npx MCP server + OAuth first-run (deferred). See `config.example.yaml` for the shapes.
+
+### Proactive Daily Briefing
+`proactive.py` is the first "agent acts on its own clock" feature. When `proactive.briefing.enabled` is set in config (off + strict-parsed by default, so a quoted `"false"` can't enable it), `server.py`'s startup event starts `proactive.briefing_loop` as a retained task (cancelled on shutdown). At the configured local `time` (HH:MM; naive-local, ≤1h DST drift accepted), it runs ONE agent turn (`run_briefing_once`) that pulls a brief — the prompt asks the agent to call `messageinfra.get_briefing` and summarise in zh with a `> ` spoken line.
+
+Key safety/design choices:
+- **Read-only autonomous sandbox:** the turn runs under `tool_guard.current_origin = "briefing"`, an autonomous origin — the gate REJECTS any write/shell/keyed tool regardless of mode (see Tool Approval Gate above). Injected briefing content can't chain into actions.
+- **Single `response` frame, not per-delta streaming:** the brief runs in the server's main loop (not the relay's), so it collects the turn to an internal sink and pushes ONE `{"type":"response","kind":"briefing"}` frame via `_broadcast_frame`. This avoids reordering on the relay's separate-loop fan-out and avoids clobbering an in-flight user turn's shared stream bubble.
+- **In-flight marking:** the turn is wrapped in `_chat_in_flight_cm` so `self_upgrade` defers a re-exec until the brief finishes (the same protection user turns get).
+- **Follow-ups:** proactive TTS auto-play on the `response` frame; relay/Telegram surfaces (MCP is server-loop-only today); a persistent inbox so a brief fired with no console connected isn't lost.
 
 ### Chat History & Replay
 Two layers in `memory.py` on top of `chat_store` (SQLite `.chat_history.db`):

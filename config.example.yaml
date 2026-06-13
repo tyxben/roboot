@@ -125,6 +125,18 @@ remote_access:
 #   #   command: npx
 #   #   args: ["-y", "@your/gmail-mcp-server"]
 
+# Proactive behaviours (the agent acting on its own clock). Optional.
+proactive:
+  # Daily briefing: at `time` (local HH:MM) the agent runs one turn that pulls
+  # a brief (e.g. via the messageinfra MCP `get_briefing` tool) and streams it
+  # to whatever consoles are connected — just like a normal reply. Needs the
+  # relevant MCP server wired above to have anything to summarise. Off by
+  # default. `prompt` overrides the built-in Chinese briefing instruction.
+  briefing:
+    enabled: false
+    time: "08:00"
+    # prompt: "现在是每日简报时间。用 messageinfra 拉取今天的动态，整理成中文要点……"
+
 # ---------------------------------------------------------------------------
 # Security hardening (set as environment variables, not config keys)
 # ---------------------------------------------------------------------------

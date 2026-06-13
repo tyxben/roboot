@@ -996,3 +996,90 @@ def test_create_claude_session_primary_text():
     )
     assert "create_claude_session" in tool_guard._ALWAYS_CONFIRM_TOOLS
     assert "create_session" not in tool_guard._ALWAYS_CONFIRM_TOOLS
+
+
+# -----------------------------------------------------------------------------
+# Autonomous-origin sandbox (unattended self-clocked turns — e.g. the briefing)
+#
+# An autonomous origin has no human to approve a gate and may run over untrusted
+# content → READ-ONLY: any keyed / requires_confirmation / write tool is
+# REJECTED regardless of mode (even OFF). Only READ/none non-keyed tools pass.
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["off", "log", "confirm"])
+async def test_autonomous_blocks_shell_in_every_mode(monkeypatch, _isolate_paths, mode):
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", mode)
+    # Even a SAFE shell command is rejected for an autonomous origin — an
+    # injected brief must not run ANY shell, not just danger-matched ones.
+    safe = await tool_guard.gate(
+        "shell", {"command": "ls"}, origin="briefing",
+        side_effect="write", requires_confirmation=True,
+    )
+    danger = await tool_guard.gate(
+        "shell", {"command": "rm -rf /"}, origin="briefing",
+        side_effect="write", requires_confirmation=True,
+    )
+    assert safe == Decision.REJECTED
+    assert danger == Decision.REJECTED
+
+
+async def test_autonomous_blocks_writes_and_keyed_even_off(monkeypatch, _isolate_paths):
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "off")  # OFF and STILL blocked
+    assert (
+        await tool_guard.gate(
+            "write_file", {"path": "/tmp/x"}, origin="briefing", side_effect="write"
+        )
+        == Decision.REJECTED
+    )
+    assert (
+        await tool_guard.gate(
+            "gmail.send_email", {"to": "x"}, origin="briefing", side_effect="write"
+        )
+        == Decision.REJECTED
+    )
+    assert (
+        await tool_guard.gate(
+            "read_clipboard", {}, origin="briefing",
+            side_effect="read", requires_confirmation=True,
+        )
+        == Decision.REJECTED
+    )
+
+
+async def test_autonomous_allows_read_tools(monkeypatch, _isolate_paths):
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+    # The brief's actual need — a READ MCP tool — passes.
+    assert (
+        await tool_guard.gate(
+            "messageinfra.get_briefing", {}, origin="briefing", side_effect="read"
+        )
+        == Decision.AUTO
+    )
+    assert (
+        await tool_guard.gate(
+            "web_search", {"q": "x"}, origin="briefing", side_effect="read"
+        )
+        == Decision.AUTO
+    )
+
+
+async def test_autonomous_reject_is_audited(monkeypatch, _isolate_paths):
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "off")
+    await tool_guard.gate(
+        "shell", {"command": "rm -rf /"}, origin="briefing", side_effect="write"
+    )
+    files = list(tool_guard.AUDIT_DIR.iterdir())
+    assert any("REJECTED-AUTONOMOUS" in p.name for p in files)
+
+
+async def test_non_autonomous_origin_unaffected(monkeypatch, _isolate_paths):
+    """A normal origin keeps prior behaviour — safe shell stays AUTO."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+    assert (
+        await tool_guard.gate(
+            "shell", {"command": "git status"}, origin="local",
+            side_effect="write", requires_confirmation=True,
+        )
+        == Decision.AUTO
+    )

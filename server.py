@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -93,6 +94,7 @@ _runtime: arcana.Runtime | None = None
 _relay_client = None  # Set when relay is enabled
 _mcp_client = None  # arcana MCPClient, published BEFORE connecting (keep alive)
 _mcp_bootstrap_task = None  # retained so the loop can't GC it; cancelled on shutdown
+_briefing_task = None  # proactive daily-briefing loop; retained + cancelled on shutdown
 
 
 def _load_config() -> dict:
@@ -199,6 +201,19 @@ _chat_in_flight: int = 0
 def get_in_flight_count() -> int:
     """Number of chat turns currently executing in the /ws endpoint."""
     return _chat_in_flight
+
+
+@contextlib.asynccontextmanager
+async def _chat_in_flight_cm():
+    """Mark an agent turn in-flight for the duration of the `with`. Used by the
+    proactive briefing so self_upgrade defers a re-exec until the brief finishes
+    (the same 'never re-exec mid-turn' protection the WS path gives user turns)."""
+    global _chat_in_flight
+    _chat_in_flight += 1
+    try:
+        yield
+    finally:
+        _chat_in_flight -= 1
 
 
 # NOTE: _relay_broadcast is defined once, below near the broadcast helpers
@@ -626,6 +641,37 @@ async def _broadcast_sessions_changed() -> None:
             pass
 
 
+async def _broadcast_frame(frame: dict) -> int:
+    """Fan a single frame out to every connected daemon surface (local WS +
+    paired relay); returns how many it reached. The proactive briefing uses
+    this as its `send` callback so a brief streams to whoever's connected,
+    exactly like a normal agent turn. Mirrors `_deliver_reminder`'s fan-out."""
+    sent = 0
+    dead: list[WebSocket] = []
+    for client_ws in list(_active_ws_clients):
+        try:
+            await client_ws.send_json(frame)
+            sent += 1
+        except Exception:
+            dead.append(client_ws)
+    for client_ws in dead:
+        _active_ws_clients.discard(client_ws)
+    relay = _relay_client
+    if (
+        relay is not None
+        and getattr(relay, "_loop", None) is not None
+        and getattr(relay, "_ciphers", None)
+    ):
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _relay_broadcast(relay, frame), relay._loop
+            )
+            sent += 1
+        except Exception:
+            pass
+    return sent
+
+
 def _register_soul_review_broadcaster() -> None:
     """Idempotent registration (startup hooks can fire repeatedly under
     some reload scenarios; soul_review.register_broadcaster dedupes)."""
@@ -691,14 +737,38 @@ async def _start_session_watcher():
     # Connect configured MCP servers in the BACKGROUND so a slow/missing server
     # can't delay readiness. Their tools register as `server.tool` (dotted),
     # landing outside tool_guard's native snapshot → gated as external writes.
-    global _mcp_bootstrap_task
+    global _mcp_bootstrap_task, _briefing_task
     import mcp_bootstrap
 
-    mcp_configs = mcp_bootstrap.parse_mcp_configs(_load_config())
+    config = _load_config()
+    mcp_configs = mcp_bootstrap.parse_mcp_configs(config)
     if mcp_configs:
         # Retain the task handle: an unreferenced task can be GC-cancelled on
         # 3.11, and shutdown needs something to cancel/await.
         _mcp_bootstrap_task = asyncio.create_task(_bootstrap_mcp(mcp_configs))
+
+    # Proactive daily briefing (opt-in). Runs a read-only autonomous agent turn
+    # at a set local time and pushes the result to connected surfaces. Off
+    # unless config enables it. `enabled` is parsed STRICTLY so a quoted
+    # "false" (truthy string) can't silently enable an autonomous turn.
+    brief_cfg = (config.get("proactive") or {}).get("briefing") or {}
+    enabled = brief_cfg.get("enabled")
+    if enabled is True or str(enabled).strip().lower() in {"true", "1", "yes", "on"}:
+        import proactive
+
+        hhmm = str(brief_cfg.get("time", "08:00"))
+        prompt = brief_cfg.get("prompt") or proactive.DEFAULT_BRIEFING_PROMPT
+        _briefing_task = asyncio.create_task(
+            proactive.briefing_loop(
+                _get_runtime(),
+                hhmm=hhmm,
+                prompt=prompt,
+                push=_broadcast_frame,
+                build_personality=lambda: build_personality(channel="web"),
+                in_flight=_chat_in_flight_cm,
+            )
+        )
+        logger.info("proactive briefing scheduled daily at %s", hhmm)
 
 
 async def _bootstrap_mcp(configs) -> None:
@@ -744,7 +814,14 @@ async def _start_self_upgrade_loop():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global _runtime, _mcp_client, _mcp_bootstrap_task
+    global _runtime, _mcp_client, _mcp_bootstrap_task, _briefing_task
+    if _briefing_task is not None:
+        _briefing_task.cancel()
+        try:
+            await _briefing_task
+        except BaseException:
+            pass
+        _briefing_task = None
     # Stop any in-flight MCP bootstrap first so it can't register more after we
     # tear down; then disconnect everything that connected so far. Publishing
     # _mcp_client before connecting means disconnect_all() reaches partial state.
