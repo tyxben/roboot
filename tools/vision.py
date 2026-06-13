@@ -173,6 +173,10 @@ async def look() -> str:
     when_to_use="当用户说'记住我'、'记住我的脸'、'注册人脸'、'我是xxx'，或让你认识一个新面孔时",
     what_to_expect="拍照并把用户的脸存入数据库，下次就能认出来",
     failure_meaning="拍照失败或没检测到人脸",
+    # Writes a face encoding to the .faces DB. side_effect="write" makes Arcana
+    # invoke tool_guard.confirmation_callback so this is actually gated in
+    # CONFIRM mode (it's listed in tool_guard._ALWAYS_CONFIRM_TOOLS).
+    side_effect="write",
 )
 async def enroll_face(name: str) -> str:
     """拍照并注册人脸。name 是这个人的名字。会拍多张提高准确度。"""

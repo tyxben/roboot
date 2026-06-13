@@ -154,6 +154,56 @@ async def test_safe_shell_allowed_without_modal(
     assert captured == [], "safe command should not have triggered the modal"
 
 
+async def test_gateway_routes_external_write_tool_to_gate(
+    monkeypatch, _isolate_paths
+):
+    """Pin Arcana's routing contract: the gateway invokes confirmation_callback
+    for a WRITE tool whose name is OUTSIDE Roboot's native/keyed set (the MCP
+    case), and our gate rejects it when the user says no. If a future Arcana
+    stops routing WRITE tools to the callback, this fails loudly — it's the
+    premise the unit-level MCP test takes on faith.
+
+    Dispatches through the real `gateway.call()`, not the callback directly.
+    """
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+
+    @arcana.tool(
+        when_to_use="stand-in for an external MCP write tool",
+        side_effect="write",
+    )
+    async def fake_external_write(target: str) -> str:
+        return f"wrote {target}"
+
+    rt = arcana.Runtime(
+        providers={"deepseek": "sk-fake"},
+        tools=[fake_external_write],
+        budget=arcana.Budget(max_cost_usd=0.01),
+        config=arcana.RuntimeConfig(default_provider="deepseek"),
+    )
+    rt._tool_gateway.confirmation_callback = tool_guard.confirmation_callback
+    # Deliberately do NOT call set_native_tools — an empty native set means an
+    # unrecognised write gates (fail-safe), which is exactly the MCP posture.
+
+    denied: list[str] = []
+
+    async def deny(frame):
+        denied.append(frame["tool"])
+        tool_guard.resolve_decision(frame["req_id"], approved=False)
+
+    tool_guard.register_broadcaster(deny)
+
+    call = ToolCall(
+        id="ext1", name="fake_external_write", arguments={"target": "prod"}
+    )
+    result = await rt._tool_gateway.call(call)
+
+    # The gateway routed the WRITE tool to our gate; the broadcaster rejected it,
+    # so the tool body never ran.
+    assert denied == ["fake_external_write"], "gateway did not route to the gate"
+    assert result.success is False
+    assert result.error is not None and result.error.code == "CONFIRMATION_REJECTED"
+
+
 async def test_off_mode_allows_dangerous(runtime, monkeypatch):
     """When ROBOOT_TOOL_APPROVAL is unset (default off), even dangerous
     commands pass — preserving back-compat for users who haven't opted in.

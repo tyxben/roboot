@@ -46,12 +46,14 @@ def _isolate_paths(tmp_path, monkeypatch):
 def _reset_module_state():
     tool_guard._broadcasters.clear()
     tool_guard._pending.clear()
+    tool_guard.set_native_tools(set())  # default: no natives → every write gates
     yield
     tool_guard._broadcasters.clear()
     for fut in list(tool_guard._pending.values()):
         if not fut.done():
             fut.cancel()
     tool_guard._pending.clear()
+    tool_guard.set_native_tools(set())
 
 
 # -----------------------------------------------------------------------------
@@ -744,3 +746,253 @@ async def test_frame_includes_issued_at(monkeypatch, _isolate_paths):
     assert "issued_at" in captured[0]
     assert isinstance(captured[0]["issued_at"], (int, float))
     assert "timeout_s" in captured[0]
+
+
+# -----------------------------------------------------------------------------
+# gate — side-effect-first gating (the MCP unknown-write path)
+#
+# Arcana only calls confirmation_callback for WRITE / requires_confirmation
+# tools. An unknown WRITE tool (e.g. an MCP `gmail.send_email`) used to
+# short-circuit to AUTO via the hardcoded name set — the gate-bypass hole
+# (MCP tool-poisoning / unknown-WRITE-bypass, CVE-2025-54136 class). These
+# tests pin the side-effect-first behavior that closes it.
+# -----------------------------------------------------------------------------
+
+
+def test_coerce_side_effect_variants():
+    coerce = tool_guard._coerce_side_effect
+    assert coerce(None) is None
+    assert coerce("write") == "write"
+    assert coerce("WRITE") == "write"
+    assert coerce(" Read ") == "read"
+    assert coerce("") is None
+    # Arcana's SideEffect is `class SideEffect(str, Enum)` — duck-typed via
+    # `.value` so tool_guard needs no arcana import.
+    assert coerce(SimpleNamespace(value="write")) == "write"
+    assert coerce(SimpleNamespace(value="NONE")) == "none"
+
+
+async def test_gate_unknown_write_tool_is_gated_in_log(monkeypatch, _isolate_paths):
+    """An unknown tool flagged WRITE (e.g. MCP send_email) must be gated, not
+    auto-allowed. In LOG mode it lands in the audit with a synthesized reason
+    and the JSON-serialized args as the summary (no primary-text extractor)."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "log")
+    decision = await tool_guard.gate(
+        "send_email", {"to": "x@y.z", "body": "hi"}, side_effect="write"
+    )
+    assert decision == Decision.LOGGED
+    files = list(tool_guard.AUDIT_DIR.iterdir())
+    assert len(files) == 1
+    record = json.loads(files[0].read_text())
+    assert record["tool"] == "send_email"
+    assert record["side_effect"] == "write"
+    assert "WRITE" in record["danger_reason"]
+    assert "x@y.z" in record["args_summary"]
+
+
+async def test_gate_unknown_read_tool_is_not_gated(monkeypatch, _isolate_paths):
+    """An unknown READ tool stays AUTO — only writes/confirm are gated."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+    decision = await tool_guard.gate(
+        "search_inbox", {"q": "invoices"}, side_effect="read"
+    )
+    assert decision == Decision.AUTO
+    # AUTO never writes audit, so the dir is never even created.
+    assert not (tool_guard.AUDIT_DIR.exists() and list(tool_guard.AUDIT_DIR.iterdir()))
+
+
+async def test_gate_unknown_none_tool_is_not_gated(monkeypatch, _isolate_paths):
+    """side_effect='none' and unflagged → AUTO."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+    decision = await tool_guard.gate("ping", {}, side_effect="none")
+    assert decision == Decision.AUTO
+
+
+async def test_gate_unknown_requires_confirmation_is_gated(
+    monkeypatch, _isolate_paths
+):
+    """requires_confirmation forces gating even for a READ tool."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "log")
+    decision = await tool_guard.gate(
+        "read_clipboard", {}, side_effect="read", requires_confirmation=True
+    )
+    assert decision == Decision.LOGGED
+
+
+async def test_gate_unknown_write_tool_confirm_modal(monkeypatch, _isolate_paths):
+    """In CONFIRM the unknown write tool fires the modal and honors reject."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+    captured: list[dict] = []
+
+    async def bc(frame):
+        captured.append(frame)
+        tool_guard.resolve_decision(frame["req_id"], approved=False)
+
+    tool_guard.register_broadcaster(bc)
+    decision = await tool_guard.gate(
+        "calendar_delete_event", {"id": "evt_1"}, side_effect="write"
+    )
+    assert decision == Decision.REJECTED
+    assert captured and captured[0]["tool"] == "calendar_delete_event"
+    assert "WRITE" in captured[0]["danger_reason"]
+
+
+async def test_gate_unknown_write_tool_cannot_be_allowlisted(
+    monkeypatch, _isolate_paths
+):
+    """Unknown write tools have no primary-text extractor, so a prefix
+    allowlist entry can't waive their gate."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "log")
+    _write_allowlist(
+        tool_guard.ALLOWLIST_PATH, [{"tool": "send_email", "prefix": "x@y.z"}]
+    )
+    decision = await tool_guard.gate(
+        "send_email", {"to": "x@y.z"}, side_effect="write"
+    )
+    assert decision == Decision.LOGGED  # still gated, allowlist didn't apply
+
+
+async def test_gate_known_tool_precedence_over_side_effect(
+    monkeypatch, _isolate_paths
+):
+    """shell is registered side_effect=write, but name-keyed danger-matching
+    wins: a safe shell command stays AUTO even though WRITE is passed (no
+    modal spam), while a dangerous one still gates."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+    safe = await tool_guard.gate(
+        "shell", {"command": "git status"}, side_effect="write"
+    )
+    assert safe == Decision.AUTO
+
+    captured: list[dict] = []
+
+    async def bc(frame):
+        captured.append(frame)
+        tool_guard.resolve_decision(frame["req_id"], approved=True)
+
+    tool_guard.register_broadcaster(bc)
+    dangerous = await tool_guard.gate(
+        "shell", {"command": "rm -rf /tmp/x"}, side_effect="write"
+    )
+    assert dangerous == Decision.APPROVED
+    assert "rm" in captured[0]["danger_reason"]
+
+
+async def test_confirmation_callback_gates_mcp_write_tool(
+    monkeypatch, _isolate_paths
+):
+    """End-to-end: a spec carrying SideEffect.WRITE drives the callback to gate
+    an unknown MCP tool and honor a reject."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+
+    async def bc(frame):
+        tool_guard.resolve_decision(frame["req_id"], approved=False)
+
+    tool_guard.register_broadcaster(bc)
+    tool_call = SimpleNamespace(
+        name="gmail.send_email", arguments={"to": "x@y.z", "subject": "hi"}
+    )
+    spec = SimpleNamespace(
+        side_effect=SimpleNamespace(value="write"), requires_confirmation=False
+    )
+    assert await tool_guard.confirmation_callback(tool_call, spec) is False
+
+
+async def test_confirmation_callback_allows_mcp_read_tool(monkeypatch):
+    """A READ-classified MCP tool reaching the callback is not gated by us."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+    tool_call = SimpleNamespace(name="gmail.list_messages", arguments={})
+    spec = SimpleNamespace(
+        side_effect=SimpleNamespace(value="read"), requires_confirmation=False
+    )
+    assert await tool_guard.confirmation_callback(tool_call, spec) is True
+
+
+async def test_confirmation_callback_failclosed_on_malformed_spec(
+    monkeypatch, _isolate_paths
+):
+    """A spec missing BOTH side_effect and requires_confirmation must fail
+    CLOSED (treated as write) so an unknown tool gates, not slips by. (Not
+    reachable via Arcana's real contract, but defense-in-depth.)"""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+
+    async def bc(frame):
+        tool_guard.resolve_decision(frame["req_id"], approved=False)
+
+    tool_guard.register_broadcaster(bc)
+    tool_call = SimpleNamespace(name="mystery.write_thing", arguments={"x": 1})
+    spec = SimpleNamespace()  # no side_effect, no requires_confirmation
+    assert await tool_guard.confirmation_callback(tool_call, spec) is False
+
+
+# -----------------------------------------------------------------------------
+# Native-vs-external trust boundary (set_native_tools)
+#
+# The side-effect-first path must gate UNKNOWN/external writes (MCP) WITHOUT
+# re-gating Roboot's own low-risk native writes (reminders/todos/voice/notes),
+# which were AUTO before. Native tools are exempt unless name-keyed or they
+# explicitly declare requires_confirmation.
+# -----------------------------------------------------------------------------
+
+
+async def test_native_write_exempt_external_write_gated(monkeypatch, _isolate_paths):
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "confirm")
+    tool_guard.set_native_tools(
+        {"schedule_reminder", "add_todo", "switch_tts_voice", "update_self"}
+    )
+
+    captured: list[dict] = []
+
+    async def bc(frame):
+        captured.append(frame)
+        tool_guard.resolve_decision(frame["req_id"], approved=False)
+
+    tool_guard.register_broadcaster(bc)
+
+    # Native low-risk write → AUTO, no modal (no regression / no modal-spam).
+    native = await tool_guard.gate(
+        "schedule_reminder",
+        {"text": "买牛奶", "delay_seconds": 900},
+        side_effect="write",
+    )
+    assert native == Decision.AUTO
+    assert captured == []
+
+    # Unknown/external write (not native) → still gates.
+    external = await tool_guard.gate(
+        "gmail.send_email", {"to": "x@y.z"}, side_effect="write"
+    )
+    assert external == Decision.REJECTED
+    assert captured and captured[0]["tool"] == "gmail.send_email"
+
+
+async def test_native_tool_with_requires_confirmation_still_gates(
+    monkeypatch, _isolate_paths
+):
+    """The native exemption must NOT swallow an explicit requires_confirmation
+    — an author who flags a native tool for confirmation still gets gated."""
+    monkeypatch.setenv("ROBOOT_TOOL_APPROVAL", "log")
+    tool_guard.set_native_tools({"sensitive_native"})
+    decision = await tool_guard.gate(
+        "sensitive_native", {}, side_effect="write", requires_confirmation=True
+    )
+    assert decision == Decision.LOGGED
+    files = list(tool_guard.AUDIT_DIR.iterdir())
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["danger_reason"] == "requires_confirmation"
+
+
+def test_create_claude_session_primary_text():
+    """The _ALWAYS_CONFIRM entry is create_claude_session (not the dead
+    'create_session'); its primary text is the prompt/dir for summary+allowlist."""
+    assert (
+        tool_guard._primary_text(
+            "create_claude_session", {"directory": "/p", "initial_prompt": "go"}
+        )
+        == "go"
+    )
+    assert (
+        tool_guard._primary_text("create_claude_session", {"directory": "/p"}) == "/p"
+    )
+    assert "create_claude_session" in tool_guard._ALWAYS_CONFIRM_TOOLS
+    assert "create_session" not in tool_guard._ALWAYS_CONFIRM_TOOLS
