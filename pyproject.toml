@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Personal AI agent hub — voice, terminal, Claude Code management"
 requires-python = ">=3.11"
 dependencies = [
-    "arcana-agent[all-providers]>=0.8.2,<0.9",
+    "arcana-agent[all-providers]>=1.0,<2",
     "pyyaml>=6.0",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
@@ -13,6 +13,7 @@ dependencies = [
     "cryptography>=42.0",
     "iterm2>=2.7",
     "edge-tts>=6.1",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +64,16 @@ py-modules = [
     "run",
     "server",
 ]
+
+[tool.uv]
+# Exclude torch (~353 MB). mlx-whisper declares it as a hard dependency, but
+# torch is only used by mlx_whisper/torch_whisper.py — the OpenAI-checkpoint
+# -> MLX *conversion* path. Roboot downloads pre-converted `-mlx` models from
+# HF and never converts, so the runtime STT path (load_models/transcribe/
+# audio/decoding) imports and runs without torch (verified). A false marker is
+# uv's idiom for dropping an unwanted transitive dep. Remove this line if you
+# ever need mlx-whisper's torch conversion utility.
+override-dependencies = ["torch ; sys_platform == 'never'"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

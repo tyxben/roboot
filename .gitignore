@@ -14,7 +14,16 @@ relay/dist/
 .chat_history.db
 .chat_history.db-wal
 .chat_history.db-shm
+.reminders.db
+.reminders.db-wal
+.reminders.db-shm
+.todos.db
+.todos.db-wal
+.todos.db-shm
 .soul/
 .identity/
 .auth/
 .voice_prefs/
+.tool_audit/
+.claude/
+.venv/

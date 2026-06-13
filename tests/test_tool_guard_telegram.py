@@ -26,6 +26,7 @@ import pytest
 pytest.importorskip("telegram")
 
 import arcana
+import soul_review
 import tool_guard
 from tools.voice_switch import current_tg_user
 
@@ -42,6 +43,7 @@ def _isolate_paths(tmp_path, monkeypatch):
     """Same isolation shape as test_tool_guard_integration."""
     monkeypatch.setattr(tool_guard, "AUDIT_DIR", tmp_path / "audit")
     monkeypatch.setattr(tool_guard, "ALLOWLIST_PATH", tmp_path / "allowlist.json")
+    monkeypatch.setattr(soul_review, "PENDING_DIR", tmp_path / "soul_pending")
     tool_guard._allowlist_cache["mtime"] = 0.0
     tool_guard._allowlist_cache["entries"] = []
     yield
@@ -52,6 +54,9 @@ def _reset_module_state():
     tool_guard._broadcasters.clear()
     tool_guard._pending.clear()
     telegram_bot._pending_owner.clear()
+    soul_review._broadcasters.clear()
+    soul_review._pending.clear()
+    telegram_bot._pending_soul_owner.clear()
     # Don't leak _tg_app between tests — main() sets it, tests stub it.
     prev_app = telegram_bot._tg_app
     yield
@@ -61,6 +66,12 @@ def _reset_module_state():
             fut.cancel()
     tool_guard._pending.clear()
     telegram_bot._pending_owner.clear()
+    soul_review._broadcasters.clear()
+    for fut in list(soul_review._pending.values()):
+        if not fut.done():
+            fut.cancel()
+    soul_review._pending.clear()
+    telegram_bot._pending_soul_owner.clear()
     telegram_bot._tg_app = prev_app
     # Force `_get_runtime()` to rebuild on next call so its callback wiring
     # is exercised fresh in each test.
@@ -114,6 +125,31 @@ def test_get_runtime_attaches_tool_guard_callback(monkeypatch):
         "Telegram bot's runtime must wire tool_guard.confirmation_callback. "
         "Without it, Telegram-driven shell calls bypass the gate."
     )
+
+
+# -----------------------------------------------------------------------------
+# Reminder delivery (scheduler dispatcher → Telegram DM)
+# -----------------------------------------------------------------------------
+
+
+async def test_reminder_delivery_dms_target(fake_app):
+    """The telegram dispatcher delivers a reminder to the user_id stored as
+    `target` when it was scheduled."""
+    telegram_bot._tg_app = fake_app
+    await telegram_bot._deliver_reminder_telegram(
+        {"id": 5, "text": "喝水", "target": "424242"}
+    )
+    fake_app.bot.send_message.assert_awaited_once()
+    call = fake_app.bot.send_message.await_args
+    assert call.kwargs["chat_id"] == 424242
+    assert "喝水" in call.kwargs["text"]
+
+
+async def test_reminder_delivery_skips_without_target(fake_app):
+    """A reminder with no telegram target must not crash or mis-deliver."""
+    telegram_bot._tg_app = fake_app
+    await telegram_bot._deliver_reminder_telegram({"id": 6, "text": "x", "target": None})
+    fake_app.bot.send_message.assert_not_awaited()
 
 
 # -----------------------------------------------------------------------------
@@ -354,3 +390,105 @@ async def test_gate_to_telegram_callback_round_trip(
 
     decision = await asyncio.wait_for(gate_task, timeout=1.0)
     assert decision == tool_guard.Decision.APPROVED
+
+
+# -----------------------------------------------------------------------------
+# 5. soul_review broadcaster — mirror of the tool_approval wiring
+# -----------------------------------------------------------------------------
+# Without a registered soul_review broadcaster, ROBOOT_SOUL_REVIEW=confirm
+# silently degrades to LOG for every Telegram-driven soul.md write — the user
+# believes writes are gated when they aren't. These pin the parity fix.
+
+
+async def test_soul_broadcaster_skips_when_no_tg_user(fake_app):
+    """No current_tg_user → bail, let the review time out. Don't DM everyone."""
+    telegram_bot._tg_app = fake_app
+    await telegram_bot._broadcast_soul_review(
+        {"req_id": "abc", "origin": "remember_user", "diff": "x", "timeout_s": 30}
+    )
+    fake_app.bot.send_message.assert_not_awaited()
+
+
+async def test_soul_broadcaster_sends_to_triggering_user(fake_app, set_user):
+    telegram_bot._tg_app = fake_app
+    set_user(424242)
+    await telegram_bot._broadcast_soul_review(
+        {
+            "req_id": "cafe",
+            "origin": "update_self",
+            "diff": "--- soul.md\n+++ soul.md\n+evil",
+            "timeout_s": 30,
+        }
+    )
+    fake_app.bot.send_message.assert_awaited_once()
+    call = fake_app.bot.send_message.await_args
+    assert call.kwargs["chat_id"] == 424242
+    markup = call.kwargs["reply_markup"]
+    cbs = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "soul_ok:cafe" in cbs
+    assert "soul_no:cafe" in cbs
+    # And the owner is bound so a stranger can't answer it.
+    assert telegram_bot._pending_soul_owner["cafe"] == 424242
+
+
+async def test_soul_callback_resolves_pending(monkeypatch):
+    monkeypatch.setattr(telegram_bot, "_is_allowed", lambda _uid: True)
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    soul_review._pending["sr1"] = fut
+
+    q = _make_query(user_id=1, data="soul_ok:sr1")
+    await telegram_bot.callback_handler(_make_update_with_query(q), context=None)
+
+    assert fut.done() and fut.result() is True
+    assert "已批准" in q.edit_message_text.await_args.args[0]
+
+
+async def test_soul_callback_rejects_cross_user_click(monkeypatch):
+    monkeypatch.setattr(telegram_bot, "_is_allowed", lambda _uid: True)
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    soul_review._pending["sr2"] = fut
+    telegram_bot._pending_soul_owner["sr2"] = 100
+
+    q = _make_query(user_id=200, data="soul_ok:sr2")
+    await telegram_bot.callback_handler(_make_update_with_query(q), context=None)
+
+    assert not fut.done(), "stranger's click must NOT resolve owner's review"
+    alert_calls = [c for c in q.answer.await_args_list if c.kwargs.get("show_alert")]
+    assert len(alert_calls) == 1
+    assert "不是你的" in alert_calls[0].args[0]
+
+
+async def test_soul_review_to_telegram_round_trip(fake_app, set_user, monkeypatch):
+    """End-to-end: confirm mode + telegram soul broadcaster registered;
+    review_write blocks; a simulated button press returns APPROVED."""
+    monkeypatch.setenv("ROBOOT_SOUL_REVIEW", "confirm")
+    monkeypatch.setattr(telegram_bot, "_is_allowed", lambda _uid: True)
+    telegram_bot._tg_app = fake_app
+    set_user(7)
+    soul_review.register_broadcaster(telegram_bot._broadcast_soul_review)
+
+    review_task = asyncio.create_task(
+        soul_review.review_write(
+            "old soul\n", "old soul\nnew line\n", origin="remember_user", timeout=2.0
+        )
+    )
+    for _ in range(50):
+        if fake_app.bot.send_message.await_count > 0:
+            break
+        await asyncio.sleep(0.01)
+    assert fake_app.bot.send_message.await_count == 1
+    markup = fake_app.bot.send_message.await_args.kwargs["reply_markup"]
+    ok_cb = next(
+        b.callback_data
+        for row in markup.inline_keyboard
+        for b in row
+        if b.callback_data.startswith("soul_ok:")
+    )
+
+    q = _make_query(user_id=7, data=ok_cb)
+    await telegram_bot.callback_handler(_make_update_with_query(q), context=None)
+
+    decision = await asyncio.wait_for(review_task, timeout=1.0)
+    assert decision == soul_review.Decision.APPROVED

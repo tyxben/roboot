@@ -43,6 +43,12 @@ from tools.soul import (
     get_name,
     summarize_sessions,
 )
+from tools import scheduler as _scheduler
+from tools.scheduler import schedule_reminder, list_reminders, cancel_reminder
+from tools.files import read_file, write_file, edit_file
+from tools.web import web_fetch, web_search
+from tools.chat_search import search_chat
+from tools.todos import add_todo, list_todos, complete_todo, cancel_todo
 
 ALL_TOOLS = [
     shell,
@@ -58,6 +64,19 @@ ALL_TOOLS = [
     update_self,
     remember_user,
     add_note,
+    schedule_reminder,
+    list_reminders,
+    cancel_reminder,
+    read_file,
+    write_file,
+    edit_file,
+    web_fetch,
+    web_search,
+    search_chat,
+    add_todo,
+    list_todos,
+    complete_todo,
+    cancel_todo,
 ]
 
 app = FastAPI(title="Roboot")
@@ -164,13 +183,8 @@ def get_in_flight_count() -> int:
     return _chat_in_flight
 
 
-async def _relay_broadcast(relay, frame: dict) -> None:
-    """Encrypt and push `frame` to every paired relay client (best-effort)."""
-    for cid in list(getattr(relay, "_ciphers", {}).keys()):
-        try:
-            await relay._send_to_client(cid, frame)
-        except Exception:
-            pass
+# NOTE: _relay_broadcast is defined once, below near the broadcast helpers
+# (it needs no early definition — nothing above this point calls it).
 
 
 @app.get("/api/sessions", dependencies=[Depends(require_lan_token)])
@@ -605,6 +619,47 @@ def _register_tool_guard_broadcaster() -> None:
     tool_guard.register_broadcaster(_broadcast_tool_approval)
 
 
+async def _deliver_reminder(reminder: dict) -> bool:
+    """Scheduler delivery for the daemon's surfaces (local consoles + relay).
+
+    The dispatcher (started below) owns origins {local, relay, ""}; Telegram
+    reminders are delivered by the bot's own dispatcher. Reuses the same
+    local-WS + relay fan-out shape as _broadcast_waiting_notification.
+
+    Returns True if the reminder reached at least one surface — the dispatcher
+    uses this to decide whether to consume the reminder or retry later (so a
+    reminder set from a now-closed tab isn't silently dropped)."""
+    frame = {
+        "type": "notify",
+        "kind": "reminder",
+        "reminder_id": reminder.get("id"),
+        "text": f"⏰ 提醒: {reminder.get('text', '')}",
+    }
+    sent = 0
+    dead: list[WebSocket] = []
+    for client_ws in list(_active_ws_clients):
+        try:
+            await client_ws.send_json(frame)
+            sent += 1
+        except Exception:
+            dead.append(client_ws)
+    for client_ws in dead:
+        _active_ws_clients.discard(client_ws)
+    relay = _relay_client
+    if relay is not None and getattr(relay, "_loop", None) is not None:
+        # Only count the relay as a surface if a client is actually paired
+        # (a derived cipher exists); the push itself is fire-and-forget.
+        if getattr(relay, "_ciphers", None):
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _relay_broadcast(relay, frame), relay._loop
+                )
+                sent += 1
+            except Exception:
+                pass
+    return sent > 0
+
+
 @app.on_event("startup")
 async def _start_session_watcher():
     _session_watcher.subscribe(_broadcast_waiting_notification)
@@ -612,6 +667,9 @@ async def _start_session_watcher():
     _session_watcher.start()
     _register_soul_review_broadcaster()
     _register_tool_guard_broadcaster()
+    # Reminder dispatcher for the daemon-owned surfaces. Origin "" covers
+    # reminders created by in-process callers that never set the contextvar.
+    _scheduler.start_dispatcher(["local", "relay", ""], _deliver_reminder)
 
 
 @app.on_event("startup")

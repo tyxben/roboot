@@ -2,9 +2,11 @@
 
 Hooks into Arcana's `ToolGateway.confirmation_callback` so that any tool
 flagged `requires_confirmation=True` (or `side_effect=WRITE`) routes through
-this module before execution. Today only `shell` is wired up — the gate
-inspects the `command` argument against a danger-pattern list and asks the
-user to approve before running.
+this module before execution. The gated set is `shell` (danger-pattern
+matched on the command), the iTerm write tools `send_to_session` /
+`create_session`, `enroll_face`, and the filesystem writers `write_file` /
+`edit_file` (always-confirm in CONFIRM mode, keyed on the target path,
+allowlistable). Any other tool short-circuits to AUTO.
 
 Modes (env `ROBOOT_TOOL_APPROVAL`):
     off     — bypass entirely; callback always allows (default).
@@ -106,7 +108,31 @@ DANGEROUS_PATTERNS: list[tuple[str, str]] = [
         r"(python[23]?|perl|ruby|node|php|lua|deno)\b",
         "pipe remote payload to interpreter",
     ),
+    # Generalized pipe-to-shell / interpreter — NOT anchored on a download
+    # command, so a payload decoded LOCALLY and piped into a shell still
+    # trips the gate: `echo … | base64 -d | sh`, `xxd -r -p x | sh`,
+    # `openssl enc -d -in x | bash`, `cat payload | sh`. The download-anchored
+    # rules above stay first so curl/wget cases keep their descriptive reason.
+    # Optional wrapper (sudo|nohup|env|exec) and optional /abs/path/ before
+    # the shell name; `\b` after the name prevents matching `bash_completion`.
+    (
+        r"\|\s*(sudo\s+|nohup\s+|env\s+|exec\s+)?(\S*/)?"
+        r"(ba|z|k|tc|c|da|fi)?sh\b",
+        "pipe payload to shell",
+    ),
+    (
+        r"\|\s*(sudo\s+|nohup\s+|env\s+|exec\s+)?(\S*/)?"
+        r"(python[23]?|perl|ruby|node|php|lua|deno)\b",
+        "pipe payload to interpreter",
+    ),
     (r"<\(\s*(curl|wget|fetch|http)\b", "process-substitution remote payload"),
+    # Shell/interpreter consuming a process substitution of ANY command
+    # (`bash <(base64 -d x)`), not just a download.
+    (r"\b(ba|z|k|tc|c|da|fi)?sh\s+<\(", "shell reads process substitution"),
+    (
+        r"\b(python[23]?|perl|ruby|node|php)\s+<\(",
+        "interpreter reads process substitution",
+    ),
     (r"\beval\s+[\"']?\$\(", "eval of subshell output"),
     (r"(?:^|[;&|])\s*\.\s+<\(", "dot-source process substitution"),
     (r"\bsource\s+<\(", "source process substitution"),
@@ -247,6 +273,8 @@ def _primary_text(tool_name: str, args: dict) -> str:
         return str(args.get("text") or "")
     if tool_name == "create_session":
         return str(args.get("command") or "")
+    if tool_name in ("write_file", "edit_file"):
+        return str(args.get("path") or "")
     return ""
 
 
@@ -279,16 +307,26 @@ def is_allowlisted(tool_name: str, args: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _log_audit(record: dict, suffix: str = "") -> Path:
-    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    tag = record.get("tool", "unknown")
-    name = f"{ts}-{uuid.uuid4().hex[:6]}-{tag}"
-    if suffix:
-        name = f"{name}-{suffix}"
-    path = AUDIT_DIR / f"{name}.json"
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2))
-    return path
+def _log_audit(record: dict, suffix: str = "") -> Path | None:
+    """Write an audit record. Best-effort: a write failure (disk full,
+    read-only fs) must NEVER propagate. `gate()` calls this on the APPROVED
+    branch *before* returning the user's decision, so an exception here would
+    turn a command the user just approved into a silent rejection. Audit I/O
+    is observability, not a gate input — log and continue.
+    """
+    try:
+        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        tag = record.get("tool", "unknown")
+        name = f"{ts}-{uuid.uuid4().hex[:6]}-{tag}"
+        if suffix:
+            name = f"{name}-{suffix}"
+        path = AUDIT_DIR / f"{name}.json"
+        path.write_text(json.dumps(record, ensure_ascii=False, indent=2))
+        return path
+    except Exception as e:
+        logger.warning("tool_guard: audit write failed (%s); continuing", e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +405,14 @@ async def gate(
     mode = get_mode()
     if mode == Mode.OFF:
         return Decision.AUTO
-    if tool_name not in {"shell", "send_to_session", "create_session", "enroll_face"}:
+    if tool_name not in {
+        "shell",
+        "send_to_session",
+        "create_session",
+        "enroll_face",
+        "write_file",
+        "edit_file",
+    }:
         # Unknown tool — don't gate. Future tools opt in.
         return Decision.AUTO
     if tool_name == "shell" and danger is None:
@@ -450,13 +495,11 @@ async def gate(
 # ---------------------------------------------------------------------------
 
 
-# contextvars for origin tracking — set at message-receive boundary in
-# server.py / adapters/telegram_bot.py / relay_client.py.
-#
-# WARN: until D2 wires the contextvar set/reset, every audit record will
-# carry origin="local" — including Telegram-driven calls. This is exactly
-# the case where origin matters most for forensics. Do not flip
-# ROBOOT_TOOL_APPROVAL=confirm in a multi-surface deployment until D2 ships.
+# contextvars for origin tracking — set/reset at the message-receive
+# boundary in server.py ("local"), adapters/telegram_bot.py ("telegram"),
+# and relay_client.py ("relay"), so each audit record and the broadcast
+# frame carry the surface the call actually came from. The default "local"
+# covers direct/in-process callers that never set it.
 import contextvars  # noqa: E402  (placed near use site for locality)
 
 current_origin: contextvars.ContextVar[str] = contextvars.ContextVar(

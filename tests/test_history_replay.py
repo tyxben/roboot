@@ -33,6 +33,24 @@ class FakeChatSession:
         self._messages = [Message(role=MessageRole.SYSTEM, content=system_prompt)]
 
 
+class FakeChatSessionWithSeedHistory:
+    """Mimics Arcana 1.0's public surface: a `seed_history(messages)` method.
+
+    `_seed_messages` must prefer this over poking `_messages`. We record what
+    it receives so the test can assert the public path was taken.
+    """
+
+    def __init__(self, system_prompt: str = "sys"):
+        from arcana.runtime.conversation import Message, MessageRole
+
+        self._messages = [Message(role=MessageRole.SYSTEM, content=system_prompt)]
+        self.seeded_via_public_api: list = []
+
+    def seed_history(self, messages):
+        self.seeded_via_public_api.extend(messages)
+        self._messages.extend(messages)
+
+
 # -----------------------------------------------------------------------------
 # Layer A -- replay_history
 # -----------------------------------------------------------------------------
@@ -68,6 +86,29 @@ async def test_replay_history_seeds_only_user_turns_in_order(monkeypatch):
     contents = [m.content for m in session._messages]
     assert roles == ["system", "user", "user"]
     assert contents == ["sys", "msg 1", "msg 2"]
+
+
+async def test_replay_prefers_public_seed_history(monkeypatch):
+    """Arcana 1.0 path: when the session exposes seed_history(), use it
+    instead of poking the private _messages list. Same user-only policy."""
+    history = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+    ]
+
+    async def fake_list(sid, limit=200):
+        return history
+
+    monkeypatch.setattr(memory.chat_store, "list_messages", fake_list)
+
+    session = FakeChatSessionWithSeedHistory()
+    seeded = await memory.replay_history(session, "s-xyz")
+
+    assert seeded == 2
+    # Went through the public API, not a direct _messages poke.
+    assert [m.content for m in session.seeded_via_public_api] == ["u1", "u2"]
+    assert all(str(m.role.value) == "user" for m in session.seeded_via_public_api)
 
 
 async def test_replay_history_noop_on_empty(monkeypatch):

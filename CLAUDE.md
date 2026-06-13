@@ -42,6 +42,9 @@ tools/                           <- Arcana tools (agent's capabilities)
 +-- face_db.py                   <- Face encoding storage and matching (.faces/)
 +-- soul.py                      <- Self-modification + user memory
 +-- voice_switch.py              <- Agent tool: change Telegram TTS voice
++-- scheduler.py                 <- Delayed/recurring reminders (.reminders.db, per-origin dispatcher)
++-- files.py                     <- read_file/write_file/edit_file (own path deny-policy; writes gated)
++-- web.py                       <- web_fetch/web_search (SSRF-guarded, keyless DuckDuckGo)
 
 adapters/                        <- I/O adapters
 +-- telegram_bot.py              <- Remote control via Telegram (voice I/O)
@@ -97,8 +100,8 @@ cd relay && npm install && npx wrangler deploy
 
 ## Key Design Decisions
 
-### Agent: Arcana 0.8.2
-All LLM interaction goes through Arcana's `Runtime` and `ChatSession`. Tools are registered with `@arcana.tool()` decorator with affordance metadata (`when_to_use`, `what_to_expect`). Streaming uses `session.stream()` which emits `LLM_CHUNK` events (not `TEXT_DELTA`). Pinned floor `>=0.8.2,<0.9` in `pyproject.toml` — 0.8.x is the "Collaborative Cognition" line; we only use the single-agent surface, so the multi-agent (`runtime.collaborate()`) and cognitive-primitives (`recall`/`pin`) features are available but unused. `Message` / `MessageRole` are imported from `arcana.contracts.llm` (canonical path), not `arcana.runtime.conversation` (re-export, fragile).
+### Agent: Arcana 1.0.0
+All LLM interaction goes through Arcana's `Runtime` and `ChatSession`. Tools are registered with `@arcana.tool()` decorator with affordance metadata (`when_to_use`, `what_to_expect`). Streaming uses `session.stream()` which emits `LLM_CHUNK` events (not `TEXT_DELTA`). Pinned floor `>=1.0,<2` in `pyproject.toml` — 1.0.0 is the first semver-stable release; its only breaking change drops the multi-agent surface (`runtime.team()`/`collaborate()`), which we never used. We use the single-agent surface only; the cognitive-primitives (`recall`/`pin`) remain available but unused. `Message` / `MessageRole` are imported from `arcana.contracts.llm` (canonical path), not `arcana.runtime.conversation` (re-export, fragile). Short-term history replay uses the public `ChatSession.seed_history()` (new in 1.0) rather than poking the private `_messages` list (see `memory.py`).
 
 ### iTerm2 Integration
 `iterm_bridge.py` maintains a persistent websocket to iTerm2's Python API. This replaced an earlier AppleScript approach. Requires iTerm2 -> Settings -> General -> Magic -> Enable Python API.
@@ -136,7 +139,7 @@ Same shape as the soul review gate, but it gates the *action* path (the agent ca
 - `log` — non-dangerous calls pass through; dangerous calls (matched against `tool_guard.DANGEROUS_PATTERNS` — 38 curated regexes covering rm/dd/sudo/pipe-to-shell/credential dirs/Roboot at-rest paths/etc.) are still allowed but the call lands in `.tool_audit/<ts>-<tool>-LOGGED.json`.
 - `confirm` — dangerous calls broadcast `{"type":"tool_approval","req_id":...,"tool":...,"args_summary":...,"danger_reason":...,"origin":...,"issued_at":...,"timeout_s":30}` to every registered surface (local console + relay mobile + Telegram). The reply `{"type":"tool_approval_decision","req_id":...,"approved":bool}` resolves the gate's pending future. No reply within `timeout_s` → REJECTED. Args summary > 2 KB → REJECTED unconditionally.
 
-Hooked into Arcana via `runtime._tool_gateway.confirmation_callback = tool_guard.confirmation_callback` — each gated tool just declares `requires_confirmation=True` on its `@arcana.tool(...)` decorator. Currently gated: `run_command` (shell). The callback fails *closed* on any internal exception (returns False) so a crashing gate rejects the call rather than waving it through.
+Hooked into Arcana via `runtime._tool_gateway.confirmation_callback = tool_guard.confirmation_callback` — each gated tool just declares `requires_confirmation=True` on its `@arcana.tool(...)` decorator (or `side_effect="write"`). Currently gated: `shell` (danger-pattern matched on the command), the iTerm write tools `send_to_session`/`create_session`, `enroll_face`, and the filesystem writers `write_file`/`edit_file` (always-confirm, keyed on the target path, allowlistable by path). The danger detector also catches locally-decoded payloads piped to a shell/interpreter (`base64 -d | sh`, `xxd -r | sh`, `cat x | sh`), not just download-anchored `curl | bash`. The callback fails *closed* on any internal exception (returns False) so a crashing gate rejects the call rather than waving it through.
 
 The danger detector applies NFKC + ANSI strip + null-byte normalization before matching, with a 16 KB hard cap on detector input (ReDoS guard). Allowlist at `~/.roboot/tool_allowlist.json` (per-machine, gitignored) does prefix matching with token boundaries; metachar-containing entries (`;`, `&`, backtick, `$(`, `||`, etc.) are silently rejected at lookup time so a user can't write `prefix: "ls; rm -rf"` and feel safe. Allowlist CANNOT override danger detection — a dangerous shell command goes to modal regardless.
 
